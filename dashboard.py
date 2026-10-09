@@ -3,6 +3,8 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -12,6 +14,18 @@ import os
 import base64
 from pathlib import Path
 import streamlit.components.v1 as components
+
+# Resilient HTTP client for live polling. Short transient 429/5xx/network hiccups
+# should not crash the Streamlit fragment or replace the whole app with an error.
+_HTTP_RETRY = Retry(
+    total=2, connect=2, read=2, status=2, backoff_factor=0.15,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    raise_on_status=False,
+)
+HTTP = requests.Session()
+HTTP.mount("https://", HTTPAdapter(max_retries=_HTTP_RETRY, pool_connections=16, pool_maxsize=32))
+HTTP.headers.update({"User-Agent": "BTC-Kalshi-Live-Terminal/2.0"})
 
 st.set_page_config(page_title="BTC × Kalshi | Live Terminal", page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
@@ -174,7 +188,7 @@ def _load_learning_from_github():
         return None
     url = f"https://api.github.com/repos/{_learning_repo()}/contents/{_learning_path()}"
     try:
-        r = requests.get(url, params={"ref": _learning_branch()}, headers=_github_headers(token), timeout=10)
+        r = HTTP.get(url, params={"ref": _learning_branch()}, headers=_github_headers(token), timeout=10)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -217,7 +231,7 @@ def _push_learning_to_github(df):
     headers = _github_headers(token)
     sha = None
     try:
-        g = requests.get(url, params={"ref": _learning_branch()}, headers=headers, timeout=10)
+        g = HTTP.get(url, params={"ref": _learning_branch()}, headers=headers, timeout=10)
         if g.status_code == 200:
             sha = g.json().get("sha")
         elif g.status_code != 404:
@@ -255,7 +269,7 @@ def save_learning_history(df):
 def _market_result_payload(ticker):
     """Fetch settlement outcome for one previously recorded market."""
     try:
-        r = requests.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=10)
+        r = HTTP.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=10)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -559,7 +573,7 @@ def get_candles(granularity=60):
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start = end - pd.Timedelta(minutes=299)
     params = {"granularity": granularity, "start": start.isoformat(), "end": end.isoformat()}
-    response = requests.get(f"{COINBASE}/products/BTC-USD/candles",
+    response = HTTP.get(f"{COINBASE}/products/BTC-USD/candles",
                             params=params, headers=HEADERS, timeout=15)
     response.raise_for_status()
     df = normalize(response.json())
@@ -569,7 +583,7 @@ def get_candles(granularity=60):
     # If the primary endpoint provides insufficient history, try Coinbase's
     # alternate public Advanced Trade candles feed before showing an error.
     # Kraken provides public BTC/USD minute OHLC history without credentials.
-    kr = requests.get("https://api.kraken.com/0/public/OHLC",
+    kr = HTTP.get("https://api.kraken.com/0/public/OHLC",
                       params={"pair": "XBTUSD", "interval": 1}, timeout=15)
     kr.raise_for_status()
     body = kr.json()
@@ -589,7 +603,7 @@ def get_candles(granularity=60):
 @st.cache_data(ttl=1, show_spinner=False)
 def get_spot_price():
     """Near-real-time BTC spot used to update the current candle between candle snapshots."""
-    r = requests.get(f"{COINBASE}/products/BTC-USD/ticker", headers=HEADERS, timeout=6)
+    r = HTTP.get(f"{COINBASE}/products/BTC-USD/ticker", headers=HEADERS, timeout=6)
     r.raise_for_status()
     return float(r.json()["price"])
 
@@ -602,11 +616,11 @@ def _fetch_reference_venue(name):
     """
     try:
         if name == "Coinbase":
-            r = requests.get(f"{COINBASE}/products/BTC-USD/ticker", headers=HEADERS, timeout=4)
+            r = HTTP.get(f"{COINBASE}/products/BTC-USD/ticker", headers=HEADERS, timeout=4)
             r.raise_for_status()
             return name, float(r.json()["price"])
         if name == "Kraken":
-            r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair":"XBTUSD"}, timeout=4)
+            r = HTTP.get("https://api.kraken.com/0/public/Ticker", params={"pair":"XBTUSD"}, timeout=4)
             r.raise_for_status()
             body = r.json()
             if body.get("error"):
@@ -615,11 +629,11 @@ def _fetch_reference_venue(name):
             row = next(iter(result.values()), None)
             return name, float(row["c"][0]) if row else None
         if name == "Bitstamp":
-            r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=4)
+            r = HTTP.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=4)
             r.raise_for_status()
             return name, float(r.json()["last"])
         if name == "Gemini":
-            r = requests.get("https://api.gemini.com/v1/pubticker/btcusd", timeout=4)
+            r = HTTP.get("https://api.gemini.com/v1/pubticker/btcusd", timeout=4)
             r.raise_for_status()
             return name, float(r.json()["last"])
     except Exception:
@@ -694,7 +708,7 @@ def get_outcome_history(hours=24):
         start, stop = pair
         params = {"granularity": 60, "start": start.isoformat(), "end": stop.isoformat()}
         try:
-            r = requests.get(f"{COINBASE}/products/BTC-USD/candles", params=params, headers=HEADERS, timeout=10)
+            r = HTTP.get(f"{COINBASE}/products/BTC-USD/candles", params=params, headers=HEADERS, timeout=10)
             r.raise_for_status()
             return _normalize_history_rows(r.json())
         except Exception:
@@ -924,14 +938,14 @@ def final_minute_probability(proxy_price, strike, expiry_ts, samples, sigma_1m):
 
 @st.cache_data(ttl=1, show_spinner=False)
 def get_market(ticker):
-    r = requests.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=12)
+    r = HTTP.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=12)
     r.raise_for_status()
     j = r.json()
     return j.get("market", j)
 
 @st.cache_data(ttl=1, show_spinner=False)
 def get_orderbook(ticker):
-    r = requests.get(f"{KALSHI}/markets/{ticker}/orderbook", headers=HEADERS, timeout=12)
+    r = HTTP.get(f"{KALSHI}/markets/{ticker}/orderbook", headers=HEADERS, timeout=12)
     r.raise_for_status()
     j = r.json()
     return j.get("orderbook_fp") or j.get("orderbook") or j
@@ -947,7 +961,7 @@ def discover_btc_15m_markets():
         params = {"series_ticker": "KXBTC15M", "status": "open", "limit": 200}
         if cursor:
             params["cursor"] = cursor
-        response = requests.get(f"{KALSHI}/markets", params=params, headers=HEADERS, timeout=12)
+        response = HTTP.get(f"{KALSHI}/markets", params=params, headers=HEADERS, timeout=12)
         response.raise_for_status()
         payload = response.json()
         found.extend(payload.get("markets", []))
@@ -1406,8 +1420,7 @@ if _fragment is None:
             return fn
         return decorate
 
-@_fragment(run_every=live_run_every)
-def render_live_dashboard():
+def _render_live_dashboard_inner():
     active_ticker = market_ticker
     if not manual_ticker:
         try:
@@ -1424,15 +1437,22 @@ def render_live_dashboard():
     learning_history, _learning_updates = refresh_learning_outcomes(learning_history, force=False)
     learning_model = get_adaptive_learner(learning_history)
 
+    candle_feed_stale = False
     try:
         candles = get_candles(60)
         if len(candles) < 10:
-            st.error("Not enough Coinbase candle data returned.")
-            st.stop()
+            raise ValueError(f"Only {len(candles)} candles returned")
+        st.session_state["_last_good_candles"] = candles.copy()
+        st.session_state["_last_good_candles_ts"] = time.time()
     except Exception as e:
-        st.error(f"Could not load Coinbase market data: {e}")
-        st.info("Check your internet connection or try again. Coinbase public market data is used; no API key is needed.")
-        st.stop()
+        fallback = st.session_state.get("_last_good_candles")
+        if isinstance(fallback, pd.DataFrame) and len(fallback) >= 10:
+            candles = fallback.copy()
+            candle_feed_stale = True
+        else:
+            st.warning("BTC feed is temporarily reconnecting. The dashboard will retry automatically.")
+            st.caption(f"Feed detail: {type(e).__name__}: {e}")
+            return
 
     # Pull the ticker separately so the displayed price/current candle can move every
     # live refresh instead of waiting on the candle endpoint alone.
@@ -1474,20 +1494,34 @@ def render_live_dashboard():
       <div><small>5M MOVE</small><strong>{f'{ret5:+.2f}%' if pd.notna(ret5) else '—'}</strong><span>short-term</span></div>
       <div><small>TREND</small><strong>{trend.title()}</strong><span>EMA 5 / 15</span></div>
     </div>""", unsafe_allow_html=True)
+    if candle_feed_stale:
+        age = max(0, int(time.time() - float(st.session_state.get("_last_good_candles_ts", time.time()))))
+        st.caption(f"⚠️ BTC candle feed reconnecting — showing last good data ({age}s old).")
 
     kalshi_data = None
     kalshi_error = None
+    kalshi_stale = False
     if active_ticker:
+        cache_key = f"_last_good_kalshi::{active_ticker}"
+        cache_ts_key = f"_last_good_kalshi_ts::{active_ticker}"
         try:
             kalshi_data = kalshi_snapshot(active_ticker)
-        except requests.RequestException as exc:
-            kalshi_error = str(exc)
+            st.session_state[cache_key] = kalshi_data
+            st.session_state[cache_ts_key] = time.time()
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            fallback = st.session_state.get(cache_key)
+            if isinstance(fallback, dict) and fallback:
+                kalshi_data = fallback
+                kalshi_stale = True
+                kalshi_error = f"Live Kalshi feed reconnecting: {exc}"
+            else:
+                kalshi_error = str(exc)
 
 
     # Dual-purpose research signals: deliberately conservative, not calibrated probabilities.
     @st.cache_data(ttl=2, show_spinner=False)
     def recent_exchange_trades():
-        r = requests.get(f"{COINBASE}/products/BTC-USD/trades", headers=HEADERS, timeout=9)
+        r = HTTP.get(f"{COINBASE}/products/BTC-USD/trades", headers=HEADERS, timeout=9)
         r.raise_for_status()
         trades = r.json()
         if not isinstance(trades, list):
@@ -1508,7 +1542,7 @@ def render_live_dashboard():
     @st.cache_data(ttl=15, show_spinner=False)
     def blockchain_activity():
         # Unconfirmed transactions are NOT attributed to whales or exchanges.
-        r = requests.get("https://mempool.space/api/mempool", timeout=9)
+        r = HTTP.get("https://mempool.space/api/mempool", timeout=9)
         r.raise_for_status()
         data = r.json()
         return int(data.get("count", 0)), int(data.get("vsize", 0))
@@ -1771,6 +1805,9 @@ def render_live_dashboard():
             st.markdown(f'<div class="compact-status">🎯 {html.escape(str(active_ticker))} · {html.escape(str(market_status))}</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="compact-status">⚠️ No active Kalshi BTC 15m contract selected</div>', unsafe_allow_html=True)
+        if kalshi_stale:
+            age = max(0, int(time.time() - float(st.session_state.get(f"_last_good_kalshi_ts::{active_ticker}", time.time()))))
+            st.caption(f"⚠️ Kalshi feed reconnecting — showing last good quotes ({age}s old).")
         timeframe = st.radio("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True, label_visibility="collapsed", key="candle_size_compact")
         with st.expander("⚙️ Chart options", expanded=False):
             window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
@@ -2350,5 +2387,22 @@ def render_live_dashboard():
     """)
     st.caption(f"Last dashboard update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} • Data may be delayed.")
 
+
+@_fragment(run_every=live_run_every)
+def render_live_dashboard():
+    try:
+        _render_live_dashboard_inner()
+        st.session_state["_last_live_render_ok"] = time.time()
+        st.session_state.pop("_last_live_render_error", None)
+    except Exception as exc:
+        # Never let a transient API/data-shape hiccup take down the entire mobile app.
+        # The fragment will retry automatically on the next interval.
+        st.session_state["_last_live_render_error"] = f"{type(exc).__name__}: {exc}"
+        st.warning("Live data hit a temporary refresh error. Keeping the app open and retrying automatically…")
+        last_ok = st.session_state.get("_last_live_render_ok")
+        if last_ok:
+            st.caption(f"Last successful live render: {max(0, int(time.time()-float(last_ok)))}s ago")
+        with st.expander("Technical detail", expanded=False):
+            st.code(st.session_state["_last_live_render_error"])
 
 render_live_dashboard()
