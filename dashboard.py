@@ -1,4 +1,6 @@
 import time
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import requests
 import pandas as pd
@@ -132,6 +134,335 @@ def get_spot_price():
     r = requests.get(f"{COINBASE}/products/BTC-USD/ticker", headers=HEADERS, timeout=6)
     r.raise_for_status()
     return float(r.json()["price"])
+
+
+def _fetch_reference_venue(name):
+    """Public spot quotes from BRTI constituent exchanges.
+
+    This is only a proxy for CME CF BRTI. Kalshi settles KXBTC15M against the
+    official BRTI, which is licensed benchmark data and is not reproduced here.
+    """
+    try:
+        if name == "Coinbase":
+            r = requests.get(f"{COINBASE}/products/BTC-USD/ticker", headers=HEADERS, timeout=4)
+            r.raise_for_status()
+            return name, float(r.json()["price"])
+        if name == "Kraken":
+            r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair":"XBTUSD"}, timeout=4)
+            r.raise_for_status()
+            body = r.json()
+            if body.get("error"):
+                return name, None
+            result = body.get("result") or {}
+            row = next(iter(result.values()), None)
+            return name, float(row["c"][0]) if row else None
+        if name == "Bitstamp":
+            r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=4)
+            r.raise_for_status()
+            return name, float(r.json()["last"])
+        if name == "Gemini":
+            r = requests.get("https://api.gemini.com/v1/pubticker/btcusd", timeout=4)
+            r.raise_for_status()
+            return name, float(r.json()["last"])
+    except Exception:
+        return name, None
+    return name, None
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def get_brti_proxy():
+    """Robust multi-exchange proxy for the BRTI settlement reference.
+
+    Uses public prices from several current CME CF BRTI constituent exchanges.
+    The median reduces single-exchange basis noise. It is *not* the official BRTI.
+    """
+    venues = ("Coinbase", "Kraken", "Bitstamp", "Gemini")
+    prices = {}
+    with ThreadPoolExecutor(max_workers=len(venues)) as pool:
+        futures = [pool.submit(_fetch_reference_venue, v) for v in venues]
+        for fut in as_completed(futures):
+            try:
+                name, value = fut.result()
+                if value is not None and np.isfinite(value) and value > 1000:
+                    prices[name] = float(value)
+            except Exception:
+                pass
+    if not prices:
+        return {"price": None, "venues": {}, "count": 0, "dispersion_bps": None}
+    vals = np.array(list(prices.values()), dtype=float)
+    med = float(np.median(vals))
+    # Drop a venue only if it is wildly detached (>1%) from the cross-venue median.
+    keep = {k:v for k,v in prices.items() if abs(v/med - 1.0) <= 0.01}
+    if keep:
+        vals = np.array(list(keep.values()), dtype=float)
+        med = float(np.median(vals))
+        prices = keep
+    dispersion_bps = float(np.max(np.abs(vals/med - 1.0))*10000) if len(vals) else None
+    return {"price": med, "venues": prices, "count": len(prices), "dispersion_bps": dispersion_bps}
+
+
+def _normalize_history_rows(rows):
+    df = pd.DataFrame(rows, columns=["time", "low", "high", "open", "close", "volume"])
+    if df.empty:
+        return df
+    for col in ("time", "low", "high", "open", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["time", "low", "high", "open", "close"])
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def get_outcome_history(hours=24):
+    """Fetch enough 1-minute history for empirical forward-return analogs.
+
+    Coinbase caps candle requests at 300 buckets. Chunks are fetched in parallel
+    and cached so the 2-3 second live UI does not repeatedly pay the history cost.
+    """
+    hours = int(np.clip(hours, 6, 48))
+    target_minutes = hours * 60
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    intervals = []
+    remaining = target_minutes
+    cursor_end = end
+    while remaining > 0 and len(intervals) < 12:
+        size = min(290, remaining)
+        start = cursor_end - pd.Timedelta(minutes=size)
+        intervals.append((start, cursor_end))
+        remaining -= size
+        cursor_end = start - pd.Timedelta(minutes=1)
+
+    def fetch_interval(pair):
+        start, stop = pair
+        params = {"granularity": 60, "start": start.isoformat(), "end": stop.isoformat()}
+        try:
+            r = requests.get(f"{COINBASE}/products/BTC-USD/candles", params=params, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            return _normalize_history_rows(r.json())
+        except Exception:
+            return pd.DataFrame()
+
+    chunks = []
+    with ThreadPoolExecutor(max_workers=min(6, len(intervals) or 1)) as pool:
+        for part in pool.map(fetch_interval, intervals):
+            if part is not None and not part.empty:
+                chunks.append(part)
+    if not chunks:
+        return pd.DataFrame(columns=["time","low","high","open","close","volume"])
+    out = pd.concat(chunks, ignore_index=True)
+    out = out.drop_duplicates("time").sort_values("time").tail(target_minutes+5).reset_index(drop=True)
+    return out
+
+
+def _normal_cdf(x):
+    try:
+        return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+    except Exception:
+        return 0.5
+
+
+def _logistic(x):
+    x = float(np.clip(x, -12, 12))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _weighted_quantile(values, weights, q):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    if not mask.any():
+        return np.nan
+    values, weights = values[mask], weights[mask]
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+    c = np.cumsum(weights) / np.sum(weights)
+    return float(np.interp(float(q), c, values))
+
+
+def empirical_analog_probability(history, current_price, strike, remaining_min):
+    """Nearest-regime empirical probability of finishing above the strike.
+
+    We compare the current 5m/15m momentum, realized volatility and EMA gap with
+    prior minutes, then inspect what BTC did over the same remaining horizon.
+    This is intentionally non-parametric and returns its effective sample size.
+    """
+    if history is None or len(history) < 240 or strike is None or current_price <= 0:
+        return None
+    df = history.copy().sort_values("time").drop_duplicates("time")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    if c.notna().sum() < 240:
+        return None
+    # Patch the latest close toward the current multi-venue proxy while keeping the
+    # historical return structure from Coinbase.
+    c = c.copy()
+    c.iloc[-1] = float(current_price)
+    r1 = c.pct_change()
+    feat = pd.DataFrame(index=df.index)
+    feat["r5"] = c.pct_change(5)
+    feat["r15"] = c.pct_change(15)
+    feat["vol15"] = r1.rolling(15).std()
+    feat["vol45"] = r1.rolling(45).std()
+    ema5 = c.ewm(span=5, adjust=False).mean()
+    ema15 = c.ewm(span=15, adjust=False).mean()
+    feat["ema_gap"] = ema5 / ema15 - 1.0
+
+    horizon = int(np.clip(round(float(remaining_min)), 1, 15))
+    future_ret = c.shift(-horizon) / c - 1.0
+    candidates = feat.iloc[:-horizon].copy()
+    candidates["future_ret"] = future_ret.iloc[:-horizon]
+    candidates = candidates.dropna()
+    current = feat.iloc[-1]
+    if candidates.empty or current.isna().any():
+        return None
+    feature_cols = ["r5","r15","vol15","vol45","ema_gap"]
+    X = candidates[feature_cols].astype(float)
+    cur = current[feature_cols].astype(float)
+    med = X.median()
+    scale = (X.quantile(.75) - X.quantile(.25)).replace(0, np.nan) / 1.349
+    scale = scale.fillna(X.std().replace(0, np.nan)).fillna(1e-6).clip(lower=1e-6)
+    # Momentum features matter a little more than the slow volatility regime.
+    feature_w = pd.Series({"r5":1.35,"r15":1.15,"vol15":.9,"vol45":.7,"ema_gap":1.0})
+    z = ((X - cur) / scale) ** 2
+    dist = np.sqrt((z * feature_w).sum(axis=1))
+    k = int(np.clip(len(candidates) * 0.16, 80, 220))
+    nearest = dist.nsmallest(min(k, len(dist))).index
+    d = dist.loc[nearest].to_numpy(dtype=float)
+    y = candidates.loc[nearest, "future_ret"].to_numpy(dtype=float)
+    # Smooth weights stop the single closest match from dominating.
+    base = max(float(np.nanmedian(d)), 0.35)
+    w = np.exp(-0.5 * (d / base) ** 2)
+    required = float(strike/current_price - 1.0)
+    hits = (y >= required).astype(float)
+    if np.sum(w) <= 0:
+        return None
+    p = float(np.sum(w * hits) / np.sum(w))
+    eff_n = float((np.sum(w) ** 2) / max(np.sum(w*w), 1e-9))
+    se = float(math.sqrt(max(p*(1-p), .0001) / max(eff_n, 1.0)))
+    return {
+        "prob": float(np.clip(p, .01, .99)),
+        "effective_n": eff_n,
+        "se": se,
+        "horizon_min": horizon,
+        "required_return": required,
+        "q10": _weighted_quantile(y, w, .10),
+        "q50": _weighted_quantile(y, w, .50),
+        "q90": _weighted_quantile(y, w, .90),
+    }
+
+
+def parametric_strike_probability(history, current_price, strike, remaining_min):
+    """Short-horizon log-return model using robust recent realized volatility."""
+    if history is None or len(history) < 60 or strike is None or current_price <= 0:
+        return None
+    c = pd.to_numeric(history["close"], errors="coerce").dropna().astype(float)
+    if len(c) < 60:
+        return None
+    c = c.copy()
+    c.iloc[-1] = float(current_price)
+    lr = np.log(c / c.shift(1)).dropna()
+    tail30 = lr.tail(30)
+    tail120 = lr.tail(min(120, len(lr)))
+    sigma = float(max(tail30.std(ddof=1), .65 * tail120.std(ddof=1), 1e-6))
+    # Drift is aggressively shrunk because minute-level BTC drift is noisy.
+    ewma_mu = float(lr.ewm(span=20, adjust=False).mean().iloc[-1])
+    mu = float(np.clip(ewma_mu * .20, -0.20*sigma, 0.20*sigma))
+    # Kalshi settles on the average BRTI during the final minute. For periods
+    # earlier than that, the average behaves roughly like a price observed near
+    # the midpoint of that final minute rather than the exact expiry tick.
+    h = max(float(remaining_min) - .50, .20)
+    mean = mu * h
+    sigma_h = sigma * math.sqrt(h)
+    threshold = math.log(float(strike) / float(current_price))
+    z = (threshold - mean) / max(sigma_h, 1e-9)
+    p = 1.0 - _normal_cdf(z)
+    return {
+        "prob": float(np.clip(p, .005, .995)),
+        "sigma_1m": sigma,
+        "sigma_h": sigma_h,
+        "z_distance": float(-threshold / max(sigma_h, 1e-9)),
+        "expected_move_dollars": float(current_price * sigma_h),
+    }
+
+
+def market_implied_probability(snapshot):
+    if not snapshot:
+        return None
+    bid, ask = snapshot.get("yes_bid"), snapshot.get("yes_ask")
+    if bid is not None and ask is not None:
+        mid = (float(bid) + float(ask)) / 2.0
+    elif ask is not None:
+        mid = float(ask)
+    elif bid is not None:
+        mid = float(bid)
+    else:
+        nbid, nask = snapshot.get("no_bid"), snapshot.get("no_ask")
+        if nbid is not None and nask is not None:
+            mid = 100.0 - (float(nbid)+float(nask))/2.0
+        elif nask is not None:
+            mid = 100.0 - float(nask)
+        elif nbid is not None:
+            mid = 100.0 - float(nbid)
+        else:
+            return None
+    return float(np.clip(mid/100.0, .01, .99))
+
+
+def _time_weighted_observed_average(samples, start_ts, end_ts):
+    """Approximate the average proxy price over an observed sub-window."""
+    pts = sorted((float(t), float(v)) for t,v in samples if np.isfinite(v))
+    if not pts or end_ts <= start_ts:
+        return None, 0.0
+    before = [x for x in pts if x[0] <= start_ts]
+    within = [x for x in pts if start_ts < x[0] <= end_ts]
+    if before:
+        value = before[-1][1]
+    elif within:
+        value = within[0][1]
+    else:
+        return None, 0.0
+    cursor = float(start_ts)
+    total = 0.0
+    for ts, val in within:
+        if ts > cursor:
+            total += value * (ts-cursor)
+            cursor = ts
+        value = val
+    if end_ts > cursor:
+        total += value * (end_ts-cursor)
+    dur = float(end_ts-start_ts)
+    return (total/dur if dur > 0 else None), dur
+
+
+def final_minute_probability(proxy_price, strike, expiry_ts, samples, sigma_1m):
+    """Approximate Kalshi's 60-second settlement average during the final minute."""
+    if proxy_price is None or strike is None or expiry_ts is None or sigma_1m is None:
+        return None
+    now_ts = time.time()
+    window_start = float(expiry_ts) - 60.0
+    if now_ts < window_start or now_ts >= float(expiry_ts):
+        return None
+    obs_avg, observed = _time_weighted_observed_average(samples, window_start, now_ts)
+    if obs_avg is None:
+        obs_avg = float(proxy_price)
+        observed = max(0.0, now_ts-window_start)
+    remaining = max(0.1, float(expiry_ts)-now_ts)
+    # Required mean price over the unseen remainder for the full 60s average to
+    # finish at/above the strike.
+    required_future_avg = (60.0*float(strike) - observed*float(obs_avg)) / remaining
+    # The average of a diffusion over a short interval has lower variance than the
+    # terminal price. sqrt(T/3) is the Brownian-average scale.
+    t_min = remaining / 60.0
+    sigma_avg = float(sigma_1m) * math.sqrt(max(t_min, 1e-5) / 3.0)
+    threshold = math.log(max(required_future_avg, 1e-9) / float(proxy_price))
+    z = threshold / max(sigma_avg, 1e-9)
+    p = 1.0 - _normal_cdf(z)
+    return {
+        "prob": float(np.clip(p, .001, .999)),
+        "observed_sec": float(np.clip(observed, 0, 60)),
+        "observed_avg": float(obs_avg),
+        "required_future_avg": float(required_future_avg),
+        "remaining_sec": float(remaining),
+    }
 
 @st.cache_data(ttl=1, show_spinner=False)
 def get_market(ticker):
@@ -602,6 +933,10 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Signal controls**")
     min_edge = st.slider("Minimum model edge (percentage points)", 1, 20, 5)
+    outcome_conf_gate = st.slider(
+        "Minimum confidence for ABOVE/BELOW call", 45, 85, 60,
+        help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
+    )
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
@@ -713,24 +1048,33 @@ def render_live_dashboard():
         data = r.json()
         return int(data.get("count", 0)), int(data.get("vsize", 0))
 
-    def research_signals(frame, snapshot, exchange_trades, candle_intel):
+    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples):
         closes = frame["close"].astype(float)
         if len(closes) < 40:
             return {"outcome": "UNCERTAIN", "scalp": "WAIT", "reason": "Insufficient BTC history", "momentum": 0.0,
                     "pressure": None, "bid_balance": None, "spread": None, "target": None,
-                    "outcome_score": 0.0, "scalp_score": 0.0}
-        p = float(closes.iloc[-1])
-        r5 = p / float(closes.iloc[-6]) - 1
-        r15 = p / float(closes.iloc[-16]) - 1
-        vol = float(closes.pct_change().tail(40).std())
+                    "outcome_score": 0.0, "scalp_score": 0.0, "prob_above": None,
+                    "prob_below": None, "confidence": 0.0, "confidence_label": "LOW",
+                    "components": {}, "reference_price": float(closes.iloc[-1])}
+
+        coinbase_p = float(closes.iloc[-1])
+        proxy_p = brti_proxy.get("price") if isinstance(brti_proxy, dict) else None
+        reference_price = float(proxy_p) if proxy_p is not None and np.isfinite(proxy_p) else coinbase_p
+        r5 = coinbase_p / float(closes.iloc[-6]) - 1
+        r15 = coinbase_p / float(closes.iloc[-16]) - 1
+        vol = float(closes.pct_change().tail(60).std())
         momentum = (r5 + 0.5 * r15) / max(vol * np.sqrt(15), 0.00001)
+
         pressure = None
         if exchange_trades:
             total = sum(v for _, v in exchange_trades)
             pressure = sum((1 if side == "buy" else -1) * v for side, v in exchange_trades) / total if total else None
+
         balance, spread = None, None
         target = extract_strike(snapshot)
         remaining_min = 15.0
+        remaining_sec = 900.0
+        expiry_ts = None
         if snapshot:
             yes_depth = sum(q for _, q in snapshot["yes"][:5])
             no_depth = sum(q for _, q in snapshot["no"][:5])
@@ -741,45 +1085,147 @@ def render_live_dashboard():
             expiry = snapshot.get("market", {}).get("close_time") or snapshot.get("market", {}).get("expiration_time")
             if expiry:
                 try:
-                    remaining_min = float(np.clip((pd.to_datetime(expiry, utc=True) - pd.Timestamp.now(tz="UTC")).total_seconds()/60, .25, 15))
+                    expiry_dt = pd.to_datetime(expiry, utc=True)
+                    expiry_ts = float(expiry_dt.timestamp())
+                    remaining_sec = float(np.clip((expiry_dt - pd.Timestamp.now(tz="UTC")).total_seconds(), 1.0, 900.0))
+                    remaining_min = remaining_sec / 60.0
                 except Exception:
                     pass
 
-        # Expiry score: strike distance dominates; candles are confirmation, not destiny.
-        outcome_score = 0.0
-        if target is not None:
-            expected_move_frac = max(vol * np.sqrt(max(remaining_min, .25)), 0.00015)
-            zdist = ((p - target) / p) / expected_move_frac
-            outcome_score += 52 * np.tanh(zdist / 1.25)
-        outcome_score += 14 * np.tanh(momentum / 1.5)
-        outcome_score += 18 * (candle_intel.get("outcome_score", 0.0) / 100.0)
-        if pressure is not None: outcome_score += 8 * pressure
-        if balance is not None: outcome_score += 8 * balance
-        outcome_score = float(np.clip(outcome_score, -100, 100))
-        outcome = "YES LEAN" if outcome_score >= 20 else "NO LEAN" if outcome_score <= -20 else "UNCERTAIN"
+        # Build independent estimates. The engine intentionally refuses to create a
+        # strong call when the strike is missing, models disagree, or data quality is poor.
+        stat = parametric_strike_probability(outcome_history if outcome_history is not None and len(outcome_history) >= 60 else frame,
+                                              reference_price, target, remaining_min)
+        analog = empirical_analog_probability(outcome_history, reference_price, target, remaining_min)
+        market_p = market_implied_probability(snapshot)
 
-        # Scalp score reacts faster: 1m/5m candle action + aggressive trades + visible Kalshi depth.
-        scalp_score = 32 * np.tanh(momentum / 1.25)
-        scalp_score += 34 * (candle_intel.get("scalp_score", 0.0) / 100.0)
-        if pressure is not None: scalp_score += 20 * pressure
-        if balance is not None: scalp_score += 14 * balance
+        # Flow probability is only a small confirmation component. It cannot overpower
+        # strike distance or the market-implied/statistical estimates.
+        flow_signal = 0.55 * np.tanh(momentum / 1.5)
+        flow_signal += 0.65 * (candle_intel.get("outcome_score", 0.0) / 100.0)
+        if pressure is not None:
+            flow_signal += 0.45 * pressure
+        if balance is not None:
+            flow_signal += 0.35 * balance
+        flow_p = _logistic(1.65 * flow_signal)
+
+        final_min = None
+        if stat and expiry_ts and target is not None and proxy_samples:
+            final_min = final_minute_probability(reference_price, target, expiry_ts, proxy_samples, stat.get("sigma_1m"))
+
+        components = {}
+        def add_component(name, prob, weight):
+            if prob is not None and np.isfinite(prob):
+                components[name] = {"prob": float(np.clip(prob, .001, .999)), "weight": float(max(weight, 0.0))}
+
+        # Dynamic weights: distance/statistics and market consensus dominate late in
+        # the contract; historical analogs matter more earlier. The special final-minute
+        # average model gets the largest weight once Kalshi's 60-second settlement
+        # window has started.
+        urgency = float(np.clip(1.0 - remaining_min/15.0, 0.0, 1.0))
+        w_stat = .25 + .13*urgency
+        w_analog = .34 - .16*urgency
+        w_market = .28 + .08*urgency
+        w_flow = .13 - .05*urgency
+        if final_min is not None:
+            w_stat, w_analog, w_market, w_flow = .23, .08, .25, .04
+            add_component("final_60s_avg", final_min.get("prob"), .40)
+        add_component("statistical", stat.get("prob") if stat else None, w_stat)
+        add_component("historical_analogs", analog.get("prob") if analog else None, w_analog)
+        add_component("kalshi_market", market_p, w_market)
+        add_component("flow_candles", flow_p, w_flow)
+
+        if target is None or not components:
+            prob_above = None
+            confidence = 0.0
+            confidence_label = "LOW"
+            outcome = "UNCERTAIN"
+            outcome_score = 0.0
+            disagreement = None
+        else:
+            total_w = sum(v["weight"] for v in components.values())
+            if total_w <= 0:
+                total_w = 1.0
+            for v in components.values():
+                v["norm_weight"] = v["weight"] / total_w
+            prob_above = sum(v["prob"]*v["norm_weight"] for v in components.values())
+            probs = np.array([v["prob"] for v in components.values()], dtype=float)
+            ws = np.array([v["norm_weight"] for v in components.values()], dtype=float)
+            disagreement = float(math.sqrt(np.sum(ws * (probs-prob_above)**2))) if len(probs) > 1 else 0.0
+            prob_above = float(np.clip(prob_above, .005, .995))
+
+            separation = float(abs(prob_above-.5)*2.0)
+            agreement = float(np.clip(1.0 - disagreement/.22, 0.0, 1.0))
+            z_strength = float(np.clip(abs(stat.get("z_distance", 0.0))/2.0, 0.0, 1.0)) if stat else 0.0
+            analog_quality = float(np.clip((analog.get("effective_n", 0.0) if analog else 0.0)/120.0, 0.0, 1.0))
+            venue_quality = float(np.clip((brti_proxy.get("count", 0) if isinstance(brti_proxy, dict) else 0)/4.0, 0.0, 1.0))
+            spread_quality = 1.0 if spread is not None and spread <= 3 else .65 if spread is not None and spread <= 7 else .35
+            quality = .35*venue_quality + .30*analog_quality + .20*spread_quality + .15*(1.0 if stat else 0.0)
+            if final_min is not None:
+                coverage = float(np.clip(final_min.get("observed_sec", 0.0)/60.0, 0.0, 1.0))
+                quality = max(quality, .55 + .35*coverage)
+            confidence = float(np.clip(100*(.40*separation + .27*agreement + .18*z_strength + .15*quality), 0, 100))
+
+            # Hard caps prevent false certainty when the reference proxy is thin or
+            # when the competing models strongly disagree.
+            venue_count = brti_proxy.get("count", 0) if isinstance(brti_proxy, dict) else 0
+            dispersion_bps = brti_proxy.get("dispersion_bps") if isinstance(brti_proxy, dict) else None
+            if venue_count < 2:
+                confidence = min(confidence, 55.0)
+            if dispersion_bps is not None and dispersion_bps > 15:
+                confidence = min(confidence, 62.0)
+            if disagreement is not None and disagreement > .18:
+                confidence = min(confidence, 58.0)
+            if analog and analog.get("se", 0) > .07:
+                confidence = min(confidence, 65.0)
+
+            confidence_label = "VERY HIGH" if confidence >= 82 else "HIGH" if confidence >= 68 else "MEDIUM" if confidence >= 52 else "LOW"
+            # Conservative call gate: better to show UNCERTAIN than manufacture certainty.
+            strong_gate = confidence >= max(float(outcome_conf_gate)+10.0, 68.0) and (prob_above >= .78 or prob_above <= .22)
+            normal_gate = confidence >= float(outcome_conf_gate) and (prob_above >= .66 or prob_above <= .34)
+            if strong_gate:
+                outcome = "ABOVE · STRONG" if prob_above > .5 else "BELOW · STRONG"
+            elif normal_gate:
+                outcome = "ABOVE" if prob_above > .5 else "BELOW"
+            else:
+                outcome = "UNCERTAIN"
+            outcome_score = float(np.clip((prob_above-.5)*200.0, -100, 100))
+
+        # Scalp model reacts faster and now includes model-vs-market edge.
+        scalp_score = 28 * np.tanh(momentum / 1.25)
+        scalp_score += 30 * (candle_intel.get("scalp_score", 0.0) / 100.0)
+        if pressure is not None: scalp_score += 18 * pressure
+        if balance is not None: scalp_score += 12 * balance
+        model_edge = None
+        if prob_above is not None and market_p is not None:
+            model_edge = (prob_above-market_p)*100.0
+            scalp_score += float(np.clip(model_edge*1.25, -20, 20))
         scalp_score = float(np.clip(scalp_score, -100, 100))
 
         scalp = "WAIT"
-        reason = "Signals disagree, quotes are missing, or the edge is too small"
-        liquid = snapshot and spread is not None and 0 <= spread <= 3 and pressure is not None and balance is not None
-        if liquid and scalp_score >= 34 and candle_intel.get("quality") != "LOW":
-            scalp, reason = "WATCH YES", "Candle structure, BTC momentum and live flow align upward; verify price/fees"
-        elif liquid and scalp_score <= -34 and candle_intel.get("quality") != "LOW":
-            scalp, reason = "WATCH NO", "Candle structure, BTC momentum and live flow align downward; verify price/fees"
-        elif liquid and abs(scalp_score) >= 42:
-            # A strong non-candle signal can still be watched, but label it as lower confirmation.
+        reason = "Signals disagree, quotes are missing, or the model edge is too small"
+        liquid = snapshot and spread is not None and 0 <= spread <= 5 and pressure is not None and balance is not None
+        if liquid and model_edge is not None and model_edge >= min_edge and scalp_score >= 30 and candle_intel.get("quality") != "LOW":
+            scalp, reason = "WATCH YES", "Model probability exceeds Kalshi YES pricing and short-term flow confirms upward"
+        elif liquid and model_edge is not None and model_edge <= -min_edge and scalp_score <= -30 and candle_intel.get("quality") != "LOW":
+            scalp, reason = "WATCH NO", "Model probability is below Kalshi YES pricing and short-term flow confirms downward"
+        elif liquid and abs(scalp_score) >= 45:
             scalp = "WATCH YES" if scalp_score > 0 else "WATCH NO"
-            reason = "Strong flow/momentum, but candle confirmation is weak; use extra caution"
+            reason = "Strong short-term flow, but the probability edge is not fully confirmed"
 
-        return {"outcome": outcome, "scalp": scalp, "reason": reason, "momentum": momentum,
-                "pressure": pressure, "bid_balance": balance, "spread": spread, "target": target,
-                "outcome_score": outcome_score, "scalp_score": scalp_score}
+        return {
+            "outcome": outcome, "scalp": scalp, "reason": reason, "momentum": momentum,
+            "pressure": pressure, "bid_balance": balance, "spread": spread, "target": target,
+            "outcome_score": outcome_score, "scalp_score": scalp_score,
+            "prob_above": prob_above, "prob_below": (1.0-prob_above) if prob_above is not None else None,
+            "confidence": confidence, "confidence_label": confidence_label,
+            "components": components, "disagreement": disagreement,
+            "reference_price": reference_price, "coinbase_price": coinbase_p,
+            "remaining_min": remaining_min, "remaining_sec": remaining_sec,
+            "analog": analog, "stat": stat, "market_prob": market_p,
+            "flow_prob": flow_p, "final_minute": final_min, "model_edge": model_edge,
+            "brti_proxy": brti_proxy,
+        }
 
     try:
         whale_trades = recent_exchange_trades()
@@ -791,9 +1237,33 @@ def render_live_dashboard():
         chain_error = None
     except (requests.RequestException, ValueError, TypeError) as exc:
         chain_count, chain_vsize, chain_error = None, None, str(exc)
+    # Outcome Fusion v2 uses a multi-exchange proxy aligned with Kalshi's actual
+    # CME CF BRTI settlement source, plus a deeper cached history for empirical analogs.
+    try:
+        brti_proxy = get_brti_proxy()
+    except Exception:
+        brti_proxy = {"price": None, "venues": {}, "count": 0, "dispersion_bps": None}
+    try:
+        outcome_history = get_outcome_history(24)
+    except Exception:
+        outcome_history = pd.DataFrame()
+
+    proxy_samples = []
+    proxy_value = brti_proxy.get("price") if isinstance(brti_proxy, dict) else None
+    if proxy_value is not None and np.isfinite(proxy_value):
+        sample_key = f"brti_proxy_samples::{active_ticker or 'none'}"
+        prior = list(st.session_state.get(sample_key, []))
+        now_sample = time.time()
+        prior.append((now_sample, float(proxy_value)))
+        # Keep enough history for Kalshi's 60-second settlement averaging window.
+        prior = [(t,v) for t,v in prior if now_sample-float(t) <= 90]
+        st.session_state[sample_key] = prior[-80:]
+        proxy_samples = prior
+
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
-    engine = research_signals(candles, kalshi_data, whale_trades, candle_engine)
+    engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
+                              outcome_history, brti_proxy, proxy_samples)
 
     # Compact mobile navigation. Short labels keep all three choices on one row.
     selected_page = st.radio(
@@ -889,6 +1359,7 @@ def render_live_dashboard():
             "timeframe": timeframe,
             "visible": visible_count,
             "strike": strike_value,
+            "reference": float(engine.get("reference_price")) if engine.get("reference_price") is not None else None,
         }, allow_nan=False)
         chart_html = r"""<!doctype html><html><head>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
@@ -900,7 +1371,7 @@ def render_live_dashboard():
           border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
         #error{color:#ff9eaa;padding:15px;display:none}
         </style></head><body>
-        <div id="frame"><div id="status">BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
+        <div id="frame"><div id="status">COINBASE BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
         <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
         <script>
         const data=__PAYLOAD__;
@@ -937,6 +1408,16 @@ def render_live_dashboard():
               lineStyle:LC.LineStyle.Dashed,
               axisLabelVisible:true,
               title:'STRIKE'
+            });
+          }
+          if (Number.isFinite(data.reference)) {
+            main.createPriceLine({
+              price:data.reference,
+              color:'#60a5fa',
+              lineWidth:1,
+              lineStyle:LC.LineStyle.Dotted,
+              axisLabelVisible:true,
+              title:'BRTI PROXY'
             });
           }
 
@@ -1018,11 +1499,14 @@ def render_live_dashboard():
         </script></body></html>"""
         chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
         components.html(chart_html, height=308, scrolling=False)
+        refresh_label = refresh_mode.replace(" · ", " ")
         if strike_value is not None:
             side_text = "ABOVE" if price >= strike_value else "BELOW"
-            st.caption(f"🔴 Strike ${strike_value:,.2f} · BTC is {side_text} by ${abs(price-strike_value):,.2f} · ⚡ {refresh_mode.replace(" · ", " ")} · 👆 Drag · 🤏 Pinch zoom")
+            ref_now = float(engine.get("reference_price") or price)
+            ref_side = "ABOVE" if ref_now >= strike_value else "BELOW"
+            st.caption(f"🔴 Strike ${strike_value:,.2f} · Coinbase {side_text} ${abs(price-strike_value):,.2f} · BRTI proxy {ref_side} ${abs(ref_now-strike_value):,.2f} · ⚡ {refresh_label} · 👆 Drag · 🤏 Pinch")
         else:
-            st.caption(f"⚡ {refresh_mode.replace(' · ', ' ')} · 👆 Drag · 🤏 Pinch zoom · Tap candle · Strike unavailable for this contract")
+            st.caption(f"⚡ {refresh_label} · 👆 Drag · 🤏 Pinch zoom · Tap candle · Strike unavailable for this contract")
         # Compact all essential live information into one terminal-style panel.
         expiry_raw = None
         if kalshi_data:
@@ -1039,14 +1523,7 @@ def render_live_dashboard():
         else:
             target_text, distance_text = "—", "—"
 
-        momentum = float(np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100))
-        if momentum > 8:
-            mood, mood_color = "UPWARD MOMENTUM", "#36d7a4"
-        elif momentum < -8:
-            mood, mood_color = "DOWNWARD MOMENTUM", "#ff6c78"
-        else:
-            mood, mood_color = "NO CLEAR EDGE", "#ffcf77"
-
+        # Outcome-first terminal: prioritize the settlement estimate and model confidence.
         timer_expiry = None
         if expiry_raw:
             try:
@@ -1057,13 +1534,45 @@ def render_live_dashboard():
         no_buy = show_price(kalshi_data["no_ask"]) if kalshi_data else "—"
         yes_sell = show_price(kalshi_data["yes_bid"]) if kalshi_data else "—"
         no_sell = show_price(kalshi_data["no_bid"]) if kalshi_data else "—"
-        whale_pressure = f"{engine['pressure']:+.0%}" if engine.get("pressure") is not None else "—"
+
+        ref_price = float(engine.get("reference_price") or price)
+        if target_text != "—":
+            try:
+                ref_distance = ref_price - float(target_value)
+                distance_text = f"${ref_distance:+,.0f}"
+            except Exception:
+                pass
+        prob_above = engine.get("prob_above")
+        prob_below = engine.get("prob_below")
+        prob_above_text = f"{prob_above*100:.0f}%" if prob_above is not None else "—"
+        prob_below_text = f"{prob_below*100:.0f}%" if prob_below is not None else "—"
+        conf_text = f"{engine.get('confidence',0):.0f}/100"
+        conf_sub = str(engine.get("confidence_label", "LOW")).lower()
+        venues = int((engine.get("brti_proxy") or {}).get("count", 0))
+        proxy_sub = f"{venues} venue proxy · not official BRTI" if venues else "Coinbase fallback · not BRTI"
+        edge = engine.get("model_edge")
+        edge_text = f"edge {edge:+.1f}pp vs Kalshi" if edge is not None else "market edge unavailable"
+        final_min = engine.get("final_minute")
+        if final_min:
+            settle_note = f"final-60s proxy {final_min.get('observed_sec',0):.0f}s observed"
+        else:
+            settle_note = "Kalshi settles on 60s BRTI average"
+
+        outcome_text = str(engine.get("outcome", "UNCERTAIN"))
+        if outcome_text.startswith("ABOVE"):
+            mood, mood_color = "OUTCOME MODEL FAVORS ABOVE", "#36d7a4"
+        elif outcome_text.startswith("BELOW"):
+            mood, mood_color = "OUTCOME MODEL FAVORS BELOW", "#ff6c78"
+        else:
+            mood, mood_color = "NO HIGH-CONFIDENCE OUTCOME CALL", "#ffcf77"
+
         intel = {
-            "expiry": timer_expiry, "btc": f"${price:,.0f}", "yes": yes_buy, "no": no_buy,
-            "yesSell": yes_sell, "noSell": no_sell, "outcome": engine["outcome"],
-            "scalp": engine["scalp"], "whale": whale_pressure, "target": target_text,
-            "candle": candle_engine["bias"], "candleSub": f"{candle_engine['scalp_score']:+.0f} · {candle_engine['quality'].lower()}",
-            "distance": distance_text, "mood": mood, "moodColor": mood_color,
+            "expiry": timer_expiry, "btc": f"${ref_price:,.0f}", "yes": yes_buy, "no": no_buy,
+            "yesSell": yes_sell, "noSell": no_sell, "outcome": outcome_text,
+            "scalp": engine["scalp"], "target": target_text, "distance": distance_text,
+            "above": prob_above_text, "below": prob_below_text, "confidence": conf_text,
+            "confSub": conf_sub, "proxySub": proxy_sub, "edge": edge_text,
+            "settleNote": settle_note, "mood": mood, "moodColor": mood_color,
         }
         intel_json = json.dumps(intel)
         intel_html = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1072,32 +1581,33 @@ def render_live_dashboard():
         .panel{border:1px solid #71303d;border-radius:11px;background:linear-gradient(125deg,#210e17,#10111a 72%);padding:8px}
         .head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
         .mood{font-size:10px;font-weight:900;letter-spacing:.08em}.sub{font-size:9px;color:#967985;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:5px}.grid4b{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:5px}
+        .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.grid4b{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:5px}
         .tile{background:#111722;border:1px solid #302631;border-radius:8px;padding:6px;min-width:0}.tile small{display:block;color:#8197b2;font-size:8px;font-weight:800;letter-spacing:.06em;white-space:nowrap}
         .tile strong{display:block;margin-top:2px;font-size:13px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tile em{display:block;margin-top:2px;color:#8fa0b3;font-size:8px;font-style:normal;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .foot{margin-top:5px;color:#8e7a84;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        @media(max-width:430px){.panel{padding:6px}.grid4,.grid3,.grid4b{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
+        @media(max-width:430px){.panel{padding:6px}.grid4,.grid4b{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
         </style></head><body><div class="panel">
-          <div class="head"><div class="mood" id="mood"></div><div class="sub">15M OUTCOME + SCALP + FLOW</div></div>
+          <div class="head"><div class="mood" id="mood"></div><div class="sub">OUTCOME FUSION · BRTI-AWARE PROXY</div></div>
           <div class="grid4">
-            <div class="tile"><small>TIME LEFT</small><strong id="count">--:--</strong><em>live</em></div>
-            <div class="tile"><small>BTC</small><strong id="btc"></strong><em id="target"></em></div>
+            <div class="tile"><small>TIME LEFT</small><strong id="count">--:--</strong><em id="settleNote"></em></div>
+            <div class="tile"><small>BRTI PROXY</small><strong id="btc"></strong><em id="proxySub"></em></div>
             <div class="tile"><small>YES BUY</small><strong id="yes"></strong><em id="yesSell"></em></div>
             <div class="tile"><small>NO BUY</small><strong id="no"></strong><em id="noSell"></em></div>
           </div>
           <div class="grid4b">
-            <div class="tile"><small>OUTCOME</small><strong id="outcome"></strong><em>expiration lean</em></div>
+            <div class="tile"><small>OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
+            <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
+            <div class="tile"><small>MODEL CONF</small><strong id="confidence"></strong><em id="confSub"></em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>short-term watch</em></div>
-            <div class="tile"><small>CANDLES</small><strong id="candle"></strong><em id="candleSub"></em></div>
-            <div class="tile"><small>WHALE</small><strong id="whale"></strong><em>aggressive trades</em></div>
           </div>
           <div class="foot" id="distance"></div>
         </div><script>
         const d=__INTEL__;
-        for(const id of ['btc','yes','no','outcome','scalp','candle','whale']) document.getElementById(id).textContent=d[id]||'—';
+        for(const id of ['btc','yes','no','outcome','above','confidence','scalp']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
-        document.getElementById('target').textContent='target '+(d.target||'—');document.getElementById('candleSub').textContent=d.candleSub||'—';document.getElementById('distance').textContent='Price vs target: '+(d.distance||'—')+' · indicators only, not a guarantee';
-        const m=document.getElementById('mood');m.textContent=d.mood||'NO CLEAR EDGE';m.style.color=d.moodColor||'#ffcf77';
+        document.getElementById('below').textContent='below '+(d.below||'—');document.getElementById('confSub').textContent=d.confSub||'—';document.getElementById('proxySub').textContent=d.proxySub||'—';document.getElementById('edge').textContent=d.edge||'—';document.getElementById('settleNote').textContent=d.settleNote||'—';
+        document.getElementById('distance').textContent='Proxy vs target: '+(d.distance||'—')+' · official BRTI is the settlement source; this is an estimate, not a guarantee';
+        const m=document.getElementById('mood');m.textContent=d.mood||'NO HIGH-CONFIDENCE OUTCOME CALL';m.style.color=d.moodColor||'#ffcf77';
         const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
         </script></body></html>""".replace("__INTEL__", intel_json)
         components.html(intel_html, height=164, scrolling=False)
@@ -1120,6 +1630,42 @@ def render_live_dashboard():
                 st.warning(f"Kalshi quotes unavailable: {kalshi_error}")
             else:
                 st.info("No active Kalshi contract selected.")
+
+            st.markdown("**Outcome Fusion v2**")
+            if engine.get("prob_above") is not None:
+                st.caption(
+                    f"Estimated ABOVE {engine['prob_above']*100:.1f}% · BELOW {engine['prob_below']*100:.1f}% · "
+                    f"model confidence {engine['confidence']:.0f}/100 ({engine['confidence_label']}) · call: {engine['outcome']}"
+                )
+                proxy_info = engine.get("brti_proxy") or {}
+                venue_text = ", ".join(f"{k} ${v:,.0f}" for k,v in (proxy_info.get("venues") or {}).items()) or "Coinbase fallback"
+                dispersion = proxy_info.get("dispersion_bps")
+                disp_text = f" · cross-venue dispersion {dispersion:.1f} bps" if dispersion is not None else ""
+                st.caption(f"BRTI-aware proxy ${engine['reference_price']:,.2f} from {venue_text}{disp_text}. This is not the official BRTI.")
+                comp_names = {
+                    "statistical":"realized-vol model",
+                    "historical_analogs":"24h historical analogs",
+                    "kalshi_market":"Kalshi market",
+                    "flow_candles":"flow + candles",
+                    "final_60s_avg":"final-60s average model",
+                }
+                comp_text = []
+                for name, row in (engine.get("components") or {}).items():
+                    comp_text.append(f"{comp_names.get(name,name)} {row['prob']*100:.0f}%")
+                if comp_text:
+                    st.caption("Components: " + " · ".join(comp_text))
+                stat_info = engine.get("stat") or {}
+                analog_info = engine.get("analog") or {}
+                if stat_info:
+                    st.caption(f"1σ expected move to settlement window ≈ ${stat_info.get('expected_move_dollars',0):,.0f} · strike distance z {stat_info.get('z_distance',0):+.2f}")
+                if analog_info:
+                    st.caption(f"Historical analog effective sample ≈ {analog_info.get('effective_n',0):.0f} · horizon {analog_info.get('horizon_min',0)}m · analog SE ≈ {analog_info.get('se',0)*100:.1f}pp")
+                if engine.get("final_minute"):
+                    fm = engine["final_minute"]
+                    st.caption(f"Final 60s window: {fm.get('observed_sec',0):.0f}s observed · proxy average ${fm.get('observed_avg',0):,.2f} · required remaining average ${fm.get('required_future_avg',0):,.2f}")
+            else:
+                st.caption("No settlement probability is available because the strike or required live inputs are missing.")
+            st.caption("Kalshi KXBTC15M settles from the simple average of 60 official BRTI values during the last minute. The dashboard uses a multi-exchange proxy and deliberately shows UNCERTAIN when evidence is not strong enough.")
 
             st.markdown("**Candle intelligence**")
             tf_text = " · ".join([f"{m}m {candle_engine['timeframes'][m]['score']:+.0f}" for m in (1,5,15)])
@@ -1152,9 +1698,12 @@ def render_live_dashboard():
                 st.session_state.paper_signals = []
             if st.button("Record current signals", type="secondary"):
                 st.session_state.paper_signals.append({"recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "ticker": active_ticker or "none", "btc": round(price, 2), "outcome_lean": engine["outcome"],
-                    "scalp_watch": engine["scalp"], "candle_bias": candle_engine["bias"],
-                    "candle_scalp_score": round(candle_engine["scalp_score"], 1),
+                    "ticker": active_ticker or "none", "coinbase_btc": round(price, 2),
+                    "brti_proxy": round(engine.get("reference_price", price), 2), "outcome_call": engine["outcome"],
+                    "prob_above_pct": round(engine.get("prob_above", np.nan)*100, 1) if engine.get("prob_above") is not None else np.nan,
+                    "model_confidence": round(engine.get("confidence", 0), 1), "scalp_watch": engine["scalp"],
+                    "model_edge_pp": round(engine.get("model_edge", np.nan), 1) if engine.get("model_edge") is not None else np.nan,
+                    "candle_bias": candle_engine["bias"], "candle_scalp_score": round(candle_engine["scalp_score"], 1),
                     "candle_expiry_score": round(candle_engine["outcome_score"], 1), "settled_result": "NOT VERIFIED"})
                 st.session_state.paper_signals = st.session_state.paper_signals[-200:]
             if st.session_state.paper_signals:
@@ -1208,43 +1757,49 @@ def render_live_dashboard():
                 st.markdown("**NO bids**")
                 st.dataframe(pd.DataFrame(no, columns=["Price (¢)", "Contracts"]).head(15), use_container_width=True, hide_index=True)
             st.subheader("Decision checklist")
-            if abs(direction_score) < 8:
-                st.warning("NO TRADE bias: BTC momentum is weak or mixed.")
-            elif yes and no and pd.notna(imbalance) and np.sign(direction_score) == np.sign(imbalance) and abs(imbalance) >= min_edge:
-                st.success("Momentum and visible depth align. Candidate only; verify price, spread, expiry and fees.")
+            if engine.get("outcome") == "UNCERTAIN":
+                st.warning(f"No high-confidence expiry call. Model confidence {engine.get('confidence',0):.0f}/100; avoid forcing a direction.")
+            elif engine.get("model_edge") is not None and abs(engine["model_edge"]) >= min_edge and engine.get("confidence",0) >= outcome_conf_gate:
+                st.success(f"{engine['outcome']} · estimated ABOVE {engine['prob_above']*100:.1f}% · model confidence {engine['confidence']:.0f}/100 · edge {engine['model_edge']:+.1f}pp vs Kalshi.")
             else:
-                st.warning("No confirmed order-flow edge. Avoid forcing a trade.")
-            st.caption("Order-book depth is not a forecast. Quotes can change and may not be executable at the displayed size.")
+                st.info(f"Expiry model leans {engine.get('outcome','UNCERTAIN')}, but the price edge/confidence gate is not strong enough for a high-conviction setup.")
+            st.caption("Order-book depth is not a forecast. Quotes can change and may not be executable at the displayed size. The official settlement source is CME CF BRTI, not Coinbase.")
 
     if selected_page == "📖 GUIDE":
         st.markdown("""
     **How to use this dashboard**
-    - **CHART:** BTC candles, Kalshi quotes, countdown, outcome lean, scalping watch, and whale indicators.
-    - **FLOW:** Kalshi order book, bid depth, and YES/NO spread.
-    - **GUIDE:** Explains signals and limitations.
+    - **CHART:** Coinbase BTC candles plus the Kalshi strike, a blue BRTI-proxy line, countdown, estimated ABOVE/BELOW probability, model confidence, scalping watch and live quotes.
+    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
+    - **GUIDE:** Explains how the outcome model is built and where uncertainty remains.
 
-    **What this version does**
-    - Pulls recent BTC-USD 1-minute OHLCV candles from Coinbase and builds 5m/15m bars locally.
-    - Reads candle anatomy (body, upper/lower wick, close location), ATR/range expansion, relative volume and higher-high/lower-low structure.
-    - Detects context-aware engulfing, hammer/shooting-star rejection, marubozu, harami, inside/outside bars, three-inside, multi-candle persistence, Hikkake traps, local breakouts/failures and direct strike reclaims/rejections.
-    - Blends **1m + 5m + 15m** candle scores differently for scalping and for the 15-minute expiry lean.
-    - Gives completed candles most of the weight and down-weights the still-forming candle.
-    - Combines candle intelligence with BTC momentum, large Coinbase trades, Kalshi spread/depth and distance from the strike.
+    **What Outcome Fusion v2 adds**
+    - Kalshi's BTC 15-minute contracts settle from the **simple average of 60 official CME CF BRTI values during the final minute**, not from a Coinbase close.
+    - The dashboard therefore builds a **BRTI-aware proxy** from public prices on several BRTI constituent exchanges (Coinbase, Kraken, Bitstamp and Gemini) and uses the median to reduce single-exchange basis noise. It is still only a proxy, not the licensed official BRTI.
+    - A cached **24-hour 1-minute history** is used to find prior BTC regimes with similar 5m/15m momentum, volatility and EMA structure. The bot checks what happened over the same remaining horizon and produces an empirical historical-analog probability.
+    - A separate **realized-volatility probability model** estimates how difficult it is for BTC to finish on the other side of the strike given the remaining time and current volatility.
+    - **Kalshi's live YES price** is treated as another independent market-implied estimate instead of being ignored.
+    - Candle intelligence, aggressive Coinbase trade flow and Kalshi depth are used as a **small confirmation layer**, not allowed to overpower the strike-distance/statistical models.
+    - During the **last 60 seconds**, the bot records the live multi-exchange proxy and estimates the average already observed. It then calculates the average price still required over the remaining seconds for the final 60-second settlement average to finish above the strike.
+    - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
 
     **How candle reading is used**
     - Long bodies and closes near an extreme imply stronger one-sided control; long two-sided wicks imply conflict/indecision.
-    - Reversal shapes only get full weight when the prior trend supports the textbook context.
-    - Breakouts get more weight when range and volume expand; failed breaks/rejections point the other way.
-    - A candle crossing the Kalshi strike gets special treatment: reclaim, breakdown, wick rejection, and multi-close acceptance are tracked separately.
-    - Classical candle names are **features**, not guaranteed predictions. Context and agreement matter more than any single pattern.
+    - Reversal shapes only receive full weight when the preceding trend supports the pattern.
+    - Breakouts get more weight when range and volume expand; failed breaks and wick rejection point the other way.
+    - Direct interaction with the Kalshi strike is tracked separately: reclaim, breakdown, wick rejection and multiple closes holding above/below.
+    - The still-forming candle is down-weighted because it can reverse before close.
 
-    **What it does not claim**
-    - It does not know the exact final BTC price.
-    - It does not calculate a statistically validated probability of finishing above/below a strike.
-    - It does not use private order flow, hidden liquidity or every trade print.
-    - It does not place orders.
+    **What MODEL CONFIDENCE means**
+    - It combines probability separation from 50/50, agreement between the statistical model, historical analogs, Kalshi market and flow/candle model, strike distance measured in volatility units, cross-exchange reference quality, spread and analog sample size.
+    - It is an **evidence-strength score**, not a guaranteed chance that the prediction is correct. Raising the sidebar confidence gate makes the bot produce fewer directional calls.
 
-    **For a proper model:** save every timestamped candle/flow feature and the eventual Kalshi settlement, then run walk-forward validation with fees, spread, slippage and probability calibration. Pattern weights should eventually be learned from BTC/Kalshi history instead of treated as permanent constants.
+    **Important limitations**
+    - The official BRTI is licensed benchmark data. The dashboard's multi-exchange reference is an approximation and can differ by several dollars, which matters when BTC is extremely close to the strike.
+    - The displayed ABOVE/BELOW percentages are model estimates and have **not yet been calibrated against a large archive of actual KXBTC15M settlements**.
+    - Hidden liquidity, exchange outages, sudden news and second-by-second volatility can still flip a 15-minute result.
+    - The bot does not place orders and cannot guarantee a settlement outcome.
+
+    **Best next validation step:** save each timestamped prediction, BRTI proxy, Kalshi price, component probabilities and eventual official settlement. Then evaluate Brier score, calibration, hit rate by confidence bucket, spread/fee-adjusted profitability and walk-forward performance before trusting the percentages with real money.
     """)
     st.caption(f"Last dashboard update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} • Data may be delayed.")
 
