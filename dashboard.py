@@ -48,6 +48,33 @@ hr {border-color:#3b222b!important}
 .position-grid strong{display:block;font-size:clamp(.88rem,1.6vw,1.15rem);color:#f7e9ed;overflow-wrap:anywhere}
 .position-note{font-size:.7rem;color:#ac8996;margin-top:12px}
 @media(max-width:650px){.position-panel{padding:12px}.position-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.position-grid>div{padding:8px}.position-grid strong{font-size:.95rem}}
+.market-strip{display:grid;grid-template-columns:1.45fr .85fr .85fr;gap:6px;margin:4px 0 6px}
+.market-strip>div{background:linear-gradient(145deg,rgba(26,43,66,.96),rgba(15,28,46,.97));border:1px solid #39212a;border-radius:10px;padding:8px 10px;min-width:0}
+.market-strip small{display:block;color:#91a8c3;font-size:.62rem;letter-spacing:.04em;white-space:nowrap}
+.market-strip strong{display:block;color:#eff6ff;font-family:'Space Grotesk',sans-serif;font-size:1.03rem;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.market-strip span{display:block;color:#9fb2c8;font-size:.61rem;margin-top:2px;white-space:nowrap}
+.compact-status{border:1px solid #4c2932;background:#15111a;border-radius:9px;padding:6px 9px;margin:3px 0 6px;color:#b8c8dc;font-size:.68rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:650px){
+  .block-container{padding:.3rem .42rem .8rem!important}
+  .hero{padding:7px 10px!important;border-radius:10px!important;margin-bottom:4px!important}
+  .hero .eyebrow,.hero .hero-sub,.hero .badge{display:none!important}
+  .hero-title{font-size:1.05rem!important;line-height:1.05!important}
+  [data-testid="stVerticalBlock"]{gap:.26rem!important}
+  [data-testid="stMetric"]{padding:5px 7px!important;min-height:52px!important;border-radius:9px!important}
+  [data-testid="stMetricLabel"]{font-size:.61rem!important}
+  [data-testid="stMetricValue"]{font-size:.9rem!important}
+  [data-testid="stMetricDelta"]{font-size:.61rem!important}
+  [data-testid="stRadio"] label{padding:2px 5px!important;border-radius:7px!important;font-size:.68rem!important}
+  [data-testid="stRadio"] div[role="radiogroup"]{gap:3px!important;flex-wrap:nowrap!important}
+  [data-testid="stSelectbox"] label{font-size:.66rem!important;margin-bottom:0!important}
+  [data-testid="stSelectbox"] div[data-baseweb="select"]>div{min-height:36px!important;height:36px!important}
+  [data-testid="stExpander"] summary{min-height:34px!important;padding-top:4px!important;padding-bottom:4px!important;font-size:.72rem!important}
+  .stCaptionContainer{font-size:.64rem!important}
+  .section-heading{margin:5px 0 3px!important;font-size:.61rem!important}
+  .market-strip{gap:4px;margin:2px 0 4px}
+  .market-strip>div{padding:6px 7px;border-radius:8px}
+  .market-strip small{font-size:.52rem}.market-strip strong{font-size:.86rem}.market-strip span{font-size:.52rem}
+}
 </style>""", unsafe_allow_html=True)
 st.markdown("""<div class="hero"><div class="eyebrow">HYPER-STYLE TERMINAL · BTC × KALSHI</div><div class="hero-title">₿ &nbsp; BTC / KALSHI LIVE</div><div class="hero-sub">Live candles · 15-minute contracts · order flow · risk first</div><span class="badge">● LIVE DATA &nbsp;·&nbsp; RESEARCH ONLY</span></div>""", unsafe_allow_html=True)
 
@@ -283,10 +310,11 @@ ema_fast = candles["close"].ewm(span=5, adjust=False).mean().iloc[-1]
 ema_slow = candles["close"].ewm(span=15, adjust=False).mean().iloc[-1]
 trend = "BULLISH" if ema_fast > ema_slow else "BEARISH" if ema_fast < ema_slow else "MIXED"
 
-top_a, top_b, top_c = st.columns([1.5, 1, 1])
-top_a.metric("BTC / USD", f"${price:,.2f}", f"{ret1:+.2f}% · 1m")
-top_b.metric("5m move", f"{ret5:+.2f}%" if pd.notna(ret5) else "—")
-top_c.metric("Trend", trend.title())
+st.markdown(f"""<div class="market-strip">
+  <div><small>BTC / USD</small><strong>${price:,.2f}</strong><span>{ret1:+.2f}% · 1m</span></div>
+  <div><small>5M MOVE</small><strong>{f'{ret5:+.2f}%' if pd.notna(ret5) else '—'}</strong><span>short-term</span></div>
+  <div><small>TREND</small><strong>{trend.title()}</strong><span>EMA 5 / 15</span></div>
+</div>""", unsafe_allow_html=True)
 
 kalshi_data = None
 kalshi_error = None
@@ -389,30 +417,25 @@ with st.spinner("Checking exchange whale-size trades and Kalshi liquidity..."):
         chain_count, chain_vsize, chain_error = None, None, str(exc)
 engine = research_signals(candles, kalshi_data, whale_trades)
 
-st.caption("Choose a section below. Each selection loads its content separately on mobile.")
-# Native radio navigation reruns the app and reliably renders only the selected
-# page on mobile browsers, avoiding empty Streamlit tab panels.
+# Compact mobile navigation. Short labels keep all three choices on one row.
 selected_page = st.radio(
     "Dashboard section",
-    ["📈 LIVE CHART", "📊 MARKET FLOW", "📖 GUIDE"],
+    ["📈 CHART", "📊 FLOW", "📖 GUIDE"],
     horizontal=True,
     label_visibility="collapsed",
-    key="dashboard_section",
+    key="dashboard_section_compact",
 )
 
 
-if selected_page == "📈 LIVE CHART":
+if selected_page == "📈 CHART":
     if market_ticker:
-        st.info(f"🎯 **Kalshi market ticker: `{market_ticker}`**" +
-                (f"  |  Status: **{kalshi_data['market'].get('status', 'unknown')}**" if kalshi_data else "  |  Quotes unavailable"))
+        market_status = kalshi_data['market'].get('status', 'unknown') if kalshi_data else 'quotes unavailable'
+        st.markdown(f'<div class="compact-status">🎯 {html.escape(str(market_ticker))} · {html.escape(str(market_status))}</div>', unsafe_allow_html=True)
     else:
-        st.warning("⚠️ No Kalshi ticker selected. Open Settings to select an active BTC 15-minute contract.")
-    tcol, wcol = st.columns(2)
-    with tcol:
-        timeframe = st.selectbox("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0)
-    with wcol:
-        window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
+        st.markdown('<div class="compact-status">⚠️ No active Kalshi BTC 15m contract selected</div>', unsafe_allow_html=True)
+    timeframe = st.radio("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True, label_visibility="collapsed", key="candle_size_compact")
     with st.expander("⚙️ Chart options", expanded=False):
+        window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
         show_ema = st.toggle("Show EMA 5 / 15", value=True)
         chart_style = st.radio("Chart type", ["Candles", "Line"], horizontal=True)
     minutes = {"15m": 15, "30m": 30, "1h": 60, "3h": 180, "6h": 360}[window]
@@ -484,8 +507,8 @@ if selected_page == "📈 LIVE CHART":
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
     <style>
     html,body{margin:0;background:#0b0b11;color:#d9e3f1;font-family:system-ui;overflow:hidden}
-    #frame{position:relative;width:100%;height:440px;overflow:hidden}
-    #chart{width:100%;height:440px;touch-action:none;overscroll-behavior:contain}
+    #frame{position:relative;width:100%;height:300px;overflow:hidden}
+    #chart{width:100%;height:300px;touch-action:none;overscroll-behavior:contain}
     #status{position:absolute;top:9px;left:12px;pointer-events:none;background:#120e16d9;
       border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
     #error{color:#ff9eaa;padding:15px;display:none}
@@ -500,7 +523,7 @@ if selected_page == "📈 LIVE CHART":
       if(!window.LightweightCharts) throw new Error('Chart library unavailable.');
       const LC=window.LightweightCharts;
       const chart=LC.createChart(root,{
-        width:root.clientWidth,height:440,
+        width:root.clientWidth,height:300,
         layout:{background:{type:'solid',color:'#0b0b11'},textColor:'#b9c9df'},
         grid:{vertLines:{color:'#251c27'},horzLines:{color:'#251c27'}},
         rightPriceScale:{borderColor:'#51303b',scaleMargins:{top:.08,bottom:.12}},
@@ -575,36 +598,24 @@ if selected_page == "📈 LIVE CHART":
     } catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
     </script></body></html>"""
     chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
-    components.html(chart_html, height=448, scrolling=False)
-    st.caption("👆 Drag left/right: move through candles · 🤏 Pinch: zoom · Tap: inspect candle")
-    with st.expander("Chart data / troubleshooting", expanded=False):
-        st.caption(f"Loaded {len(clean_bars)} distinct {timeframe} candles · UTC "
-                   f"{datetime.fromtimestamp(clean_bars[0]['time'], timezone.utc):%H:%M}–"
-                   f"{datetime.fromtimestamp(clean_bars[-1]['time'], timezone.utc):%H:%M}.")
-    # A compact, high-contrast contract status card inspired by trading terminals.
+    components.html(chart_html, height=308, scrolling=False)
+    st.caption("👆 Drag · 🤏 Pinch zoom · Tap candle")
+    # Compact all essential live information into one terminal-style panel.
     expiry_raw = None
     if kalshi_data:
         market_info = kalshi_data["market"]
         expiry_raw = market_info.get("close_time") or market_info.get("expiration_time")
-        seconds_left = None
-        if expiry_raw:
-            try:
-                expires = pd.to_datetime(expiry_raw, utc=True)
-                seconds_left = max(0, int((expires - pd.Timestamp.now(tz="UTC")).total_seconds()))
-            except (ValueError, TypeError):
-                pass
-        clock = f"{seconds_left // 60:02d}:{seconds_left % 60:02d}" if seconds_left is not None else "—:—"
         target_raw = market_info.get("floor_strike") or market_info.get("strike_price")
         try:
             target_value = float(target_raw)
             distance = price - target_value
-            target_text = f"${target_value:,.2f}"
-            distance_text = f"${distance:+,.2f}"
+            target_text = f"${target_value:,.0f}"
+            distance_text = f"${distance:+,.0f}"
         except (ValueError, TypeError):
-            target_text = "—"
-            distance_text = "—"
+            target_text, distance_text = "—", "—"
     else:
-        clock, target_text, distance_text = "—:—", "—", "—"
+        target_text, distance_text = "—", "—"
+
     momentum = float(np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100))
     if momentum > 8:
         mood, mood_color = "UPWARD MOMENTUM", "#36d7a4"
@@ -612,57 +623,59 @@ if selected_page == "📈 LIVE CHART":
         mood, mood_color = "DOWNWARD MOMENTUM", "#ff6c78"
     else:
         mood, mood_color = "NO CLEAR EDGE", "#ffcf77"
-    # Client-side timer ticks every second without Streamlit rerunning or resetting the chart.
-    # A separate server refresh is still required to roll over to a new Kalshi contract.
+
     timer_expiry = None
     if expiry_raw:
         try:
             timer_expiry = pd.to_datetime(expiry_raw, utc=True).isoformat()
         except (ValueError, TypeError, OverflowError):
             pass
-    timer_html = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>html,body{margin:0;background:transparent;color:#f4f6fb;font-family:system-ui,sans-serif}
-    .timer{box-sizing:border-box;padding:11px 15px;border:1px solid #793141;border-radius:12px;background:#210f18;display:flex;align-items:center;justify-content:space-between;gap:12px}
-    .label{font-size:11px;font-weight:800;letter-spacing:.13em;color:#efa3b0}.value{font-size:26px;font-weight:850;font-variant-numeric:tabular-nums;color:#fff;letter-spacing:.035em}
-    .expired{color:#ff7183}.hint{font-size:10px;color:#aa8892}</style></head><body>
-    <div class="timer"><div><div class="label">KALSHI CONTRACT · TIME LEFT</div><div class="hint" id="hint">Countdown updates every second</div></div><div class="value" id="count">--:--</div></div>
-    <script>const expiry=__EXPIRY__;const el=document.getElementById('count');
-    function tick(){if(!expiry){el.textContent='--:--';document.getElementById('hint').textContent='Expiry unavailable';return;}
-    const ms=Date.parse(expiry)-Date.now();if(!Number.isFinite(ms)){el.textContent='--:--';return;}
-    if(ms<=0){el.textContent='EXPIRED';el.classList.add('expired');document.getElementById('hint').textContent='Refresh dashboard for next contract';return;}
-    const sec=Math.ceil(ms/1000);const hh=Math.floor(sec/3600);const mm=Math.floor((sec%3600)/60);const ss=sec%60;
-    el.textContent=(hh?String(hh).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0');}
-    tick();setInterval(tick,1000);</script></body></html>""".replace('__EXPIRY__', json.dumps(timer_expiry))
-    components.html(timer_html, height=78, scrolling=False)
-    st.markdown(f"""<div class="position-panel">
-      <div class="position-eyebrow">● LIVE POSITION INTEL · INDICATORS ONLY</div>
-      <div class="position-mood" style="color:{mood_color}">{html.escape(mood)}</div>
-      <div class="position-grid">
-        <div><small>CONTRACT TIMER</small><strong>LIVE ABOVE ↑</strong></div>
-        <div><small>BTC PRICE</small><strong>${price:,.2f}</strong></div>
-        <div><small>CONTRACT TARGET*</small><strong>{target_text}</strong></div>
-        <div><small>PRICE VS TARGET</small><strong>{distance_text}</strong></div>
-      </div><div class="position-note">Momentum is descriptive, not a prediction. *Target shown only when the Kalshi API supplies an interpretable strike.</div>
-    </div>""", unsafe_allow_html=True)
-    st.markdown('<div class="section-heading">Kalshi YES / NO · live quotes</div>', unsafe_allow_html=True)
-    if kalshi_data:
-        k = kalshi_data
-        yes_col, no_col = st.columns(2)
-        with yes_col:
-            st.metric("🟢 YES · Buy", show_price(k["yes_ask"]))
-            st.caption(f"Sell YES: {show_price(k['yes_bid'])}")
-        with no_col:
-            st.metric("🔴 NO · Buy", show_price(k["no_ask"]))
-            st.caption(f"Sell NO: {show_price(k['no_bid'])}")
-        st.caption(f"Ticker: {market_ticker} · Status: {k['market'].get('status', 'unknown')} · Expiry (UTC): {k['market'].get('close_time', 'unknown')}")
-        if all(k[name] is None for name in ('yes_ask', 'no_ask', 'yes_bid', 'no_bid')):
-            st.warning("No current quotes returned for this contract. A missing quote is not a zero-cent price.")
-    elif kalshi_error:
-        st.warning(f"Kalshi quotes unavailable: {kalshi_error}")
-    else:
-        st.info("No active Kalshi contract selected. Check Settings to select one.")
-    st.caption("Quotes are in cents per contract, not model probabilities. Opposite-side bids may imply asks; fees and slippage are not included.")
-
+    yes_buy = show_price(kalshi_data["yes_ask"]) if kalshi_data else "—"
+    no_buy = show_price(kalshi_data["no_ask"]) if kalshi_data else "—"
+    yes_sell = show_price(kalshi_data["yes_bid"]) if kalshi_data else "—"
+    no_sell = show_price(kalshi_data["no_bid"]) if kalshi_data else "—"
+    whale_pressure = f"{engine['pressure']:+.0%}" if engine.get("pressure") is not None else "—"
+    intel = {
+        "expiry": timer_expiry, "btc": f"${price:,.0f}", "yes": yes_buy, "no": no_buy,
+        "yesSell": yes_sell, "noSell": no_sell, "outcome": engine["outcome"],
+        "scalp": engine["scalp"], "whale": whale_pressure, "target": target_text,
+        "distance": distance_text, "mood": mood, "moodColor": mood_color,
+    }
+    intel_json = json.dumps(intel)
+    intel_html = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+    *{box-sizing:border-box}html,body{margin:0;background:transparent;color:#edf5ff;font-family:system-ui,sans-serif}
+    .panel{border:1px solid #71303d;border-radius:11px;background:linear-gradient(125deg,#210e17,#10111a 72%);padding:8px}
+    .head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+    .mood{font-size:10px;font-weight:900;letter-spacing:.08em}.sub{font-size:9px;color:#967985;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:5px}
+    .tile{background:#111722;border:1px solid #302631;border-radius:8px;padding:6px;min-width:0}.tile small{display:block;color:#8197b2;font-size:8px;font-weight:800;letter-spacing:.06em;white-space:nowrap}
+    .tile strong{display:block;margin-top:2px;font-size:13px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tile em{display:block;margin-top:2px;color:#8fa0b3;font-size:8px;font-style:normal;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .foot{margin-top:5px;color:#8e7a84;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    @media(max-width:430px){.panel{padding:6px}.grid4,.grid3{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
+    </style></head><body><div class="panel">
+      <div class="head"><div class="mood" id="mood"></div><div class="sub">15M OUTCOME + SCALP + FLOW</div></div>
+      <div class="grid4">
+        <div class="tile"><small>TIME LEFT</small><strong id="count">--:--</strong><em>live</em></div>
+        <div class="tile"><small>BTC</small><strong id="btc"></strong><em id="target"></em></div>
+        <div class="tile"><small>YES BUY</small><strong id="yes"></strong><em id="yesSell"></em></div>
+        <div class="tile"><small>NO BUY</small><strong id="no"></strong><em id="noSell"></em></div>
+      </div>
+      <div class="grid3">
+        <div class="tile"><small>OUTCOME</small><strong id="outcome"></strong><em>expiration lean</em></div>
+        <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>short-term watch</em></div>
+        <div class="tile"><small>WHALE FLOW</small><strong id="whale"></strong><em>aggressive trades</em></div>
+      </div>
+      <div class="foot" id="distance"></div>
+    </div><script>
+    const d=__INTEL__;
+    for(const id of ['btc','yes','no','outcome','scalp','whale']) document.getElementById(id).textContent=d[id]||'—';
+    document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
+    document.getElementById('target').textContent='target '+(d.target||'—');document.getElementById('distance').textContent='Price vs target: '+(d.distance||'—')+' · indicators only, not a guarantee';
+    const m=document.getElementById('mood');m.textContent=d.mood||'NO CLEAR EDGE';m.style.color=d.moodColor||'#ffcf77';
+    const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
+    </script></body></html>""".replace("__INTEL__", intel_json)
+    components.html(intel_html, height=164, scrolling=False)
     direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
     if abs(direction_score) < 8:
         context = "NO CLEAR EDGE — wait for confirmation"
@@ -670,40 +683,38 @@ if selected_page == "📈 LIVE CHART":
         context = "UPSIDE MOMENTUM — only consider a long after checking Kalshi price and spread"
     else:
         context = "DOWNSIDE MOMENTUM — only consider a short/downside thesis after checking Kalshi price and spread"
-    with st.expander("📊 Momentum & recent candles", expanded=False):
-        st.info(context)
-        st.write(f"Momentum score (heuristic): **{direction_score:+.1f}/100**. Not a calibrated probability.")
-        st.metric("15m realized volatility", f"{vol15:.3f}%" if pd.notna(vol15) else "—")
-        st.dataframe(candles.tail(10).sort_values("time", ascending=False), use_container_width=True, hide_index=True)
 
-    st.markdown("### 🎯 Outcome + ⚡ Scalp intelligence")
-    st.markdown('<div class="section-heading">Dual engine · 15-minute outcome + short-term scalps</div>', unsafe_allow_html=True)
-    pred_col, scalp_col = st.columns(2)
-    with pred_col:
-        st.metric("🎯 Expiration outlook", engine["outcome"])
-        st.caption("Directional lean only; NOT a calibrated probability. Exact settlement depends on Kalshi contract rules and price source.")
-    with scalp_col:
-        st.metric("⚡ Scalping setup", engine["scalp"])
-        st.caption(engine["reason"])
-    with st.expander("🐋 Whale activity · signal evidence", expanded=False):
-        if whale_error:
-            st.warning(f"Exchange trades unavailable: {whale_error}")
+    # Keep secondary information and tools behind one disclosure so the default
+    # mobile view stays close to a single terminal screen.
+    with st.expander("＋ More data / tools", expanded=False):
+        st.markdown("**Market details**")
+        if kalshi_data:
+            st.caption(f"Ticker: {market_ticker} · Status: {kalshi_data['market'].get('status', 'unknown')} · Expiry UTC: {kalshi_data['market'].get('close_time', 'unknown')}")
+            st.caption(f"YES buy {yes_buy} / sell {yes_sell} · NO buy {no_buy} / sell {no_sell} · Target {target_text} · Distance {distance_text}")
+        elif kalshi_error:
+            st.warning(f"Kalshi quotes unavailable: {kalshi_error}")
         else:
-            sizes = [usd for _, usd in whale_trades]
+            st.info("No active Kalshi contract selected.")
+
+        st.markdown("**Momentum**")
+        st.caption(f"{context} · Score {direction_score:+.1f}/100 · 15m realized volatility {vol15:.3f}%" if pd.notna(vol15) else f"{context} · Score {direction_score:+.1f}/100")
+
+        st.markdown("**Whale + flow evidence**")
+        if whale_error:
+            st.caption(f"Exchange trades unavailable: {whale_error}")
+        else:
             large = [(side, usd) for side, usd in whale_trades if usd >= 100000]
-            st.write(f"Recent Coinbase trades sampled: **{len(whale_trades)}** · Trades ≥ $100k: **{len(large)}**")
-            st.write("Aggressive trade pressure: **" + (f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"))
-            st.caption("Large exchange trades are a proxy for whale-size activity, not proof of a specific whale wallet.")
+            pressure_text = f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"
+            st.caption(f"Coinbase trades sampled: {len(whale_trades)} · ≥$100k: {len(large)} · Aggressive pressure: {pressure_text}")
         if chain_error:
             st.caption(f"Blockchain activity unavailable: {chain_error}")
         else:
-            st.write(f"Bitcoin mempool: **{chain_count:,} unconfirmed transactions** · **{chain_vsize / 1e6:.2f} MB vsize**")
-            st.caption("Mempool volume is blockchain activity, NOT identified whale transfers or exchange inflows. Wallet attribution is not provided by this public feed.")
-        st.write("Kalshi top-five bid-depth balance: **" + (f"{engine['bid_balance']:+.1%}" if engine['bid_balance'] is not None else "Unavailable") + "**")
-        st.write("YES spread: **" + (f"{engine['spread']:.1f}¢" if engine['spread'] is not None else "Unavailable") + "**")
-        st.caption("Signals use sampled public data, not full historical Kalshi flow. NO automated orders are placed.")
+            st.caption(f"Bitcoin mempool: {chain_count:,} unconfirmed · {chain_vsize / 1e6:.2f} MB vsize")
+        bid_text = f"{engine['bid_balance']:+.1%}" if engine['bid_balance'] is not None else "Unavailable"
+        spread_text = f"{engine['spread']:.1f}¢" if engine['spread'] is not None else "Unavailable"
+        st.caption(f"Kalshi top-five bid balance: {bid_text} · YES spread: {spread_text}")
 
-    with st.expander("🧪 Paper signal tracker · session only", expanded=False):
+        st.markdown("**Paper signal tracker**")
         if "paper_signals" not in st.session_state:
             st.session_state.paper_signals = []
         if st.button("Record current signals", type="secondary"):
@@ -712,13 +723,13 @@ if selected_page == "📈 LIVE CHART":
                 "scalp_watch": engine["scalp"], "settled_result": "NOT VERIFIED"})
             st.session_state.paper_signals = st.session_state.paper_signals[-200:]
         if st.session_state.paper_signals:
-            st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True, height=180)
             st.download_button("Export paper signals (CSV)", pd.DataFrame(st.session_state.paper_signals).to_csv(index=False),
                                file_name="btc_kalshi_paper_signals.csv", mime="text/csv")
-        st.caption("Records only signals while this Streamlit session remains active. Outcomes are NOT automatically settled or verified; do not interpret them as backtest accuracy.")
+        st.caption("Signals are research indicators only; paper outcomes are not automatically verified.")
 
 
-if selected_page == "📊 MARKET FLOW":
+if selected_page == "📊 FLOW":
     if not market_ticker:
         st.warning("No open BTC 15-minute market selected. Check the sidebar.")
     elif kalshi_error:
@@ -773,8 +784,8 @@ if selected_page == "📊 MARKET FLOW":
 if selected_page == "📖 GUIDE":
     st.markdown("""
 **How to use this dashboard**
-- **LIVE CHART:** BTC candles, Kalshi quotes, countdown, outcome lean, scalping watch, and whale indicators.
-- **MARKET FLOW:** Kalshi order book, bid depth, and YES/NO spread.
+- **CHART:** BTC candles, Kalshi quotes, countdown, outcome lean, scalping watch, and whale indicators.
+- **FLOW:** Kalshi order book, bid depth, and YES/NO spread.
 - **GUIDE:** Explains signals and limitations.
 
 **What this version does**
