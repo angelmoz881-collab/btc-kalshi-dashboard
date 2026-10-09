@@ -7,7 +7,6 @@ import streamlit as st
 import json
 import html
 import streamlit.components.v1 as components
-import plotly.graph_objects as go
 
 st.set_page_config(page_title="BTC × Kalshi | Live Terminal", page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
@@ -297,6 +296,139 @@ if market_ticker:
     except requests.RequestException as exc:
         kalshi_error = str(exc)
 
+
+# Dual-purpose research signals: deliberately conservative, not calibrated probabilities.
+@st.cache_data(ttl=12, show_spinner=False)
+def recent_exchange_trades():
+    r = requests.get(f"{COINBASE}/products/BTC-USD/trades", headers=HEADERS, timeout=9)
+    r.raise_for_status()
+    trades = r.json()
+    if not isinstance(trades, list):
+        raise ValueError("Unexpected exchange trade format")
+    result = []
+    for t in trades:
+        try:
+            size = float(t["size"])
+            px = float(t["price"])
+            side = str(t.get("side", "")).lower()
+            if size > 0 and px > 0 and side in ("buy", "sell"):
+                # Coinbase Exchange trade 'side' is the maker side; the aggressor is opposite.
+                result.append(("buy" if side == "sell" else "sell", size * px))
+        except (KeyError, ValueError, TypeError):
+            pass
+    return result
+
+@st.cache_data(ttl=45, show_spinner=False)
+def blockchain_activity():
+    # Unconfirmed transactions are NOT attributed to whales or exchanges.
+    r = requests.get("https://mempool.space/api/mempool", timeout=9)
+    r.raise_for_status()
+    data = r.json()
+    return int(data.get("count", 0)), int(data.get("vsize", 0))
+
+def research_signals(frame, snapshot, exchange_trades):
+    closes = frame["close"].astype(float)
+    if len(closes) < 40:
+        return {"outcome": "UNCERTAIN", "scalp": "WAIT", "reason": "Insufficient BTC history", "momentum": 0.0,
+                "pressure": None, "bid_balance": None, "spread": None, "target": None}
+    p = float(closes.iloc[-1])
+    r5 = p / float(closes.iloc[-6]) - 1
+    r15 = p / float(closes.iloc[-16]) - 1
+    vol = float(closes.pct_change().tail(40).std())
+    momentum = (r5 + 0.5 * r15) / max(vol * np.sqrt(15), 0.00001)
+    pressure = None
+    if exchange_trades:
+        total = sum(v for _, v in exchange_trades)
+        pressure = sum((1 if side == "buy" else -1) * v for side, v in exchange_trades) / total if total else None
+    balance, spread, target = None, None, None
+    if snapshot:
+        yes_depth = sum(q for _, q in snapshot["yes"][:5])
+        no_depth = sum(q for _, q in snapshot["no"][:5])
+        if yes_depth + no_depth > 0:
+            balance = (yes_depth - no_depth) / (yes_depth + no_depth)
+        if snapshot["yes_ask"] is not None and snapshot["yes_bid"] is not None:
+            spread = snapshot["yes_ask"] - snapshot["yes_bid"]
+        m = snapshot["market"]
+        # Strike is not universally present/meaningful; avoid inventing it.
+        for key in ("floor_strike", "strike_price"):
+            try:
+                value = float(m[key])
+                if 1000 < value < 1000000:
+                    target = value
+                    break
+            except (KeyError, TypeError, ValueError):
+                continue
+    outcome = "UNCERTAIN"
+    if target is not None:
+        distance = (p - target) / p
+        if distance > max(0.0003, vol * 2):
+            outcome = "YES LEAN"
+        elif distance < -max(0.0003, vol * 2):
+            outcome = "NO LEAN"
+    # A short-lived scalp setup is NOT an execution recommendation.
+    scalp = "WAIT"
+    reason = "Signals disagree, missing quotes, or insufficient edge"
+    if snapshot and spread is not None and 0 <= spread <= 3 and pressure is not None and balance is not None:
+        if momentum > 0.55 and pressure > 0.18 and balance > 0.12:
+            scalp, reason = "WATCH YES", "Positive BTC momentum and trade/order-book pressure; check fees and depth"
+        elif momentum < -0.55 and pressure < -0.18 and balance < -0.12:
+            scalp, reason = "WATCH NO", "Negative BTC momentum and trade/order-book pressure; check fees and depth"
+    return {"outcome": outcome, "scalp": scalp, "reason": reason, "momentum": momentum,
+            "pressure": pressure, "bid_balance": balance, "spread": spread, "target": target}
+
+with st.spinner("Checking exchange whale-size trades and Kalshi liquidity..."):
+    try:
+        whale_trades = recent_exchange_trades()
+        whale_error = None
+    except (requests.RequestException, ValueError) as exc:
+        whale_trades, whale_error = [], str(exc)
+    try:
+        chain_count, chain_vsize = blockchain_activity()
+        chain_error = None
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        chain_count, chain_vsize, chain_error = None, None, str(exc)
+engine = research_signals(candles, kalshi_data, whale_trades)
+
+st.markdown('<div class="section-heading">Dual engine · 15-minute outcome + short-term scalps</div>', unsafe_allow_html=True)
+pred_col, scalp_col = st.columns(2)
+with pred_col:
+    st.metric("🎯 Expiration outlook", engine["outcome"])
+    st.caption("Directional lean only; NOT a calibrated probability. Exact settlement depends on Kalshi contract rules and price source.")
+with scalp_col:
+    st.metric("⚡ Scalping setup", engine["scalp"])
+    st.caption(engine["reason"])
+with st.expander("🐋 Whale activity · signal evidence", expanded=False):
+    if whale_error:
+        st.warning(f"Exchange trades unavailable: {whale_error}")
+    else:
+        sizes = [usd for _, usd in whale_trades]
+        large = [(side, usd) for side, usd in whale_trades if usd >= 100000]
+        st.write(f"Recent Coinbase trades sampled: **{len(whale_trades)}** · Trades ≥ $100k: **{len(large)}**")
+        st.write("Aggressive trade pressure: **" + (f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"))
+        st.caption("Large exchange trades are a proxy for whale-size activity, not proof of a specific whale wallet.")
+    if chain_error:
+        st.caption(f"Blockchain activity unavailable: {chain_error}")
+    else:
+        st.write(f"Bitcoin mempool: **{chain_count:,} unconfirmed transactions** · **{chain_vsize / 1e6:.2f} MB vsize**")
+        st.caption("Mempool volume is blockchain activity, NOT identified whale transfers or exchange inflows. Wallet attribution is not provided by this public feed.")
+    st.write("Kalshi top-five bid-depth balance: **" + (f"{engine['bid_balance']:+.1%}" if engine['bid_balance'] is not None else "Unavailable") + "**")
+    st.write("YES spread: **" + (f"{engine['spread']:.1f}¢" if engine['spread'] is not None else "Unavailable") + "**")
+    st.caption("Signals use sampled public data, not full historical Kalshi flow. NO automated orders are placed.")
+
+with st.expander("🧪 Paper signal tracker · session only", expanded=False):
+    if "paper_signals" not in st.session_state:
+        st.session_state.paper_signals = []
+    if st.button("Record current signals", type="secondary"):
+        st.session_state.paper_signals.append({"recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ticker": market_ticker or "none", "btc": round(price, 2), "outcome_lean": engine["outcome"],
+            "scalp_watch": engine["scalp"], "settled_result": "NOT VERIFIED"})
+        st.session_state.paper_signals = st.session_state.paper_signals[-200:]
+    if st.session_state.paper_signals:
+        st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True)
+        st.download_button("Export paper signals (CSV)", pd.DataFrame(st.session_state.paper_signals).to_csv(index=False),
+                           file_name="btc_kalshi_paper_signals.csv", mime="text/csv")
+    st.caption("Records only signals while this Streamlit session remains active. Outcomes are NOT automatically settled or verified; do not interpret them as backtest accuracy.")
+
 tab1, tab2, tab3 = st.tabs(["🔴 LIVE CHART", "📊 MARKET FLOW", "⚙️ GUIDE"])
 
 with tab1:
@@ -343,62 +475,86 @@ with tab1:
     ema5 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=5, adjust=False).mean())]
     ema15 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=15, adjust=False).mean())]
     visible_count = max(2, min(len(bars), max(1, minutes // candle_minutes)))
-    # Native Plotly chart: no embedded iframe or Lightweight Charts time-axis state.
-    # Datetime x-values are taken directly from the validated OHLC dataframe.
-    chart = go.Figure()
-    if chart_style == "Candles":
-        chart.add_trace(go.Candlestick(
-            x=view["time"], open=view["open"], high=view["high"],
-            low=view["low"], close=view["close"], name="BTC/USD",
-            increasing=dict(line=dict(color="#38d6b0"), fillcolor="#38d6b0"),
-            decreasing=dict(line=dict(color="#ff6d83"), fillcolor="#ff6d83"),
-        ))
-    else:
-        chart.add_trace(go.Scatter(
-            x=view["time"], y=view["close"], name="BTC/USD",
-            mode="lines", line=dict(color="#60a5fa", width=2)))
-    if show_ema:
-        for span, color in ((5, "#fbbf24"), (15, "#a78bfa")):
-            chart.add_trace(go.Scatter(
-                x=view["time"], y=view["close"].ewm(span=span, adjust=False).mean(),
-                name=f"EMA {span}", mode="lines", line=dict(color=color, width=1)))
-    # Touch-first controls: disable drag-to-zoom/selection; allow two-finger pinch zoom.
-    zoom_key = f"btc_zoom_{timeframe}_{window}"
-    if zoom_key not in st.session_state:
-        st.session_state[zoom_key] = 1.0
-    zin, zout, zreset = st.columns(3)
-    if zin.button("＋ In", key=f"zin_{timeframe}_{window}", use_container_width=True):
-        st.session_state[zoom_key] = max(0.1, st.session_state[zoom_key] / 1.7)
-    if zout.button("－ Out", key=f"zout_{timeframe}_{window}", use_container_width=True):
-        st.session_state[zoom_key] = min(8.0, st.session_state[zoom_key] * 1.7)
-    if zreset.button("↺ Reset", key=f"zreset_{timeframe}_{window}", use_container_width=True):
-        st.session_state[zoom_key] = 1.0
-    # Date ranges, unlike chart-library logical ranges, cannot collapse to one bar.
-    right_edge = view["time"].iloc[-1] + pd.Timedelta(minutes=candle_minutes * 2)
-    left_edge = right_edge - pd.Timedelta(minutes=max(minutes, candle_minutes * 4) * st.session_state[zoom_key])
-    chart.update_layout(
-        height=440, margin=dict(l=2, r=2, t=22, b=5),
-        paper_bgcolor="#0b0b11", plot_bgcolor="#0b0b11",
-        font=dict(color="#c6d3e5", size=12),
-        xaxis=dict(type="date", range=[left_edge, right_edge],
-                   showgrid=True, gridcolor="#29202a",
-                   rangeslider=dict(visible=False), tickformat="%H:%M"),
-        yaxis=dict(side="right", showgrid=True, gridcolor="#29202a",
-                   tickprefix="$", tickformat=",.2f", fixedrange=False),
-        showlegend=False,
-        dragmode=False, uirevision=f"{timeframe}-{window}-{chart_style}-{st.session_state[zoom_key]}",
-        hovermode="x unified",
-    )
-    st.plotly_chart(chart, use_container_width=True, config={
-        "displaylogo": False, "scrollZoom": True, "responsive": True, "doubleClickDelay": 350,
-        "doubleClick": "reset", "displayModeBar": False,
-        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-    })
-    st.caption("🤏 Two fingers: pinch to zoom · Drag-to-zoom OFF · + / − available as backup.")
+    # Lightweight Charts handles native two-finger scaling and one-finger panning.
+    # Pass unique, strictly ascending UNIX timestamps (seconds, not milliseconds).
+    clean_bars = sorted({b["time"]: b for b in bars}.values(), key=lambda b: b["time"])
+    if len(clean_bars) < 2:
+        st.error("At least two distinct candles are required to draw the chart.")
+        st.stop()
+    closes = pd.Series([b["close"] for b in clean_bars], dtype="float64")
+    overlays = []
+    for span, color in ((5, "#fbbf24"), (15, "#a78bfa")):
+        avg = closes.ewm(span=span, adjust=False).mean()
+        overlays.append({"color": color, "points": [
+            {"time": b["time"], "value": float(v)} for b, v in zip(clean_bars, avg)
+        ]})
+    chart_data = json.dumps({
+        "bars": clean_bars,
+        "line": [{"time": b["time"], "value": b["close"]} for b in clean_bars],
+        "overlays": overlays if show_ema else [],
+        "style": chart_style,
+        "timeframe": timeframe,
+        "visible": visible_count,
+    }, allow_nan=False)
+    chart_html = r"""<!doctype html><html><head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <style>
+    html,body{margin:0;background:#0b0b11;color:#d9e3f1;font-family:system-ui;overflow:hidden}
+    #frame{position:relative;width:100%;height:440px;overflow:hidden}
+    #chart{width:100%;height:440px;touch-action:none;overscroll-behavior:contain}
+    #status{position:absolute;top:9px;left:12px;pointer-events:none;background:#120e16d9;
+      border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
+    #error{color:#ff9eaa;padding:15px;display:none}
+    </style></head><body>
+    <div id="frame"><div id="status">BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+    const data=__PAYLOAD__;
+    const root=document.getElementById('chart');
+    const error=document.getElementById('error');
+    try {
+      if(!window.LightweightCharts) throw new Error('Chart library unavailable.');
+      const LC=window.LightweightCharts;
+      const chart=LC.createChart(root,{
+        width:root.clientWidth,height:440,
+        layout:{background:{type:'solid',color:'#0b0b11'},textColor:'#b9c9df'},
+        grid:{vertLines:{color:'#251c27'},horzLines:{color:'#251c27'}},
+        rightPriceScale:{borderColor:'#51303b',scaleMargins:{top:.08,bottom:.12}},
+        timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#51303b',
+          barSpacing:8,minBarSpacing:2,rightOffset:3},
+        crosshair:{mode:LC.CrosshairMode.Magnet},
+        handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false},
+        handleScale:{axisPressedMouseMove:false,mouseWheel:false,pinch:true},
+        kineticScroll:{touch:true,mouse:false}
+      });
+      const main=data.style==='Candles'
+        ?chart.addCandlestickSeries({upColor:'#34d399',downColor:'#fb7185',borderVisible:false,
+          wickUpColor:'#34d399',wickDownColor:'#fb7185'})
+        :chart.addLineSeries({color:'#60a5fa',lineWidth:2});
+      main.setData(data.style==='Candles'?data.bars:data.line);
+      data.overlays.forEach(o=>{
+        const series=chart.addLineSeries({color:o.color,lineWidth:1,
+          lastValueVisible:false,priceLineVisible:false});series.setData(o.points);
+      });
+      function setInitialView(){
+        const n=data.bars.length;
+        const visible=Math.min(n,Math.max(3,data.visible));
+        chart.timeScale().setVisibleLogicalRange({from:n-visible-1,to:n+2});
+      }
+      requestAnimationFrame(()=>requestAnimationFrame(setInitialView));
+      new ResizeObserver(()=>chart.applyOptions({width:root.clientWidth})).observe(root);
+      // Prevent mobile long-press tooltip from interfering with the pinch gesture.
+      // One finger pans; two fingers scale. Tapping still permits crosshair inspection.
+      root.addEventListener('contextmenu',e=>e.preventDefault());
+    } catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
+    </script></body></html>"""
+    chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
+    components.html(chart_html, height=448, scrolling=False)
+    st.caption("🤏 Two fingers: pinch to zoom · 👆 One finger: pan · Tap: inspect candle")
     with st.expander("Chart data / troubleshooting", expanded=False):
-        st.caption(f"Loaded {len(bars)} distinct {timeframe} candles · UTC "
-                   f"{datetime.fromtimestamp(bars[0]['time'], timezone.utc):%H:%M}–"
-                   f"{datetime.fromtimestamp(bars[-1]['time'], timezone.utc):%H:%M}.")
+        st.caption(f"Loaded {len(clean_bars)} distinct {timeframe} candles · UTC "
+                   f"{datetime.fromtimestamp(clean_bars[0]['time'], timezone.utc):%H:%M}–"
+                   f"{datetime.fromtimestamp(clean_bars[-1]['time'], timezone.utc):%H:%M}.")
     # A compact, high-contrast contract status card inspired by trading terminals.
     expiry_raw = None
     if kalshi_data:
