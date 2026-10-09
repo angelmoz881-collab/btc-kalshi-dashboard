@@ -988,16 +988,18 @@ def historical_reversal_probability(history, trend_direction, horizon_min=5):
 def reversal_intelligence(frame, exchange_trades, candle_intel, outcome_history, strike=None):
     """Detect a *possible* short-horizon BTC reversal using independent evidence.
 
-    The detector intentionally distinguishes a warning from confirmation. It combines
-    prevailing trend, momentum deceleration, overextension, reversal candles, aggressive
-    large-trade pressure and historical analogs. A high score means several independent
-    clues agree; it is not a promise that price will reverse.
+    The detector intentionally distinguishes an early warning from observed confirmation.
+    It combines prevailing trend, momentum deceleration, overextension, reversal candles,
+    aggressive large-trade pressure, historical analogs, and a micro-structure break.
+    A confirmed label means the turn has begun in live price structure; it is never a guarantee.
     """
     neutral = {
         "status":"NO CLEAR REVERSAL", "direction":"NONE", "score":0.0,
         "confidence":"LOW", "historical_prob":None, "historical":None,
         "whale_pressure":None, "large_buy_usd":0.0, "large_sell_usd":0.0,
         "reasons":[], "confirmations":0, "trend":"MIXED",
+        "confirmation_state":"NOT CONFIRMED", "confirmation_strength":0.0,
+        "confirmation_checks":[], "confirmed":False, "guaranteed":False,
     }
     if frame is None or len(frame) < 35:
         return neutral
@@ -1131,19 +1133,79 @@ def reversal_intelligence(frame, exchange_trades, candle_intel, outcome_history,
                 add(9, "price rejected above/lost the strike")
 
     score = float(np.clip(score, 0, 100))
+
+    # A second layer separates an EARLY reversal warning from an OBSERVED confirmation.
+    # "Confirmed" here means short-term price structure has already started turning;
+    # it never means the next candles are guaranteed to continue in that direction.
+    ema8_prev = float(c.iloc[:-1].ewm(span=8, adjust=False).mean().iloc[-1]) if len(c) > 2 else ema8
+    prior_micro = c.iloc[-5:-1] if len(c) >= 6 else c.iloc[:-1]
+    if reversal_direction == "UP":
+        momentum_turn = bool(r1 > 0 and r2 > 0)
+        micro_break = bool(len(prior_micro) and price > float(prior_micro.max()))
+        ema_turn = bool(ema8 > ema8_prev)
+        explicit_pattern = any(any(w in n.lower() for w in bullish_words) for n in pattern_names)
+    else:
+        momentum_turn = bool(r1 < 0 and r2 < 0)
+        micro_break = bool(len(prior_micro) and price < float(prior_micro.min()))
+        ema_turn = bool(ema8 < ema8_prev)
+        explicit_pattern = any(any(w in n.lower() for w in bearish_words) for n in pattern_names)
+
+    candle_turn = bool(opposing >= 14 or explicit_pattern)
+    against_whales = (-trend_direction * whale_pressure) if whale_pressure is not None else None
+    whale_align = bool(against_whales is not None and against_whales >= .16)
+    history_support = bool(
+        hist is not None and hist_p is not None and hist.get("effective_n", 0) >= 25 and float(hist_p) >= .55
+    )
+
+    confirmation_checks = []
+    confirmation_strength = 0.0
+    def confirm_check(ok, points, label):
+        nonlocal confirmation_strength
+        if ok:
+            confirmation_strength += float(points)
+            confirmation_checks.append(label)
+
+    confirm_check(momentum_turn, 22, "1m/2m momentum turned")
+    confirm_check(micro_break, 25, "micro swing structure broke")
+    confirm_check(ema_turn, 13, "EMA8 slope turned")
+    confirm_check(candle_turn, 15, "reversal candle structure agrees")
+    confirm_check(whale_align, 15, "large-trade flow agrees")
+    confirm_check(history_support, 10, "similar BTC history supports the turn")
+    confirmation_strength = float(np.clip(confirmation_strength, 0, 100))
+
+    independent_support = sum((ema_turn, candle_turn, whale_align, history_support))
+    confirmed = bool(
+        score >= 68 and confirms >= 3 and momentum_turn and micro_break and independent_support >= 2
+    )
+    very_strong = bool(
+        confirmed and score >= 82 and confirmation_strength >= 75 and independent_support >= 3
+    )
+
     # Require multiple independent confirmations for stronger language.
-    if score >= 72 and confirms >= 3:
+    if very_strong:
+        status = f"CONFIRMED REVERSAL {reversal_direction} · VERY STRONG"
+        confidence = "HIGH"
+        confirmation_state = f"CONFIRMED {reversal_direction}"
+    elif confirmed:
+        status = f"CONFIRMED REVERSAL {reversal_direction}"
+        confidence = "HIGH"
+        confirmation_state = f"CONFIRMED {reversal_direction}"
+    elif score >= 72 and confirms >= 3:
         status = f"REVERSAL {reversal_direction} · STRONG WATCH"
         confidence = "HIGH"
+        confirmation_state = "NOT CONFIRMED YET"
     elif score >= 56 and confirms >= 2:
         status = f"POSSIBLE REVERSAL {reversal_direction}"
         confidence = "MEDIUM-HIGH"
+        confirmation_state = "NOT CONFIRMED YET"
     elif score >= 40:
         status = f"REVERSAL {reversal_direction} WATCH"
         confidence = "MEDIUM"
+        confirmation_state = "EARLY WARNING"
     else:
         status = "NO CLEAR REVERSAL"
         confidence = "LOW"
+        confirmation_state = "NOT CONFIRMED"
 
     return {
         "status":status, "direction":reversal_direction if score >= 40 else "NONE",
@@ -1152,6 +1214,8 @@ def reversal_intelligence(frame, exchange_trades, candle_intel, outcome_history,
         "large_buy_usd":large_buy, "large_sell_usd":large_sell,
         "reasons":reasons[:5], "confirmations":confirms, "trend":trend_name,
         "stretch_z":float(stretch_z), "r1":float(r1), "r5":float(r5), "r15":float(r15),
+        "confirmation_state":confirmation_state, "confirmation_strength":confirmation_strength,
+        "confirmation_checks":confirmation_checks, "confirmed":confirmed, "guaranteed":False,
     }
 
 def parametric_strike_probability(history, current_price, strike, remaining_min):
@@ -2456,7 +2520,9 @@ def _render_live_dashboard_inner():
             rev_whale_text = "whales selling"
         else:
             rev_whale_text = "whales balanced"
-        rev_sub = f"{rev_score:.0f}/100 · {rev_hist_text} · {rev_whale_text}"
+        rev_confirm = str(rev.get("confirmation_state", "NOT CONFIRMED"))
+        rev_confirm_strength = float(rev.get("confirmation_strength", 0.0) or 0.0)
+        rev_sub = f"{rev_confirm} · confirm {rev_confirm_strength:.0f}/100 · {rev_whale_text}"
         rev_color = "#36d7a4" if rev.get("direction") == "UP" else "#ff6c78" if rev.get("direction") == "DOWN" else "#ffcf77"
 
         intel = {
@@ -2534,6 +2600,10 @@ def _render_live_dashboard_inner():
             st.markdown("**Reversal radar**")
             rev = engine.get("reversal") or {}
             st.caption(f"{rev.get('status','NO CLEAR REVERSAL')} · score {rev.get('score',0):.0f}/100 · current trend {rev.get('trend','MIXED')}")
+            st.caption(
+                f"Confirmation: {rev.get('confirmation_state','NOT CONFIRMED')} · "
+                f"strength {rev.get('confirmation_strength',0):.0f}/100 · guaranteed: NO"
+            )
             if rev.get("historical_prob") is not None:
                 hist = rev.get("historical") or {}
                 st.caption(f"Similar historical states reversed {rev['historical_prob']*100:.1f}% over ~{hist.get('horizon_min',5)}m · effective sample ≈ {hist.get('effective_n',0):.0f}")
@@ -2541,7 +2611,13 @@ def _render_live_dashboard_inner():
                 st.caption(f"Large-trade pressure {rev['whale_pressure']:+.2f} · ≥$100k buys ${rev.get('large_buy_usd',0)/1e6:.2f}M · sells ${rev.get('large_sell_usd',0)/1e6:.2f}M")
             for why in rev.get("reasons", [])[:4]:
                 st.caption(f"• {why}")
-            st.caption("A reversal watch is a warning that the current short-term move may be failing; it is not a guaranteed turn.")
+            checks = rev.get("confirmation_checks", [])
+            if checks:
+                st.caption("Confirmation checks: " + " · ".join(checks[:6]))
+            st.caption(
+                "CONFIRMED means momentum and short-term price structure have already turned with supporting evidence. "
+                "It still cannot mean 'for sure'—BTC can reverse again immediately."
+            )
 
             st.markdown("**Outcome Fusion v2**")
             if engine.get("prob_above") is not None:
