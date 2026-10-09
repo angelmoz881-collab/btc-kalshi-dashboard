@@ -300,7 +300,7 @@ with tab1:
                 (f"  |  Status: **{kalshi_data['market'].get('status', 'unknown')}**" if kalshi_data else "  |  Quotes unavailable"))
     else:
         st.warning("⚠️ No Kalshi ticker selected. Open Settings to select an active BTC 15-minute contract.")
-    st.caption("TradingView Lightweight Charts · drag to pan · pinch or scroll to zoom · crosshair for exact candle prices")
+    st.caption("Interactive Plotly chart · pinch to zoom · zoom buttons · select Pan from chart toolbar to scroll through history")
     timeframe = st.radio("Candle timeframe", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True)
     window = st.radio("Visible history", ["15m", "30m", "1h", "3h", "6h"], index=2, horizontal=True)
     c1, c2 = st.columns(2)
@@ -357,9 +357,20 @@ with tab1:
             chart.add_trace(go.Scatter(
                 x=view["time"], y=view["close"].ewm(span=span, adjust=False).mean(),
                 name=f"EMA {span}", mode="lines", line=dict(color=color, width=1)))
+    # Mobile-friendly zoom controls supplement Plotly's native two-finger pinch.
+    zoom_key = f"btc_zoom_{timeframe}_{window}"
+    if zoom_key not in st.session_state:
+        st.session_state[zoom_key] = 1.0
+    zin, zout, zreset = st.columns(3)
+    if zin.button("＋ Zoom in", key=f"zin_{timeframe}_{window}", use_container_width=True):
+        st.session_state[zoom_key] = max(0.1, st.session_state[zoom_key] / 1.7)
+    if zout.button("－ Zoom out", key=f"zout_{timeframe}_{window}", use_container_width=True):
+        st.session_state[zoom_key] = min(8.0, st.session_state[zoom_key] * 1.7)
+    if zreset.button("⟲ Reset zoom", key=f"zreset_{timeframe}_{window}", use_container_width=True):
+        st.session_state[zoom_key] = 1.0
     # Date ranges, unlike chart-library logical ranges, cannot collapse to one bar.
     right_edge = view["time"].iloc[-1] + pd.Timedelta(minutes=candle_minutes * 2)
-    left_edge = right_edge - pd.Timedelta(minutes=max(minutes, candle_minutes * 4))
+    left_edge = right_edge - pd.Timedelta(minutes=max(minutes, candle_minutes * 4) * st.session_state[zoom_key])
     chart.update_layout(
         height=520, margin=dict(l=8, r=8, t=12, b=15),
         paper_bgcolor="#0c1929", plot_bgcolor="#0c1929",
@@ -370,18 +381,19 @@ with tab1:
         yaxis=dict(side="right", showgrid=True, gridcolor="#1b2e44",
                    tickprefix="$", tickformat=",.2f", fixedrange=False),
         showlegend=show_ema, legend=dict(orientation="h", y=1.12, x=0),
-        dragmode="pan", uirevision=f"{timeframe}-{window}-{chart_style}",
+        dragmode="zoom", uirevision=f"{timeframe}-{window}-{chart_style}-{st.session_state[zoom_key]}",
         hovermode="x unified",
     )
     st.plotly_chart(chart, use_container_width=True, config={
         "displaylogo": False, "scrollZoom": True, "responsive": True,
+        "doubleClick": "reset", "displayModeBar": True,
         "modeBarButtonsToRemove": ["lasso2d", "select2d"],
     })
     st.caption(f"Loaded {len(bars)} distinct {timeframe} BTC candles · UTC: "
                f"{datetime.fromtimestamp(bars[0]['time'], timezone.utc):%H:%M}–"
                f"{datetime.fromtimestamp(bars[-1]['time'], timezone.utc):%H:%M} · "
                f"Showing last {visible_count} candles initially.")
-    st.caption("Drag sideways to inspect older candles. Pinch to zoom on mobile; scroll to zoom on desktop. Use the time buttons to reset your view.")
+    st.caption("Pinch with two fingers to zoom on mobile. Drag to select a zoom area, or use ＋/－ buttons above. Double-tap the chart or use Reset zoom to restore the view. Select Pan from the chart toolbar to move sideways.")
     st.markdown('<div class="section-heading">Kalshi live quotes · directly below BTC chart</div>', unsafe_allow_html=True)
     if kalshi_data:
         k = kalshi_data
