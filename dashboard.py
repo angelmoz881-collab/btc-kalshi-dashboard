@@ -389,10 +389,19 @@ with st.spinner("Checking exchange whale-size trades and Kalshi liquidity..."):
         chain_count, chain_vsize, chain_error = None, None, str(exc)
 engine = research_signals(candles, kalshi_data, whale_trades)
 
-st.caption("Navigate: LIVE CHART for candles and signals · MARKET FLOW for Kalshi liquidity · GUIDE for explanations")
-tab1, tab2, tab3 = st.tabs(["📈 LIVE CHART", "📊 MARKET FLOW", "📖 GUIDE"])
+st.caption("Choose a section below. Each selection loads its content separately on mobile.")
+# Native radio navigation reruns the app and reliably renders only the selected
+# page on mobile browsers, avoiding empty Streamlit tab panels.
+selected_page = st.radio(
+    "Dashboard section",
+    ["📈 LIVE CHART", "📊 MARKET FLOW", "📖 GUIDE"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="dashboard_section",
+)
 
-with tab1:
+
+if selected_page == "📈 LIVE CHART":
     if market_ticker:
         st.info(f"🎯 **Kalshi market ticker: `{market_ticker}`**" +
                 (f"  |  Status: **{kalshi_data['market'].get('status', 'unknown')}**" if kalshi_data else "  |  Quotes unavailable"))
@@ -653,7 +662,7 @@ with tab1:
         st.caption("Records only signals while this Streamlit session remains active. Outcomes are NOT automatically settled or verified; do not interpret them as backtest accuracy.")
 
 
-with tab2:
+if selected_page == "📊 MARKET FLOW":
     if not market_ticker:
         st.warning("No open BTC 15-minute market selected. Check the sidebar.")
     elif kalshi_error:
@@ -705,7 +714,7 @@ with tab2:
             st.warning("No confirmed order-flow edge. Avoid forcing a trade.")
         st.caption("Order-book depth is not a forecast. Quotes can change and may not be executable at the displayed size.")
 
-with tab3:
+if selected_page == "📖 GUIDE":
     st.markdown("""
 **How to use this dashboard**
 - **LIVE CHART:** BTC candles, Kalshi quotes, countdown, outcome lean, scalping watch, and whale indicators.
