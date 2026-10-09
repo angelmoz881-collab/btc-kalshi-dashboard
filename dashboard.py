@@ -37,9 +37,9 @@ hr {border-color:#243850!important}
 .hero-sub {color:#a6bbd2;font-size:.87rem;margin-top:8px}
 .badge {display:inline-block;border:1px solid #276d6d;border-radius:20px;background:rgba(16,109,102,.2);color:#7aede0;font-weight:800;font-size:.72rem;padding:6px 11px;margin-top:13px}
 .section-heading {font-size:.72rem;font-weight:800;color:#8fa6c1;letter-spacing:.14em;text-transform:uppercase;margin:20px 0 11px}
-@media(max-width:650px){.block-container{padding:1rem .7rem 2rem}.hero{padding:18px 16px;border-radius:15px}[data-testid="stMetric"]{padding:12px 11px;min-height:94px}[data-testid="stMetricValue"]{font-size:1.18rem!important}[data-testid="stTabs"] button{padding:9px 7px;font-size:.78rem}}
+@media(max-width:650px){.block-container{padding:.55rem .65rem 2rem}.hero{padding:12px 14px;border-radius:13px;margin-bottom:8px}.hero-title{font-size:1.35rem}.hero-sub{font-size:.76rem}.badge{margin-top:7px;font-size:.63rem;padding:4px 8px}[data-testid="stMetric"]{padding:9px 10px;min-height:72px;border-radius:11px}[data-testid="stMetricValue"]{font-size:1.08rem!important}[data-testid="stTabs"] button{padding:8px 7px;font-size:.75rem}.section-heading{margin:10px 0 6px}[data-testid="stVerticalBlock"]{gap:.48rem}div[data-testid="stPlotlyChart"]{margin:0!important}}
 </style>""", unsafe_allow_html=True)
-st.markdown("""<div class="hero"><div class="eyebrow">Live market intelligence · Bitcoin / Kalshi</div><div class="hero-title">₿ &nbsp; BTC Scalp Terminal</div><div class="hero-sub">Price action, momentum and 15-minute prediction-market liquidity — in one focused workspace.</div><span class="badge">● RESEARCH MODE &nbsp;·&nbsp; NO AUTO-TRADING</span></div>""", unsafe_allow_html=True)
+st.markdown("""<div class="hero"><div class="eyebrow">Live market intelligence · Bitcoin / Kalshi</div><div class="hero-title">₿ &nbsp; BTC Scalp Terminal</div><div class="hero-sub">Live BTC chart and Kalshi prices, built for your phone.</div><span class="badge">● RESEARCH MODE &nbsp;·&nbsp; NO AUTO-TRADING</span></div>""", unsafe_allow_html=True)
 
 COINBASE = "https://api.exchange.coinbase.com"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -273,15 +273,10 @@ ema_fast = candles["close"].ewm(span=5, adjust=False).mean().iloc[-1]
 ema_slow = candles["close"].ewm(span=15, adjust=False).mean().iloc[-1]
 trend = "BULLISH" if ema_fast > ema_slow else "BEARISH" if ema_fast < ema_slow else "MIXED"
 
-st.markdown('<div class="section-heading">Market overview · BTC / USD</div>', unsafe_allow_html=True)
-st.metric("BTC-USD", f"${price:,.2f}", f"{ret1:+.3f}% / 1m")
-m1, m2 = st.columns(2)
-m1.metric("5-minute move", f"{ret5:+.3f}%" if pd.notna(ret5) else "—")
-m2.metric("15-minute move", f"{ret15:+.3f}%" if pd.notna(ret15) else "—")
-m3, m4 = st.columns(2)
-m3.metric("EMA trend", trend)
-m4.metric("15m realized vol*", f"{vol15:.3f}%" if pd.notna(vol15) else "—")
-st.caption("*Approximate realized volatility from recent 1-minute returns; not a forecast.")
+top_a, top_b, top_c = st.columns([1.5, 1, 1])
+top_a.metric("BTC / USD", f"${price:,.2f}", f"{ret1:+.2f}% · 1m")
+top_b.metric("5m move", f"{ret5:+.2f}%" if pd.notna(ret5) else "—")
+top_c.metric("Trend", trend.title())
 
 kalshi_data = None
 kalshi_error = None
@@ -291,23 +286,22 @@ if market_ticker:
     except requests.RequestException as exc:
         kalshi_error = str(exc)
 
-tab1, tab2, tab3 = st.tabs(["Live dashboard", "Kalshi order flow", "How to interpret"])
+tab1, tab2, tab3 = st.tabs(["📈 Chart", "📚 Order book", "ℹ️ Guide"])
 
 with tab1:
-    st.markdown("#### BTC / USD · Price action")
     if market_ticker:
         st.info(f"🎯 **Kalshi market ticker: `{market_ticker}`**" +
                 (f"  |  Status: **{kalshi_data['market'].get('status', 'unknown')}**" if kalshi_data else "  |  Quotes unavailable"))
     else:
         st.warning("⚠️ No Kalshi ticker selected. Open Settings to select an active BTC 15-minute contract.")
-    st.caption("Interactive Plotly chart · pinch to zoom · zoom buttons · select Pan from chart toolbar to scroll through history")
-    timeframe = st.radio("Candle timeframe", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True)
-    window = st.radio("Visible history", ["15m", "30m", "1h", "3h", "6h"], index=2, horizontal=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        show_ema = st.toggle("EMA 5 / 15", value=True)
-    with c2:
-        chart_style = st.selectbox("Chart style", ["Candles", "Line"], label_visibility="collapsed")
+    tcol, wcol = st.columns(2)
+    with tcol:
+        timeframe = st.selectbox("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0)
+    with wcol:
+        window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
+    with st.expander("⚙️ Chart options", expanded=False):
+        show_ema = st.toggle("Show EMA 5 / 15", value=False)
+        chart_style = st.radio("Chart type", ["Candles", "Line"], horizontal=True)
     minutes = {"15m": 15, "30m": 30, "1h": 60, "3h": 180, "6h": 360}[window]
     candle_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}[timeframe]
     # Coinbase timestamps are already UTC datetime values. Preserve those
@@ -357,22 +351,22 @@ with tab1:
             chart.add_trace(go.Scatter(
                 x=view["time"], y=view["close"].ewm(span=span, adjust=False).mean(),
                 name=f"EMA {span}", mode="lines", line=dict(color=color, width=1)))
-    # Mobile-friendly zoom controls supplement Plotly's native two-finger pinch.
+    # Touch-first controls: disable drag-to-zoom/selection; allow two-finger pinch zoom.
     zoom_key = f"btc_zoom_{timeframe}_{window}"
     if zoom_key not in st.session_state:
         st.session_state[zoom_key] = 1.0
     zin, zout, zreset = st.columns(3)
-    if zin.button("＋ Zoom in", key=f"zin_{timeframe}_{window}", use_container_width=True):
+    if zin.button("＋ In", key=f"zin_{timeframe}_{window}", use_container_width=True):
         st.session_state[zoom_key] = max(0.1, st.session_state[zoom_key] / 1.7)
-    if zout.button("－ Zoom out", key=f"zout_{timeframe}_{window}", use_container_width=True):
+    if zout.button("－ Out", key=f"zout_{timeframe}_{window}", use_container_width=True):
         st.session_state[zoom_key] = min(8.0, st.session_state[zoom_key] * 1.7)
-    if zreset.button("⟲ Reset zoom", key=f"zreset_{timeframe}_{window}", use_container_width=True):
+    if zreset.button("↺ Reset", key=f"zreset_{timeframe}_{window}", use_container_width=True):
         st.session_state[zoom_key] = 1.0
     # Date ranges, unlike chart-library logical ranges, cannot collapse to one bar.
     right_edge = view["time"].iloc[-1] + pd.Timedelta(minutes=candle_minutes * 2)
     left_edge = right_edge - pd.Timedelta(minutes=max(minutes, candle_minutes * 4) * st.session_state[zoom_key])
     chart.update_layout(
-        height=520, margin=dict(l=8, r=8, t=12, b=15),
+        height=385, margin=dict(l=2, r=2, t=22, b=5),
         paper_bgcolor="#0c1929", plot_bgcolor="#0c1929",
         font=dict(color="#c6d3e5", size=12),
         xaxis=dict(type="date", range=[left_edge, right_edge],
@@ -380,20 +374,20 @@ with tab1:
                    rangeslider=dict(visible=False), tickformat="%H:%M"),
         yaxis=dict(side="right", showgrid=True, gridcolor="#1b2e44",
                    tickprefix="$", tickformat=",.2f", fixedrange=False),
-        showlegend=show_ema, legend=dict(orientation="h", y=1.12, x=0),
-        dragmode="zoom", uirevision=f"{timeframe}-{window}-{chart_style}-{st.session_state[zoom_key]}",
+        showlegend=False,
+        dragmode=False, uirevision=f"{timeframe}-{window}-{chart_style}-{st.session_state[zoom_key]}",
         hovermode="x unified",
     )
     st.plotly_chart(chart, use_container_width=True, config={
-        "displaylogo": False, "scrollZoom": True, "responsive": True,
-        "doubleClick": "reset", "displayModeBar": True,
+        "displaylogo": False, "scrollZoom": True, "responsive": True, "doubleClickDelay": 350,
+        "doubleClick": "reset", "displayModeBar": False,
         "modeBarButtonsToRemove": ["lasso2d", "select2d"],
     })
-    st.caption(f"Loaded {len(bars)} distinct {timeframe} BTC candles · UTC: "
-               f"{datetime.fromtimestamp(bars[0]['time'], timezone.utc):%H:%M}–"
-               f"{datetime.fromtimestamp(bars[-1]['time'], timezone.utc):%H:%M} · "
-               f"Showing last {visible_count} candles initially.")
-    st.caption("Pinch with two fingers to zoom on mobile. Drag to select a zoom area, or use ＋/－ buttons above. Double-tap the chart or use Reset zoom to restore the view. Select Pan from the chart toolbar to move sideways.")
+    st.caption("🤏 Use two fingers to pinch in or out. Drag-to-zoom is disabled. Use +/− or Reset if your browser blocks pinch gestures.")
+    with st.expander("Chart data / troubleshooting", expanded=False):
+        st.caption(f"Loaded {len(bars)} distinct {timeframe} candles · UTC "
+                   f"{datetime.fromtimestamp(bars[0]['time'], timezone.utc):%H:%M}–"
+                   f"{datetime.fromtimestamp(bars[-1]['time'], timezone.utc):%H:%M}.")
     st.markdown('<div class="section-heading">Kalshi live quotes · directly below BTC chart</div>', unsafe_allow_html=True)
     if kalshi_data:
         k = kalshi_data
@@ -413,7 +407,6 @@ with tab1:
         st.info("No active Kalshi contract selected. Check Settings to select one.")
     st.caption("Quotes are in cents per contract, not model probabilities. Opposite-side bids may imply asks; fees and slippage are not included.")
 
-    st.markdown('<div class="section-heading">Momentum readout</div>', unsafe_allow_html=True)
     direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
     if abs(direction_score) < 8:
         context = "NO CLEAR EDGE — wait for confirmation"
@@ -421,9 +414,11 @@ with tab1:
         context = "UPSIDE MOMENTUM — only consider a long after checking Kalshi price and spread"
     else:
         context = "DOWNSIDE MOMENTUM — only consider a short/downside thesis after checking Kalshi price and spread"
-    st.info(context)
-    st.write(f"Momentum composite (heuristic): **{direction_score:+.1f}/100**. This is not a calibrated probability.")
-    st.dataframe(candles.tail(10).sort_values("time", ascending=False), use_container_width=True, hide_index=True)
+    with st.expander("📊 Momentum & recent candles", expanded=False):
+        st.info(context)
+        st.write(f"Momentum score (heuristic): **{direction_score:+.1f}/100**. Not a calibrated probability.")
+        st.metric("15m realized volatility", f"{vol15:.3f}%" if pd.notna(vol15) else "—")
+        st.dataframe(candles.tail(10).sort_values("time", ascending=False), use_container_width=True, hide_index=True)
 
 with tab2:
     if not market_ticker:
