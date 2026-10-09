@@ -185,41 +185,50 @@ def _github_headers(token):
 def _load_learning_from_github():
     token = _learning_token()
     if not token:
+        st.session_state["learning_remote_read_status"] = "GitHub token not configured"
         return None
     url = f"https://api.github.com/repos/{_learning_repo()}/contents/{_learning_path()}"
     try:
         r = HTTP.get(url, params={"ref": _learning_branch()}, headers=_github_headers(token), timeout=10)
         if r.status_code == 404:
+            st.session_state["learning_remote_read_status"] = "GitHub file not created yet"
             return None
         r.raise_for_status()
         payload = r.json()
         raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
         from io import StringIO
-        return _normalize_learning_history(pd.read_csv(StringIO(raw)))
-    except Exception:
+        remote = _normalize_learning_history(pd.read_csv(StringIO(raw)))
+        st.session_state["learning_remote_read_status"] = f"GitHub read OK · {len(remote)} snapshots"
+        return remote
+    except Exception as exc:
+        st.session_state["learning_remote_read_status"] = f"GitHub read failed: {type(exc).__name__}: {exc}"
         return None
 
 
 def load_learning_history():
-    """Load feedback history. Local disk is fastest; optional GitHub is durable.
+    """Load/merge local and durable GitHub feedback history.
 
-    Streamlit's local filesystem can be reset by a redeploy. If a
-    LEARNING_GITHUB_TOKEN secret is configured, the same CSV is also read/written
-    through the repository Contents API so the learner survives restarts.
+    With a token configured, GitHub is treated as durable storage while the local
+    file remains a fast cache. Merging both prevents a stale Streamlit runtime file
+    from hiding newer history that was already persisted to the learning branch.
     """
+    local = None
     try:
         if LEARNING_LOCAL_PATH.exists():
-            return _normalize_learning_history(pd.read_csv(LEARNING_LOCAL_PATH))
-    except Exception:
-        pass
-    remote = _load_learning_from_github()
-    if remote is not None:
+            local = _normalize_learning_history(pd.read_csv(LEARNING_LOCAL_PATH))
+    except Exception as exc:
+        st.session_state["learning_local_read_status"] = f"Local read failed: {type(exc).__name__}: {exc}"
+    remote = _load_learning_from_github() if _learning_token() else None
+    frames = [x for x in (local, remote) if isinstance(x, pd.DataFrame) and len(x)]
+    if frames:
+        merged = _normalize_learning_history(pd.concat(frames, ignore_index=True))
         try:
             LEARNING_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-            remote.to_csv(LEARNING_LOCAL_PATH, index=False)
-        except Exception:
-            pass
-        return remote
+            merged.to_csv(LEARNING_LOCAL_PATH, index=False)
+            st.session_state["learning_local_read_status"] = f"Local cache OK · {len(merged)} snapshots"
+        except Exception as exc:
+            st.session_state["learning_local_read_status"] = f"Local cache write failed: {type(exc).__name__}: {exc}"
+        return merged
     return _empty_learning_history()
 
 
@@ -267,32 +276,78 @@ def save_learning_history(df):
 
 
 def _market_result_payload(ticker):
-    """Fetch settlement outcome for one previously recorded market."""
+    """Fetch the official settled YES/NO outcome for one recorded market.
+
+    Kalshi's current Market payload exposes settlement_value_dollars/settlement_ts
+    but may omit the older ``result`` field. Binary YES contracts settle to $1 or
+    $0, so infer YES/NO from that official payout when necessary. As a final
+    fallback for KXBTC15M, compare the published expiration value with the strike.
+    """
     try:
         r = HTTP.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=10)
         if r.status_code == 404:
+            st.session_state["learning_result_status"] = f"{ticker}: market not found yet"
             return None
         r.raise_for_status()
-        m = r.json().get("market", r.json())
-        result = str(m.get("result") or m.get("market_result") or "").lower()
-        if result not in ("yes", "no"):
-            return None
-        value = m.get("expiration_value")
-        if value in (None, ""):
-            value = m.get("settlement_value")
-        if value in (None, ""):
-            value = m.get("settlement_value_dollars")
+        body = r.json()
+        m = body.get("market", body)
+        result = str(m.get("result") or m.get("market_result") or "").strip().lower()
+
+        # Newer Kalshi Market objects expose the YES payout instead of a result
+        # string. A settled binary market pays either $1.00 (YES) or $0.00 (NO).
+        payout_raw = m.get("settlement_value_dollars")
+        if payout_raw in (None, ""):
+            payout_raw = m.get("yes_settlement_value_dollars")
         try:
-            value = float(value) if value not in (None, "") else np.nan
+            payout = float(payout_raw) if payout_raw not in (None, "") else np.nan
         except Exception:
-            value = np.nan
+            payout = np.nan
+        if result not in ("yes", "no") and np.isfinite(payout):
+            if payout >= 0.999:
+                result = "yes"
+            elif payout <= 0.001:
+                result = "no"
+
+        expiration_raw = m.get("expiration_value")
+        try:
+            expiration_value = float(expiration_raw) if expiration_raw not in (None, "") else np.nan
+        except Exception:
+            expiration_value = np.nan
+
+        # If Kalshi has published the benchmark expiration value but not a payout,
+        # infer the binary result from the contract strike. This fallback is only
+        # used for this BTC-above-strike series.
+        if result not in ("yes", "no") and str(ticker).startswith("KXBTC15M") and np.isfinite(expiration_value):
+            strike_raw = m.get("floor_strike")
+            if strike_raw in (None, ""):
+                strike_raw = m.get("strike_price")
+            try:
+                strike = float(strike_raw) if strike_raw not in (None, "") else np.nan
+            except Exception:
+                strike = np.nan
+            if np.isfinite(strike):
+                result = "yes" if expiration_value > strike else "no"
+
         settled = m.get("settlement_ts") or m.get("settled_time") or m.get("settlement_time") or ""
+        if result not in ("yes", "no"):
+            status = str(m.get("status") or "").lower()
+            st.session_state["learning_result_status"] = (
+                f"{ticker}: no settled label yet · status={status or 'unknown'} · "
+                f"payout={payout_raw if payout_raw not in (None,'') else 'n/a'}"
+            )
+            return None
+
+        # Prefer the published BTC expiration benchmark for diagnostics; otherwise
+        # retain the binary payout as the settlement value.
+        value = expiration_value if np.isfinite(expiration_value) else payout
+        st.session_state["learning_result_status"] = f"{ticker}: resolved {result.upper()}"
         return {"result": result, "settled_utc": str(settled), "settlement_value": value}
-    except Exception:
+    except Exception as exc:
+        st.session_state["learning_result_status"] = f"{ticker}: result check failed: {type(exc).__name__}: {exc}"
         return None
 
 
-def refresh_learning_outcomes(df, force=False, max_markets=12):
+def refresh_learning_outcomes(df, force=False, max_markets=24):
     """Fill labels for old snapshots by checking official Kalshi market results."""
     df = _normalize_learning_history(df)
     now = time.time()
@@ -821,6 +876,252 @@ def empirical_analog_probability(history, current_price, strike, remaining_min):
         "q90": _weighted_quantile(y, w, .90),
     }
 
+
+
+def historical_reversal_probability(history, trend_direction, horizon_min=5):
+    """Estimate short-horizon reversal frequency in historically similar BTC states.
+
+    This is not a guaranteed probability. It looks for prior 1-minute states with
+    similar momentum, EMA stretch, realized volatility and momentum deceleration,
+    then measures how often price moved materially *against* the prevailing trend
+    over the next few minutes.
+    """
+    if history is None or len(history) < 300 or trend_direction not in (-1, 1):
+        return None
+    df = history.copy().sort_values("time").drop_duplicates("time")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    if c.notna().sum() < 300:
+        return None
+    r1 = c.pct_change()
+    ema8 = c.ewm(span=8, adjust=False).mean()
+    ema21 = c.ewm(span=21, adjust=False).mean()
+    f = pd.DataFrame(index=df.index)
+    f["r2"] = c.pct_change(2)
+    f["r5"] = c.pct_change(5)
+    f["r15"] = c.pct_change(15)
+    f["vol15"] = r1.rolling(15).std()
+    f["ema_gap"] = ema8 / ema21 - 1.0
+    # Positive acceleration means the latest 2m is stronger than the preceding 3m.
+    prev3 = c.shift(2) / c.shift(5) - 1.0
+    f["accel"] = f["r2"] - prev3
+
+    horizon = int(np.clip(round(float(horizon_min)), 2, 10))
+    future = c.shift(-horizon) / c - 1.0
+    candidates = f.iloc[:-horizon].copy()
+    candidates["future_ret"] = future.iloc[:-horizon]
+    candidates = candidates.dropna()
+    current = f.iloc[-1]
+    if candidates.empty or current.isna().any():
+        return None
+
+    # Compare only states whose prevailing 5m/15m direction matches the live trend.
+    same_dir = (np.sign(candidates["r5"]) == trend_direction) & (np.sign(candidates["r15"]) == trend_direction)
+    pool = candidates.loc[same_dir].copy()
+    if len(pool) < 80:
+        pool = candidates.copy()
+
+    cols = ["r2", "r5", "r15", "vol15", "ema_gap", "accel"]
+    X = pool[cols].astype(float)
+    cur = current[cols].astype(float)
+    scale = (X.quantile(.75) - X.quantile(.25)).replace(0, np.nan) / 1.349
+    scale = scale.fillna(X.std().replace(0, np.nan)).fillna(1e-6).clip(lower=1e-6)
+    fw = pd.Series({"r2":1.35,"r5":1.35,"r15":1.0,"vol15":.75,"ema_gap":1.15,"accel":1.3})
+    dist = np.sqrt((((X-cur)/scale)**2 * fw).sum(axis=1))
+    k = int(np.clip(len(pool)*.22, 70, 180))
+    near = dist.nsmallest(min(k, len(dist))).index
+    d = dist.loc[near].to_numpy(dtype=float)
+    y = pool.loc[near, "future_ret"].to_numpy(dtype=float)
+    base = max(float(np.nanmedian(d)), .35)
+    w = np.exp(-0.5*(d/base)**2)
+    if np.sum(w) <= 0:
+        return None
+
+    # Require more than a microscopic tick against trend. Threshold scales with
+    # recent 1m volatility so high-volatility periods do not generate false reversals.
+    sigma = float(max(current["vol15"], 1e-5))
+    threshold = float(np.clip(.55*sigma*np.sqrt(horizon), .00025, .0025))
+    reversed_move = (y <= -threshold) if trend_direction > 0 else (y >= threshold)
+    p = float(np.sum(w*reversed_move.astype(float))/np.sum(w))
+    eff_n = float((np.sum(w)**2)/max(np.sum(w*w), 1e-9))
+    return {
+        "prob": float(np.clip(p, .01, .99)),
+        "effective_n": eff_n,
+        "horizon_min": horizon,
+        "threshold": threshold,
+        "median_forward": _weighted_quantile(y, w, .50),
+        "q25": _weighted_quantile(y, w, .25),
+        "q75": _weighted_quantile(y, w, .75),
+    }
+
+
+def reversal_intelligence(frame, exchange_trades, candle_intel, outcome_history, strike=None):
+    """Detect a *possible* short-horizon BTC reversal using independent evidence.
+
+    The detector intentionally distinguishes a warning from confirmation. It combines
+    prevailing trend, momentum deceleration, overextension, reversal candles, aggressive
+    large-trade pressure and historical analogs. A high score means several independent
+    clues agree; it is not a promise that price will reverse.
+    """
+    neutral = {
+        "status":"NO CLEAR REVERSAL", "direction":"NONE", "score":0.0,
+        "confidence":"LOW", "historical_prob":None, "historical":None,
+        "whale_pressure":None, "large_buy_usd":0.0, "large_sell_usd":0.0,
+        "reasons":[], "confirmations":0, "trend":"MIXED",
+    }
+    if frame is None or len(frame) < 35:
+        return neutral
+    f = frame.copy().sort_values("time").drop_duplicates("time")
+    c = pd.to_numeric(f["close"], errors="coerce").dropna().astype(float)
+    if len(c) < 35:
+        return neutral
+
+    price = float(c.iloc[-1])
+    r1 = price/float(c.iloc[-2]) - 1.0
+    r2 = price/float(c.iloc[-3]) - 1.0
+    r5 = price/float(c.iloc[-6]) - 1.0
+    r15 = price/float(c.iloc[-16]) - 1.0
+    prev3 = float(c.iloc[-3]/c.iloc[-6]-1.0)
+    ema8 = float(c.ewm(span=8, adjust=False).mean().iloc[-1])
+    ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+    sigma1 = float(c.pct_change().tail(30).std())
+    sigma1 = max(sigma1, 1e-5)
+
+    # Require a reasonably coherent prevailing move before calling something a reversal.
+    trend_direction = 0
+    if r5 > 0 and r15 > 0 and ema8 >= ema21:
+        trend_direction = 1
+    elif r5 < 0 and r15 < 0 and ema8 <= ema21:
+        trend_direction = -1
+    elif abs(r5) > max(.00045, .9*sigma1*np.sqrt(5)):
+        trend_direction = 1 if r5 > 0 else -1
+    if trend_direction == 0:
+        return {**neutral, "trend":"MIXED"}
+
+    trend_name = "UPTREND" if trend_direction > 0 else "DOWNTREND"
+    reversal_direction = "DOWN" if trend_direction > 0 else "UP"
+    score = 0.0
+    reasons = []
+    confirms = 0
+
+    def add(points, reason, confirmation=True):
+        nonlocal score, confirms
+        score += float(points)
+        reasons.append(reason)
+        if confirmation:
+            confirms += 1
+
+    # 1) Momentum deceleration / turn. Recent 1-2m moving against the prior trend is
+    # more useful than simply seeing an old overbought/oversold reading.
+    if trend_direction > 0:
+        if r1 < 0: add(9, "latest 1m candle is pushing against the uptrend")
+        if r2 < 0 and prev3 > 0: add(15, "2m momentum flipped down after prior buying")
+        if r5 > 0 and r2 < -.18*abs(r5): add(8, "recent downside impulse is eroding the 5m rise")
+    else:
+        if r1 > 0: add(9, "latest 1m candle is pushing against the downtrend")
+        if r2 > 0 and prev3 < 0: add(15, "2m momentum flipped up after prior selling")
+        if r5 < 0 and r2 > .18*abs(r5): add(8, "recent upside impulse is eroding the 5m drop")
+
+    # 2) Stretch from a slower mean. Extreme stretch alone is only a setup, so it
+    # contributes less unless another trigger appears.
+    stretch_z = (price/ema21 - 1.0) / max(sigma1*np.sqrt(8), 1e-5)
+    if trend_direction > 0 and stretch_z >= .85:
+        add(min(12, 6 + 4*(stretch_z-.85)), f"price is stretched {stretch_z:.1f}σ above EMA21", confirmation=False)
+    elif trend_direction < 0 and stretch_z <= -.85:
+        add(min(12, 6 + 4*(abs(stretch_z)-.85)), f"price is stretched {abs(stretch_z):.1f}σ below EMA21", confirmation=False)
+
+    # 3) Candle engine: only opposing 1m/5m structure is treated as reversal evidence.
+    tf = (candle_intel or {}).get("timeframes", {})
+    one = float((tf.get(1) or {}).get("score", 0.0))
+    five = float((tf.get(5) or {}).get("score", 0.0))
+    opposing = -(0.58*one + 0.42*five) * trend_direction
+    if opposing >= 14:
+        add(float(np.clip(opposing*.34, 5, 16)), f"1m/5m candles are turning {reversal_direction.lower()}")
+    # Explicit rejection/reclaim patterns deserve a separate clue.
+    pattern_names = [str(p.get("name", "")) for p in (candle_intel or {}).get("patterns", [])]
+    bullish_words = ("bullish", "hammer", "failed low", "lower-wick", "reclaim")
+    bearish_words = ("bearish", "shooting", "failed high", "upper-wick", "breakdown")
+    if reversal_direction == "UP" and any(any(w in n.lower() for w in bullish_words) for n in pattern_names):
+        add(8, "bullish rejection/reversal candle pattern detected")
+    if reversal_direction == "DOWN" and any(any(w in n.lower() for w in bearish_words) for n in pattern_names):
+        add(8, "bearish rejection/reversal candle pattern detected")
+
+    # 4) Aggressive large trades. Weight ≥$100k trades more heavily than the full tape.
+    large_buy = large_sell = 0.0
+    all_signed = all_total = 0.0
+    for side, usd in exchange_trades or []:
+        try:
+            usd = float(usd)
+            s = 1.0 if side == "buy" else -1.0
+            all_signed += s*usd; all_total += usd
+            if usd >= 100000:
+                if side == "buy": large_buy += usd
+                else: large_sell += usd
+        except Exception:
+            pass
+    whale_total = large_buy + large_sell
+    if whale_total > 0:
+        whale_pressure = (large_buy-large_sell)/whale_total
+    elif all_total > 0:
+        whale_pressure = all_signed/all_total
+    else:
+        whale_pressure = None
+    if whale_pressure is not None:
+        against = -trend_direction * whale_pressure
+        if against >= .16:
+            magnitude = min(16.0, 7.0 + 12.0*against)
+            side_word = "buying" if reversal_direction == "UP" else "selling"
+            add(magnitude, f"large-trade pressure shows {side_word} against the current trend")
+        elif against <= -.22:
+            # Whales reinforcing the prevailing trend reduce reversal risk.
+            score -= min(12.0, 5.0 + 10.0*abs(against))
+            reasons.append("large-trade pressure is still reinforcing the current trend")
+
+    # 5) Historical same-regime analogs use the existing cached 24h history, so this
+    # adds no extra network request to the fast live loop.
+    hist = historical_reversal_probability(outcome_history, trend_direction, horizon_min=5)
+    hist_p = hist.get("prob") if hist else None
+    if hist and hist.get("effective_n", 0) >= 25:
+        p = float(hist_p)
+        if p >= .60:
+            add(float(np.clip((p-.50)*42, 5, 17)), f"similar BTC states reversed {p*100:.0f}% of the time over ~5m")
+        elif p <= .36:
+            score -= float(np.clip((.50-p)*28, 3, 9))
+            reasons.append(f"similar BTC states only reversed {p*100:.0f}% of the time")
+
+    # 6) Strike rejection is especially useful for this product because traders often
+    # react around the binary threshold, but it never creates a reversal signal alone.
+    if strike is not None and np.isfinite(strike):
+        dist_sigma = abs(price-float(strike))/max(price*sigma1*np.sqrt(5), 1e-6)
+        strike_events = [str((tf.get(m) or {}).get("strike_event", "")) for m in (1,5)]
+        if dist_sigma <= .75:
+            if reversal_direction == "UP" and any(("reclaim" in x.lower() or "lower-wick" in x.lower()) for x in strike_events):
+                add(9, "price rejected below/reclaimed the strike")
+            elif reversal_direction == "DOWN" and any(("breakdown" in x.lower() or "upper-wick" in x.lower()) for x in strike_events):
+                add(9, "price rejected above/lost the strike")
+
+    score = float(np.clip(score, 0, 100))
+    # Require multiple independent confirmations for stronger language.
+    if score >= 72 and confirms >= 3:
+        status = f"REVERSAL {reversal_direction} · STRONG WATCH"
+        confidence = "HIGH"
+    elif score >= 56 and confirms >= 2:
+        status = f"POSSIBLE REVERSAL {reversal_direction}"
+        confidence = "MEDIUM-HIGH"
+    elif score >= 40:
+        status = f"REVERSAL {reversal_direction} WATCH"
+        confidence = "MEDIUM"
+    else:
+        status = "NO CLEAR REVERSAL"
+        confidence = "LOW"
+
+    return {
+        "status":status, "direction":reversal_direction if score >= 40 else "NONE",
+        "score":score, "confidence":confidence, "historical_prob":hist_p,
+        "historical":hist, "whale_pressure":whale_pressure,
+        "large_buy_usd":large_buy, "large_sell_usd":large_sell,
+        "reasons":reasons[:5], "confirmations":confirms, "trend":trend_name,
+        "stretch_z":float(stretch_z), "r1":float(r1), "r5":float(r5), "r15":float(r15),
+    }
 
 def parametric_strike_probability(history, current_price, strike, remaining_min):
     """Short-horizon log-return model using robust recent realized volatility."""
@@ -1783,6 +2084,17 @@ def _render_live_dashboard_inner():
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
                               outcome_history, brti_proxy, proxy_samples, learning_model)
+    reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
+    engine["reversal"] = reversal
+    # A strong reversal warning acts as a scalp safety brake: do not keep telling the
+    # user to chase a direction that multiple independent reversal clues oppose.
+    if reversal.get("score", 0) >= 60:
+        if reversal.get("direction") == "UP" and engine.get("scalp") == "WATCH NO":
+            engine["scalp"] = "WAIT"
+            engine["reason"] = "Possible upside reversal conflicts with the downside scalp signal"
+        elif reversal.get("direction") == "DOWN" and engine.get("scalp") == "WATCH YES":
+            engine["scalp"] = "WAIT"
+            engine["reason"] = "Possible downside reversal conflicts with the upside scalp signal"
 
     # Automatically journal one snapshot in each time bucket (max six per market).
     # Once the market settles, refresh_learning_outcomes supplies the official YES/NO
@@ -2098,6 +2410,23 @@ def _render_live_dashboard_inner():
         else:
             mood, mood_color = "NO HIGH-CONFIDENCE OUTCOME CALL", "#ffcf77"
 
+        rev = engine.get("reversal") or {}
+        rev_status = str(rev.get("status", "NO CLEAR REVERSAL"))
+        rev_score = float(rev.get("score", 0.0) or 0.0)
+        rev_hist = rev.get("historical_prob")
+        rev_hist_text = f"hist {rev_hist*100:.0f}%" if rev_hist is not None else "hist n/a"
+        rev_whale = rev.get("whale_pressure")
+        if rev_whale is None:
+            rev_whale_text = "whales n/a"
+        elif rev_whale > .08:
+            rev_whale_text = "whales buying"
+        elif rev_whale < -.08:
+            rev_whale_text = "whales selling"
+        else:
+            rev_whale_text = "whales balanced"
+        rev_sub = f"{rev_score:.0f}/100 · {rev_hist_text} · {rev_whale_text}"
+        rev_color = "#36d7a4" if rev.get("direction") == "UP" else "#ff6c78" if rev.get("direction") == "DOWN" else "#ffcf77"
+
         intel = {
             "expiry": timer_expiry, "btc": f"${ref_price:,.0f}", "yes": yes_buy, "no": no_buy,
             "yesSell": yes_sell, "noSell": no_sell, "outcome": outcome_text,
@@ -2105,6 +2434,7 @@ def _render_live_dashboard_inner():
             "above": prob_above_text, "below": prob_below_text, "confidence": conf_text,
             "confSub": conf_sub, "proxySub": proxy_sub, "edge": edge_text,
             "settleNote": settle_note, "mood": mood, "moodColor": mood_color,
+            "reversal": rev_status, "reversalSub": rev_sub, "reversalColor": rev_color,
         }
         intel_json = json.dumps(intel)
         intel_html = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2116,6 +2446,7 @@ def _render_live_dashboard_inner():
         .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.grid4b{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:5px}
         .tile{background:#111722;border:1px solid #302631;border-radius:8px;padding:6px;min-width:0}.tile small{display:block;color:#8197b2;font-size:8px;font-weight:800;letter-spacing:.06em;white-space:nowrap}
         .tile strong{display:block;margin-top:2px;font-size:13px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tile em{display:block;margin-top:2px;color:#8fa0b3;font-size:8px;font-style:normal;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .rev{margin-top:5px;display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid #3b3138;background:#0f141d;border-radius:8px;padding:5px 7px}.rev b{font-size:9px;letter-spacing:.04em}.rev span{color:#94a5b8;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .foot{margin-top:5px;color:#8e7a84;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         @media(max-width:430px){.panel{padding:6px}.grid4,.grid4b{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
         </style></head><body><div class="panel">
@@ -2132,17 +2463,19 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>MODEL CONF</small><strong id="confidence"></strong><em id="confSub"></em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>short-term watch</em></div>
           </div>
+          <div class="rev" id="revBox"><b id="reversal"></b><span id="reversalSub"></span></div>
           <div class="foot" id="distance"></div>
         </div><script>
         const d=__INTEL__;
         for(const id of ['btc','yes','no','outcome','above','confidence','scalp']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
         document.getElementById('below').textContent='below '+(d.below||'—');document.getElementById('confSub').textContent=d.confSub||'—';document.getElementById('proxySub').textContent=d.proxySub||'—';document.getElementById('edge').textContent=d.edge||'—';document.getElementById('settleNote').textContent=d.settleNote||'—';
+        const rv=document.getElementById('reversal');rv.textContent=d.reversal||'NO CLEAR REVERSAL';rv.style.color=d.reversalColor||'#ffcf77';document.getElementById('reversalSub').textContent=d.reversalSub||'—';document.getElementById('revBox').style.borderColor=d.reversalColor||'#3b3138';
         document.getElementById('distance').textContent='Proxy vs target: '+(d.distance||'—')+' · official BRTI is the settlement source; this is an estimate, not a guarantee';
         const m=document.getElementById('mood');m.textContent=d.mood||'NO HIGH-CONFIDENCE OUTCOME CALL';m.style.color=d.moodColor||'#ffcf77';
         const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
         </script></body></html>""".replace("__INTEL__", intel_json)
-        components.html(intel_html, height=164, scrolling=False)
+        components.html(intel_html, height=188, scrolling=False)
         direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
         if abs(direction_score) < 8:
             context = "NO CLEAR EDGE — wait for confirmation"
@@ -2162,6 +2495,18 @@ def _render_live_dashboard_inner():
                 st.warning(f"Kalshi quotes unavailable: {kalshi_error}")
             else:
                 st.info("No active Kalshi contract selected.")
+
+            st.markdown("**Reversal radar**")
+            rev = engine.get("reversal") or {}
+            st.caption(f"{rev.get('status','NO CLEAR REVERSAL')} · score {rev.get('score',0):.0f}/100 · current trend {rev.get('trend','MIXED')}")
+            if rev.get("historical_prob") is not None:
+                hist = rev.get("historical") or {}
+                st.caption(f"Similar historical states reversed {rev['historical_prob']*100:.1f}% over ~{hist.get('horizon_min',5)}m · effective sample ≈ {hist.get('effective_n',0):.0f}")
+            if rev.get("whale_pressure") is not None:
+                st.caption(f"Large-trade pressure {rev['whale_pressure']:+.2f} · ≥$100k buys ${rev.get('large_buy_usd',0)/1e6:.2f}M · sells ${rev.get('large_sell_usd',0)/1e6:.2f}M")
+            for why in rev.get("reasons", [])[:4]:
+                st.caption(f"• {why}")
+            st.caption("A reversal watch is a warning that the current short-term move may be failing; it is not a guaranteed turn.")
 
             st.markdown("**Outcome Fusion v2**")
             if engine.get("prob_above") is not None:
@@ -2265,8 +2610,14 @@ def _render_live_dashboard_inner():
                 preview_cols = [c for c in ["recorded_utc","ticker","checkpoint","base_prob_above","adaptive_prob_above","outcome_call","result"] if c in learning_history.columns]
                 st.dataframe(learning_history[preview_cols].tail(20), hide_index=True, use_container_width=True, height=180)
             persistence = st.session_state.get("learning_save_status", "local only")
+            unresolved_count = int((~learning_history["result"].isin(["yes", "no"])).sum()) if len(learning_history) else 0
             if _learning_token():
                 st.caption(f"Persistence: {persistence}. GitHub-backed history is enabled via LEARNING_GITHUB_TOKEN.")
+                st.caption(
+                    f"Storage check: {st.session_state.get('learning_remote_read_status','waiting')} · "
+                    f"unresolved snapshots: {unresolved_count} · "
+                    f"resolver: {st.session_state.get('learning_result_status','waiting for first settlement check')}"
+                )
             else:
                 st.caption("Persistence: local runtime + CSV export. Streamlit may reset local files on a redeploy; add a LEARNING_GITHUB_TOKEN secret for automatic GitHub-backed history.")
 
