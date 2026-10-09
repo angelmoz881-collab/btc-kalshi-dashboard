@@ -107,7 +107,7 @@ LEARNING_COLUMNS = [
 LEARNING_LOCAL_PATH = Path(os.environ.get("KALSHI_LEARNING_PATH", "data/btc_kalshi_learning.csv"))
 LEARNING_GITHUB_PATH = os.environ.get("LEARNING_GITHUB_PATH", "data/btc_kalshi_learning.csv")
 LEARNING_GITHUB_REPO = os.environ.get("LEARNING_GITHUB_REPO", "angelmoz881-collab/btc-kalshi-dashboard")
-LEARNING_GITHUB_BRANCH = os.environ.get("LEARNING_GITHUB_BRANCH", "main")
+LEARNING_GITHUB_BRANCH = os.environ.get("LEARNING_GITHUB_BRANCH", "learning-data")
 
 
 def _secret(name, default=None):
@@ -119,6 +119,18 @@ def _secret(name, default=None):
 
 def _learning_token():
     return _secret("LEARNING_GITHUB_TOKEN") or os.environ.get("LEARNING_GITHUB_TOKEN")
+
+
+def _learning_repo():
+    return _secret("LEARNING_GITHUB_REPO", LEARNING_GITHUB_REPO) or LEARNING_GITHUB_REPO
+
+
+def _learning_branch():
+    return _secret("LEARNING_GITHUB_BRANCH", LEARNING_GITHUB_BRANCH) or LEARNING_GITHUB_BRANCH
+
+
+def _learning_path():
+    return _secret("LEARNING_GITHUB_PATH", LEARNING_GITHUB_PATH) or LEARNING_GITHUB_PATH
 
 
 def _empty_learning_history():
@@ -160,9 +172,9 @@ def _load_learning_from_github():
     token = _learning_token()
     if not token:
         return None
-    url = f"https://api.github.com/repos/{LEARNING_GITHUB_REPO}/contents/{LEARNING_GITHUB_PATH}"
+    url = f"https://api.github.com/repos/{_learning_repo()}/contents/{_learning_path()}"
     try:
-        r = requests.get(url, params={"ref": LEARNING_GITHUB_BRANCH}, headers=_github_headers(token), timeout=10)
+        r = requests.get(url, params={"ref": _learning_branch()}, headers=_github_headers(token), timeout=10)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -201,11 +213,11 @@ def _push_learning_to_github(df):
     token = _learning_token()
     if not token:
         return "local only"
-    url = f"https://api.github.com/repos/{LEARNING_GITHUB_REPO}/contents/{LEARNING_GITHUB_PATH}"
+    url = f"https://api.github.com/repos/{_learning_repo()}/contents/{_learning_path()}"
     headers = _github_headers(token)
     sha = None
     try:
-        g = requests.get(url, params={"ref": LEARNING_GITHUB_BRANCH}, headers=headers, timeout=10)
+        g = requests.get(url, params={"ref": _learning_branch()}, headers=headers, timeout=10)
         if g.status_code == 200:
             sha = g.json().get("sha")
         elif g.status_code != 404:
@@ -213,7 +225,7 @@ def _push_learning_to_github(df):
         payload = {
             "message": "Update BTC Kalshi adaptive learning history",
             "content": base64.b64encode(df.to_csv(index=False).encode("utf-8")).decode("ascii"),
-            "branch": LEARNING_GITHUB_BRANCH,
+            "branch": _learning_branch(),
         }
         if sha:
             payload["sha"] = sha
