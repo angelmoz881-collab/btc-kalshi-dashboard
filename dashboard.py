@@ -306,6 +306,367 @@ def save_learning_history(df):
     return status
 
 
+
+# -----------------------------------------------------------------------------
+# Long-horizon research archive + learned reversal calibration
+# -----------------------------------------------------------------------------
+MARKET_TAPE_LOCAL_PATH = Path(os.environ.get("KALSHI_TAPE_PATH", "data/btc_market_tape.csv"))
+MARKET_TAPE_GITHUB_PATH = os.environ.get("MARKET_TAPE_GITHUB_PATH", "data/btc_market_tape.csv")
+REVERSAL_LOCAL_PATH = Path(os.environ.get("KALSHI_REVERSAL_PATH", "data/btc_reversal_learning.csv"))
+REVERSAL_GITHUB_PATH = os.environ.get("REVERSAL_GITHUB_PATH", "data/btc_reversal_learning.csv")
+ARCHIVE_RETENTION_DAYS = int(os.environ.get("KALSHI_ARCHIVE_DAYS", "90"))
+AUX_REMOTE_FLUSH_SEC = int(os.environ.get("KALSHI_ARCHIVE_FLUSH_SEC", "900"))
+
+
+def _aux_remote_csv(path, cache_seconds=90):
+    """Read a CSV from the learning branch without hammering GitHub every live refresh."""
+    if not _learning_token():
+        return pd.DataFrame()
+    key = "_aux_remote::" + str(path).replace("/", "::")
+    ts_key = key + "::ts"
+    now = time.time()
+    cached = st.session_state.get(key)
+    if isinstance(cached, pd.DataFrame) and now - float(st.session_state.get(ts_key, 0) or 0) < cache_seconds:
+        return cached.copy()
+    url = f"https://api.github.com/repos/{_learning_repo()}/contents/{path}"
+    try:
+        r = HTTP.get(url, params={"ref": _learning_branch()}, headers=_github_headers(_learning_token()), timeout=10)
+        if r.status_code == 404:
+            out = pd.DataFrame()
+        else:
+            r.raise_for_status()
+            from io import StringIO
+            raw = base64.b64decode((r.json() or {}).get("content", "")).decode("utf-8")
+            out = pd.read_csv(StringIO(raw)) if raw.strip() else pd.DataFrame()
+        st.session_state[key] = out.copy()
+        st.session_state[ts_key] = now
+        return out
+    except Exception as exc:
+        st.session_state["aux_remote_status"] = f"Archive read failed: {type(exc).__name__}: {exc}"
+        return cached.copy() if isinstance(cached, pd.DataFrame) else pd.DataFrame()
+
+
+def _aux_push_csv(df, path, message):
+    if not _learning_token():
+        return "local only"
+    url = f"https://api.github.com/repos/{_learning_repo()}/contents/{path}"
+    headers = _github_headers(_learning_token())
+    try:
+        g = HTTP.get(url, params={"ref": _learning_branch()}, headers=headers, timeout=10)
+        sha = g.json().get("sha") if g.status_code == 200 else None
+        if g.status_code not in (200, 404):
+            g.raise_for_status()
+        payload = {
+            "message": message,
+            "content": base64.b64encode(df.to_csv(index=False).encode("utf-8")).decode("ascii"),
+            "branch": _learning_branch(),
+        }
+        if sha:
+            payload["sha"] = sha
+        r = requests.put(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        key = "_aux_remote::" + str(path).replace("/", "::")
+        st.session_state[key] = df.copy()
+        st.session_state[key + "::ts"] = time.time()
+        return "GitHub synced"
+    except Exception as exc:
+        return f"GitHub sync failed: {type(exc).__name__}: {exc}"
+
+
+def _atomic_csv(df, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+MARKET_TAPE_COLUMNS = [
+    "recorded_utc", "bucket_5m", "ticker", "remaining_sec", "strike", "reference_price",
+    "coinbase_price", "prob_above", "confidence", "outcome", "market_prob", "flow_prob",
+    "pressure", "bid_balance", "spread", "candle_score", "reversal_score", "reversal_direction",
+    "reversal_status", "reversal_probability", "whale_pressure", "cvd_usd", "cvd_pressure",
+    "venue_agreement", "large_buy_usd", "large_sell_usd", "flow_venues", "brti_venues",
+    "dispersion_bps",
+]
+MARKET_TAPE_TEXT = {"recorded_utc", "bucket_5m", "ticker", "outcome", "reversal_direction", "reversal_status"}
+
+
+def _normalize_market_tape(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame({c: pd.Series(dtype="string" if c in MARKET_TAPE_TEXT else "float64") for c in MARKET_TAPE_COLUMNS})
+    out = df.copy()
+    for c in MARKET_TAPE_COLUMNS:
+        if c not in out.columns:
+            out[c] = "" if c in MARKET_TAPE_TEXT else np.nan
+    out = out[MARKET_TAPE_COLUMNS]
+    for c in MARKET_TAPE_TEXT:
+        out[c] = out[c].fillna("").astype("string")
+    for c in set(MARKET_TAPE_COLUMNS) - MARKET_TAPE_TEXT:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    dt = pd.to_datetime(out["recorded_utc"], utc=True, errors="coerce")
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max(7, ARCHIVE_RETENTION_DAYS))
+    out = out[(dt.isna()) | (dt >= cutoff)]
+    return out.drop_duplicates(["ticker", "bucket_5m"], keep="last").sort_values("recorded_utc").tail(22000).reset_index(drop=True)
+
+
+def load_market_tape():
+    frames = []
+    try:
+        if MARKET_TAPE_LOCAL_PATH.exists(): frames.append(pd.read_csv(MARKET_TAPE_LOCAL_PATH))
+    except Exception: pass
+    remote = _aux_remote_csv(_secret("MARKET_TAPE_GITHUB_PATH", MARKET_TAPE_GITHUB_PATH) or MARKET_TAPE_GITHUB_PATH)
+    if len(remote): frames.append(remote)
+    return _normalize_market_tape(pd.concat(frames, ignore_index=True) if frames else None)
+
+
+def _save_market_tape(df, force_remote=False):
+    df = _normalize_market_tape(df)
+    try: _atomic_csv(df, MARKET_TAPE_LOCAL_PATH)
+    except Exception as exc: st.session_state["market_tape_status"] = f"local save failed: {exc}"
+    last = float(st.session_state.get("market_tape_remote_push", 0) or 0)
+    if _learning_token() and (force_remote or time.time()-last >= AUX_REMOTE_FLUSH_SEC):
+        path = _secret("MARKET_TAPE_GITHUB_PATH", MARKET_TAPE_GITHUB_PATH) or MARKET_TAPE_GITHUB_PATH
+        st.session_state["market_tape_status"] = _aux_push_csv(df, path, "Update BTC/Kalshi 90-day research tape")
+        if "failed" not in str(st.session_state["market_tape_status"]).lower():
+            st.session_state["market_tape_remote_push"] = time.time()
+    return df
+
+
+def record_market_tape(df, ticker, engine, candle_engine, reversal, flow):
+    if not ticker or ticker == "none": return _normalize_market_tape(df), False
+    now = pd.Timestamp.now(tz="UTC")
+    bucket = now.floor("5min").isoformat()
+    out = _normalize_market_tape(df)
+    if ((out["ticker"] == str(ticker)) & (out["bucket_5m"] == bucket)).any(): return out, False
+    row = {
+        "recorded_utc": now.isoformat(), "bucket_5m": bucket, "ticker": str(ticker),
+        "remaining_sec": engine.get("remaining_sec"), "strike": engine.get("target"),
+        "reference_price": engine.get("reference_price"), "coinbase_price": engine.get("coinbase_price"),
+        "prob_above": engine.get("prob_above"), "confidence": engine.get("confidence"), "outcome": engine.get("outcome", ""),
+        "market_prob": engine.get("market_prob"), "flow_prob": engine.get("flow_prob"), "pressure": engine.get("pressure"),
+        "bid_balance": engine.get("bid_balance"), "spread": engine.get("spread"),
+        "candle_score": (candle_engine or {}).get("outcome_score"), "reversal_score": reversal.get("score"),
+        "reversal_direction": reversal.get("candidate_direction", reversal.get("direction", "NONE")),
+        "reversal_status": reversal.get("status", ""), "reversal_probability": reversal.get("model_probability"),
+        "whale_pressure": flow.get("whale_pressure"), "cvd_usd": flow.get("cvd_usd"), "cvd_pressure": flow.get("pressure"),
+        "venue_agreement": flow.get("venue_agreement"), "large_buy_usd": flow.get("large_buy_usd"),
+        "large_sell_usd": flow.get("large_sell_usd"), "flow_venues": flow.get("venue_count"),
+        "brti_venues": (engine.get("brti_proxy") or {}).get("count"),
+        "dispersion_bps": (engine.get("brti_proxy") or {}).get("dispersion_bps"),
+    }
+    out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+    return _save_market_tape(out), True
+
+
+REVERSAL_COLUMNS = [
+    "recorded_utc", "bucket_2m", "ticker", "direction", "trend", "score", "confirmation_strength",
+    "confirmed", "price", "sigma1", "threshold_5m", "historical_prob", "r1", "r2", "r5", "r15",
+    "stretch_z", "candle_1m", "candle_5m", "whale_pressure", "cvd_pressure", "venue_agreement",
+    "large_buy_usd", "large_sell_usd", "confirmations", "move_1m", "move_3m", "move_5m", "move_10m",
+    "reversed_1m", "reversed_3m", "reversed_5m", "reversed_10m", "labeled_utc",
+]
+REVERSAL_TEXT = {"recorded_utc", "bucket_2m", "ticker", "direction", "trend", "labeled_utc"}
+
+
+def _normalize_reversal_history(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame({c: pd.Series(dtype="string" if c in REVERSAL_TEXT else "float64") for c in REVERSAL_COLUMNS})
+    out = df.copy()
+    for c in REVERSAL_COLUMNS:
+        if c not in out.columns: out[c] = "" if c in REVERSAL_TEXT else np.nan
+    out = out[REVERSAL_COLUMNS]
+    for c in REVERSAL_TEXT: out[c] = out[c].fillna("").astype("string")
+    for c in set(REVERSAL_COLUMNS)-REVERSAL_TEXT: out[c] = pd.to_numeric(out[c], errors="coerce")
+    dt = pd.to_datetime(out["recorded_utc"], utc=True, errors="coerce")
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max(7, ARCHIVE_RETENTION_DAYS))
+    out = out[(dt.isna()) | (dt >= cutoff)]
+    return out.drop_duplicates(["ticker", "bucket_2m"], keep="last").sort_values("recorded_utc").tail(50000).reset_index(drop=True)
+
+
+def load_reversal_history():
+    frames=[]
+    try:
+        if REVERSAL_LOCAL_PATH.exists(): frames.append(pd.read_csv(REVERSAL_LOCAL_PATH))
+    except Exception: pass
+    path = _secret("REVERSAL_GITHUB_PATH", REVERSAL_GITHUB_PATH) or REVERSAL_GITHUB_PATH
+    remote = _aux_remote_csv(path)
+    if len(remote): frames.append(remote)
+    return _normalize_reversal_history(pd.concat(frames, ignore_index=True) if frames else None)
+
+
+def _save_reversal_history(df, force_remote=False):
+    df = _normalize_reversal_history(df)
+    try: _atomic_csv(df, REVERSAL_LOCAL_PATH)
+    except Exception as exc: st.session_state["reversal_store_status"] = f"local save failed: {exc}"
+    last=float(st.session_state.get("reversal_remote_push",0) or 0)
+    if _learning_token() and (force_remote or time.time()-last >= AUX_REMOTE_FLUSH_SEC):
+        path = _secret("REVERSAL_GITHUB_PATH", REVERSAL_GITHUB_PATH) or REVERSAL_GITHUB_PATH
+        st.session_state["reversal_store_status"] = _aux_push_csv(df, path, "Update BTC reversal learning history")
+        if "failed" not in str(st.session_state["reversal_store_status"]).lower(): st.session_state["reversal_remote_push"] = time.time()
+    return df
+
+
+def refresh_reversal_labels(df, price_history, max_rows=240):
+    out = _normalize_reversal_history(df)
+    if out.empty or price_history is None or len(price_history) < 20: return out, 0
+    h = price_history[["time","close"]].copy()
+    h["time"] = pd.to_datetime(h["time"], utc=True, errors="coerce")
+    h["close"] = pd.to_numeric(h["close"], errors="coerce")
+    h = h.dropna().sort_values("time")
+    if h.empty: return out, 0
+    updated=0
+    unresolved = out[out["reversed_10m"].isna()].tail(max_rows)
+    for idx,row in unresolved.iterrows():
+        t0 = pd.to_datetime(row.get("recorded_utc"), utc=True, errors="coerce")
+        px = float(row.get("price")) if pd.notna(row.get("price")) else np.nan
+        direction = str(row.get("direction", ""))
+        if pd.isna(t0) or not np.isfinite(px) or px<=0 or direction not in ("UP","DOWN"): continue
+        sign = 1.0 if direction=="UP" else -1.0
+        base_thr = float(row.get("threshold_5m")) if pd.notna(row.get("threshold_5m")) else .0005
+        any_label=False
+        for minutes in (1,3,5,10):
+            col=f"reversed_{minutes}m"
+            if pd.notna(out.at[idx,col]): continue
+            target=t0+pd.Timedelta(minutes=minutes)
+            cand=h[h["time"]>=target].head(1)
+            if cand.empty or (cand.iloc[0]["time"]-target).total_seconds()>90: continue
+            move=float(cand.iloc[0]["close"])/px-1.0
+            thr=float(np.clip(base_thr*np.sqrt(minutes/5.0), .00018, .0030))
+            out.at[idx,f"move_{minutes}m"]=move
+            out.at[idx,col]=1.0 if sign*move>=thr else 0.0
+            any_label=True
+        if any_label:
+            out.at[idx,"labeled_utc"]=pd.Timestamp.now(tz="UTC").isoformat()
+            updated += 1
+    if updated: out=_save_reversal_history(out)
+    return _normalize_reversal_history(out), updated
+
+
+def _reversal_baseline_probability(row):
+    score=float(np.clip(float(row.get("score",0) or 0),0,100))
+    score_p=_logistic((score-52.0)/13.0)
+    hp=row.get("historical_prob")
+    try: hp=float(hp)
+    except Exception: hp=np.nan
+    if np.isfinite(hp): score_p=.58*score_p+.42*float(np.clip(hp,.03,.97))
+    if float(row.get("confirmed",0) or 0)>=.5: score_p=max(score_p,.68)
+    return float(np.clip(score_p,.03,.97))
+
+
+def _reversal_feature_vector(row):
+    direction = 1.0 if str(row.get("direction",""))=="UP" else -1.0
+    def num(k,d=0.0):
+        try:
+            x=float(row.get(k,d)); return x if np.isfinite(x) else d
+        except Exception: return d
+    return np.array([
+        num("score")/100.0, num("confirmation_strength")/100.0,
+        direction*num("r1"), direction*num("r2"), direction*num("r5"), direction*num("r15"),
+        direction*num("candle_1m")/100.0, direction*num("candle_5m")/100.0,
+        direction*num("whale_pressure"), direction*num("cvd_pressure"), num("venue_agreement"),
+        min(np.log1p(num("large_buy_usd")+num("large_sell_usd"))/15.0,1.5),
+        num("historical_prob",.5)-.5, abs(num("stretch_z"))/3.0,
+    ], dtype=float)
+
+
+def train_reversal_learner(history):
+    hist=_normalize_reversal_history(history)
+    r=hist[hist["reversed_5m"].isin([0,1]) & hist["direction"].isin(["UP","DOWN"])].copy()
+    markets=r["ticker"].nunique() if len(r) else 0
+    if len(r)<40 or markets<20 or r["reversed_5m"].nunique()<2:
+        return {"active":False,"status":f"COLLECTING {markets}/20 MARKETS","resolved_rows":len(r),"resolved_markets":markets,"model":None,"brier":None,"base_brier":None,"hit_rate":None,"blend":0.0}
+    r["_t"]=pd.to_datetime(r["recorded_utc"],utc=True,errors="coerce")
+    order=r.groupby("ticker")["_t"].min().sort_values().index.tolist()
+    groups=r["ticker"].astype(str).to_numpy(); y=r["reversed_5m"].to_numpy(float)
+    X=np.vstack([_reversal_feature_vector(row) for _,row in r.iterrows()])
+    base=np.array([_reversal_baseline_probability(row) for _,row in r.iterrows()],float)
+    oof=np.full(len(r),np.nan)
+    start=max(12,int(len(order)*.45)); chunk=max(4,int(len(order)*.14))
+    for st_idx in range(start,len(order),chunk):
+        train_groups=set(order[:st_idx]); test_groups=set(order[st_idx:min(len(order),st_idx+chunk)])
+        train=np.array([g in train_groups for g in groups]); test=np.array([g in test_groups for g in groups])
+        if train.sum()<30 or test.sum()==0 or len(np.unique(y[train]))<2: continue
+        model=_fit_regularized_logit(X[train],y[train],l2=4.5,iterations=500,lr=.065)
+        if model: oof[test]=_predict_regularized_logit(model,X[test])
+    valid=np.isfinite(oof)
+    if valid.sum()<20:
+        return {"active":False,"status":"WAITING FOR WALK-FORWARD VALIDATION","resolved_rows":len(r),"resolved_markets":markets,"model":None,"brier":None,"base_brier":float(np.mean((base-y)**2)),"hit_rate":None,"blend":0.0}
+    bb=float(np.mean((base[valid]-y[valid])**2)); lb=float(np.mean((oof[valid]-y[valid])**2))
+    hit=float(np.mean((oof[valid]>=.5)==(y[valid]>=.5)))
+    improvement=(bb-lb)/max(bb,1e-9)
+    active=bool(lb+.001<bb and improvement>.01)
+    blend=float(np.clip(.25+improvement*2.0, .25, .65)) if active else 0.0
+    model=_fit_regularized_logit(X,y,l2=4.5,iterations=600,lr=.065) if active else None
+    return {"active":active,"status":"ACTIVE" if active else "VALIDATED · NO IMPROVEMENT YET","resolved_rows":len(r),"resolved_markets":markets,"model":model,"brier":lb,"base_brier":bb,"hit_rate":hit,"blend":blend,"improvement":improvement}
+
+
+def get_reversal_learner(history):
+    h=_normalize_reversal_history(history); r=h[h["reversed_5m"].isin([0,1])]
+    sig=(len(r),r["ticker"].nunique() if len(r) else 0,float(r["reversed_5m"].sum()) if len(r) else 0)
+    if st.session_state.get("reversal_model_sig")==sig and "reversal_model_cache" in st.session_state: return st.session_state["reversal_model_cache"]
+    m=train_reversal_learner(h); st.session_state["reversal_model_sig"]=sig; st.session_state["reversal_model_cache"]=m; return m
+
+
+def apply_reversal_learning(rev, learner, history):
+    out=dict(rev or {})
+    direction=str(out.get("candidate_direction",out.get("direction","NONE")))
+    row={**out,"direction":direction}
+    base=_reversal_baseline_probability(row) if direction in ("UP","DOWN") else 0.5
+    raw=None; prob=base
+    if learner and learner.get("active") and learner.get("model") and direction in ("UP","DOWN"):
+        raw=float(_predict_regularized_logit(learner["model"],_reversal_feature_vector(row).reshape(1,-1))[0])
+        b=float(learner.get("blend",0)); prob=(1-b)*base+b*raw
+    # Empirical reliability for similar score band. This is descriptive and strongly shrunk.
+    h=_normalize_reversal_history(history); rr=h[h["reversed_5m"].isin([0,1])]
+    empirical=None; sample_n=0
+    if len(rr):
+        band=rr[(rr["score"]-float(out.get("score",0))).abs()<=10]
+        if len(band)>=12:
+            sample_n=len(band); empirical=float(band["reversed_5m"].mean()); w=min(.25,sample_n/240.0); prob=(1-w)*prob+w*empirical
+    prob=float(np.clip(prob,.03,.97))
+    out.update({"model_probability":prob,"false_reversal_risk":1-prob,"reversal_model_raw":raw,
+                "empirical_success":empirical,"empirical_samples":sample_n,"reversal_model":learner or {}})
+    return out
+
+
+def record_reversal_snapshot(df, ticker, rev, flow):
+    direction=str(rev.get("candidate_direction",rev.get("direction","NONE")))
+    if not ticker or direction not in ("UP","DOWN") or rev.get("trend")=="MIXED": return _normalize_reversal_history(df),False
+    now=pd.Timestamp.now(tz="UTC"); bucket=now.floor("2min").isoformat(); out=_normalize_reversal_history(df)
+    if ((out["ticker"]==str(ticker))&(out["bucket_2m"]==bucket)).any(): return out,False
+    sigma=float(rev.get("sigma1",np.nan)); threshold=float(np.clip(.55*max(sigma,1e-5)*np.sqrt(5),.00025,.0025))
+    row={
+        "recorded_utc":now.isoformat(),"bucket_2m":bucket,"ticker":str(ticker),"direction":direction,"trend":rev.get("trend",""),
+        "score":rev.get("score"),"confirmation_strength":rev.get("confirmation_strength"),"confirmed":1.0 if rev.get("confirmed") else 0.0,
+        "price":rev.get("price"),"sigma1":sigma,"threshold_5m":threshold,"historical_prob":rev.get("historical_prob"),
+        "r1":rev.get("r1"),"r2":rev.get("r2"),"r5":rev.get("r5"),"r15":rev.get("r15"),"stretch_z":rev.get("stretch_z"),
+        "candle_1m":rev.get("candle_1m"),"candle_5m":rev.get("candle_5m"),"whale_pressure":flow.get("whale_pressure"),
+        "cvd_pressure":flow.get("pressure"),"venue_agreement":flow.get("venue_agreement"),"large_buy_usd":flow.get("large_buy_usd"),
+        "large_sell_usd":flow.get("large_sell_usd"),"confirmations":rev.get("confirmations"),"labeled_utc":"",
+    }
+    out=pd.concat([out,pd.DataFrame([row])],ignore_index=True)
+    return _save_reversal_history(out),True
+
+
+def build_outcome_calibration(history):
+    h=_normalize_learning_history(history); r=h[h["result"].isin(["yes","no"]) & h["adaptive_prob_above"].notna()].copy()
+    if len(r)<20: return {"samples":len(r),"ece":None,"bins":{}}
+    r["y"]=(r["result"]=="yes").astype(float); r["p"]=pd.to_numeric(r["adaptive_prob_above"],errors="coerce").clip(.001,.999)
+    r=r.dropna(subset=["p"]); r["bin"]=(r["p"]*10).astype(int).clip(0,9)
+    bins={}; total=max(len(r),1); ece=0.0
+    for (cp,b),g in r.groupby(["checkpoint","bin"]):
+        n=len(g); pred=float(g["p"].mean()); actual=float(g["y"].mean()); bins[(str(cp),int(b))]={"n":n,"pred":pred,"actual":actual}; ece += n/total*abs(pred-actual)
+    return {"samples":len(r),"ece":float(ece),"bins":bins}
+
+
+def apply_outcome_calibration(prob, remaining_sec, calibration):
+    if prob is None or not calibration: return prob,{"active":False,"adjustment_pp":0.0,"n":0,"empirical":None}
+    p=float(np.clip(prob,.005,.995)); cp=_checkpoint_name(remaining_sec); b=int(np.clip(int(p*10),0,9)); info=(calibration.get("bins") or {}).get((cp,b))
+    if not info or info.get("n",0)<20: return p,{"active":False,"adjustment_pp":0.0,"n":info.get("n",0) if info else 0,"empirical":info.get("actual") if info else None}
+    n=int(info["n"]); empirical=float(info["actual"]); pred=float(info["pred"]); w=min(.35,n/180.0)
+    adj=float(np.clip(w*(empirical-pred),-.06,.06)); return float(np.clip(p+adj,.005,.995)),{"active":True,"adjustment_pp":adj*100,"n":n,"empirical":empirical,"bin_pred":pred}
+
+
 def _market_result_payload(ticker):
     """Fetch the official settled YES/NO outcome for one recorded market.
 
@@ -1213,7 +1574,9 @@ def reversal_intelligence(frame, exchange_trades, candle_intel, outcome_history,
         "historical":hist, "whale_pressure":whale_pressure,
         "large_buy_usd":large_buy, "large_sell_usd":large_sell,
         "reasons":reasons[:5], "confirmations":confirms, "trend":trend_name,
-        "stretch_z":float(stretch_z), "r1":float(r1), "r5":float(r5), "r15":float(r15),
+        "stretch_z":float(stretch_z), "price":float(price), "sigma1":float(sigma1),
+        "r1":float(r1), "r2":float(r2), "r5":float(r5), "r15":float(r15),
+        "candle_1m":float(one), "candle_5m":float(five), "candidate_direction":reversal_direction,
         "confirmation_state":confirmation_state, "confirmation_strength":confirmation_strength,
         "confirmation_checks":confirmation_checks, "confirmed":confirmed, "guaranteed":False,
     }
@@ -1935,6 +2298,65 @@ def _render_live_dashboard_inner():
                 pass
         return result
 
+
+    @st.cache_data(ttl=2, show_spinner=False)
+    def recent_multi_exchange_flow():
+        """Sample public BTC trade tapes from several venues and build a CVD/whale-flow proxy."""
+        cutoff=time.time()-180.0
+        def coinbase():
+            r=HTTP.get(f"{COINBASE}/products/BTC-USD/trades",headers=HEADERS,timeout=7); r.raise_for_status(); out=[]
+            for t in r.json() if isinstance(r.json(),list) else []:
+                try:
+                    ts=pd.to_datetime(t.get("time"),utc=True).timestamp(); usd=float(t["size"])*float(t["price"]); maker=str(t.get("side","")).lower(); side="buy" if maker=="sell" else "sell"
+                    if ts>=cutoff and usd>0: out.append(("Coinbase",side,usd,ts))
+                except Exception: pass
+            return out
+        def kraken():
+            r=HTTP.get("https://api.kraken.com/0/public/Trades",params={"pair":"XBTUSD"},timeout=7); r.raise_for_status(); body=r.json(); out=[]
+            vals=[v for k,v in (body.get("result") or {}).items() if k!="last"]
+            for t in (vals[0] if vals else []):
+                try:
+                    ts=float(t[2]); usd=float(t[0])*float(t[1]); side="buy" if str(t[3]).lower().startswith("b") else "sell"
+                    if ts>=cutoff and usd>0: out.append(("Kraken",side,usd,ts))
+                except Exception: pass
+            return out
+        def bitstamp():
+            r=HTTP.get("https://www.bitstamp.net/api/v2/transactions/btcusd/",params={"time":"minute"},timeout=7); r.raise_for_status(); out=[]
+            for t in r.json() if isinstance(r.json(),list) else []:
+                try:
+                    ts=float(t.get("date")); usd=float(t.get("price"))*float(t.get("amount")); side="buy" if str(t.get("type"))=="0" else "sell"
+                    if ts>=cutoff and usd>0: out.append(("Bitstamp",side,usd,ts))
+                except Exception: pass
+            return out
+        def gemini():
+            r=HTTP.get("https://api.gemini.com/v1/trades/btcusd",params={"limit_trades":200},timeout=7); r.raise_for_status(); out=[]
+            for t in r.json() if isinstance(r.json(),list) else []:
+                try:
+                    ts=float(t.get("timestampms",0))/1000.0 if t.get("timestampms") else float(t.get("timestamp",0)); usd=float(t.get("price"))*float(t.get("amount")); side=str(t.get("type","")).lower()
+                    if ts>=cutoff and usd>0 and side in ("buy","sell"): out.append(("Gemini",side,usd,ts))
+                except Exception: pass
+            return out
+        rows=[]; errors=[]
+        funcs={"Coinbase":coinbase,"Kraken":kraken,"Bitstamp":bitstamp,"Gemini":gemini}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures={pool.submit(fn):name for name,fn in funcs.items()}
+            for fut,name in [(f,n) for f,n in futures.items()]:
+                try: rows.extend(fut.result())
+                except Exception as exc: errors.append(f"{name}:{type(exc).__name__}")
+        if not rows:
+            return {"trades":[],"legacy_trades":[],"pressure":None,"cvd_usd":0.0,"whale_pressure":None,"large_buy_usd":0.0,"large_sell_usd":0.0,"venue_agreement":0.0,"venue_count":0,"errors":errors}
+        buy=sum(x[2] for x in rows if x[1]=="buy"); sell=sum(x[2] for x in rows if x[1]=="sell"); total=buy+sell; pressure=(buy-sell)/total if total else 0.0
+        lb=sum(x[2] for x in rows if x[1]=="buy" and x[2]>=100000); ls=sum(x[2] for x in rows if x[1]=="sell" and x[2]>=100000); lt=lb+ls
+        whale=(lb-ls)/lt if lt else pressure
+        vp={}
+        for venue in {x[0] for x in rows}:
+            b=sum(x[2] for x in rows if x[0]==venue and x[1]=="buy"); ss=sum(x[2] for x in rows if x[0]==venue and x[1]=="sell"); vp[venue]=(b-ss)/(b+ss) if b+ss else 0.0
+        sign=1 if pressure>.04 else -1 if pressure<-.04 else 0
+        active=[v for v in vp.values() if abs(v)>.04]
+        agree=(sum(1 for v in active if (1 if v>0 else -1)==sign)/len(active)) if active and sign else 0.0
+        legacy=[(side,usd) for _,side,usd,_ in rows]
+        return {"trades":rows,"legacy_trades":legacy,"pressure":float(pressure),"cvd_usd":float(buy-sell),"whale_pressure":float(whale),"large_buy_usd":float(lb),"large_sell_usd":float(ls),"venue_agreement":float(agree),"venue_count":len(vp),"venue_pressure":vp,"errors":errors}
+
     @st.cache_data(ttl=15, show_spinner=False)
     def blockchain_activity():
         # Unconfirmed transactions are NOT attributed to whales or exchanges.
@@ -1943,7 +2365,7 @@ def _render_live_dashboard_inner():
         data = r.json()
         return int(data.get("count", 0)), int(data.get("vsize", 0))
 
-    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples, adaptive_learner):
+    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples, adaptive_learner, flow_info=None, outcome_calibration=None):
         closes = frame["close"].astype(float)
         if len(closes) < 40:
             return {"outcome": "UNCERTAIN", "scalp": "WAIT", "reason": "Insufficient BTC history", "momentum": 0.0,
@@ -1961,7 +2383,9 @@ def _render_live_dashboard_inner():
         momentum = (r5 + 0.5 * r15) / max(vol * np.sqrt(15), 0.00001)
 
         pressure = None
-        if exchange_trades:
+        if isinstance(flow_info, dict) and flow_info.get("pressure") is not None:
+            pressure = float(flow_info.get("pressure"))
+        elif exchange_trades:
             total = sum(v for _, v in exchange_trades)
             pressure = sum((1 if side == "buy" else -1) * v for side, v in exchange_trades) / total if total else None
 
@@ -2039,6 +2463,7 @@ def _render_live_dashboard_inner():
             disagreement = None
             base_prob_above = None
             learning_adjustment = {"active": False, "raw_prob": None, "adjustment_pp": 0.0, "blend": 0.0}
+            calibration_adjustment = {"active": False, "adjustment_pp": 0.0, "n": 0, "empirical": None}
         else:
             total_w = sum(v["weight"] for v in components.values())
             if total_w <= 0:
@@ -2067,6 +2492,7 @@ def _render_live_dashboard_inner():
                 "disagreement": disagreement,
             }
             prob_above, learning_adjustment = apply_adaptive_learner(base_prob_above, _learn_features, adaptive_learner)
+            prob_above, calibration_adjustment = apply_outcome_calibration(prob_above, remaining_sec, outcome_calibration)
 
             separation = float(abs(prob_above-.5)*2.0)
             agreement = float(np.clip(1.0 - disagreement/.22, 0.0, 1.0))
@@ -2092,6 +2518,8 @@ def _render_live_dashboard_inner():
                 confidence = min(confidence, 58.0)
             if analog and analog.get("se", 0) > .07:
                 confidence = min(confidence, 65.0)
+            if outcome_calibration and outcome_calibration.get("ece") is not None and outcome_calibration.get("ece") > .12:
+                confidence = min(confidence, 68.0)
 
             confidence_label = "VERY HIGH" if confidence >= 82 else "HIGH" if confidence >= 68 else "MEDIUM" if confidence >= 52 else "LOW"
             # Conservative call gate: better to show UNCERTAIN than manufacture certainty.
@@ -2140,13 +2568,20 @@ def _render_live_dashboard_inner():
             "flow_prob": flow_p, "final_minute": final_min, "model_edge": model_edge,
             "brti_proxy": brti_proxy, "base_prob_above": base_prob_above,
             "learning_adjustment": learning_adjustment, "learning_model": adaptive_learner,
+            "probability_calibration": calibration_adjustment, "calibration_report": outcome_calibration or {},
+            "flow_info": flow_info or {},
         }
 
     try:
-        whale_trades = recent_exchange_trades()
-        whale_error = None
-    except (requests.RequestException, ValueError) as exc:
-        whale_trades, whale_error = [], str(exc)
+        flow_info = recent_multi_exchange_flow()
+        whale_trades = flow_info.get("legacy_trades", [])
+        whale_error = None if whale_trades else "; ".join(flow_info.get("errors", [])) or "No recent multi-exchange trades"
+    except Exception as exc:
+        flow_info = {}
+        try:
+            whale_trades = recent_exchange_trades(); whale_error = f"Multi-exchange flow fallback: {exc}"
+        except Exception as fallback_exc:
+            whale_trades, whale_error = [], str(fallback_exc)
     try:
         chain_count, chain_vsize = blockchain_activity()
         chain_error = None
@@ -2163,6 +2598,12 @@ def _render_live_dashboard_inner():
     except Exception:
         outcome_history = pd.DataFrame()
 
+    outcome_calibration = build_outcome_calibration(learning_history)
+    reversal_history = load_reversal_history()
+    reversal_history, _reversal_labels_added = refresh_reversal_labels(reversal_history, outcome_history)
+    reversal_model = get_reversal_learner(reversal_history)
+    market_tape = load_market_tape()
+
     proxy_samples = []
     proxy_value = brti_proxy.get("price") if isinstance(brti_proxy, dict) else None
     if proxy_value is not None and np.isfinite(proxy_value):
@@ -2178,9 +2619,34 @@ def _render_live_dashboard_inner():
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
-                              outcome_history, brti_proxy, proxy_samples, learning_model)
+                              outcome_history, brti_proxy, proxy_samples, learning_model, flow_info, outcome_calibration)
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
+    # Enrich the reversal signal with multi-exchange CVD/whale agreement before the learned layer.
+    reversal["candidate_direction"] = reversal.get("candidate_direction", reversal.get("direction", "NONE"))
+    if reversal.get("candidate_direction") in ("UP", "DOWN") and flow_info:
+        ds = 1.0 if reversal["candidate_direction"] == "UP" else -1.0
+        cvd_align = ds * float(flow_info.get("pressure", 0.0) or 0.0)
+        whale_align = ds * float(flow_info.get("whale_pressure", 0.0) or 0.0)
+        agreement = float(flow_info.get("venue_agreement", 0.0) or 0.0)
+        if whale_align >= .16 and agreement >= .5:
+            reversal["score"] = float(np.clip(float(reversal.get("score",0))+min(10,4+10*whale_align),0,100))
+            reversal.setdefault("reasons", []).append(f"multi-exchange whale flow agrees across {int(flow_info.get('venue_count',0))} venues")
+            reversal["confirmation_strength"] = float(np.clip(float(reversal.get("confirmation_strength",0))+10,0,100))
+            checks=list(reversal.get("confirmation_checks",[])); checks.append("multi-exchange CVD/whales agree"); reversal["confirmation_checks"]=checks
+        elif cvd_align <= -.22 and agreement >= .5:
+            reversal["score"] = float(np.clip(float(reversal.get("score",0))-7,0,100))
+            reversal.setdefault("reasons", []).append("multi-exchange CVD still opposes the reversal")
+        reversal["whale_pressure"] = flow_info.get("whale_pressure")
+        reversal["large_buy_usd"] = flow_info.get("large_buy_usd",0.0)
+        reversal["large_sell_usd"] = flow_info.get("large_sell_usd",0.0)
+        reversal["cvd_pressure"] = flow_info.get("pressure")
+        reversal["cvd_usd"] = flow_info.get("cvd_usd")
+        reversal["venue_agreement"] = agreement
+        reversal["flow_venues"] = flow_info.get("venue_count",0)
+    reversal = apply_reversal_learning(reversal, reversal_model, reversal_history)
     engine["reversal"] = reversal
+    reversal_history, _reversal_recorded = record_reversal_snapshot(reversal_history, active_ticker, reversal, flow_info or {})
+    market_tape, _tape_recorded = record_market_tape(market_tape, active_ticker, engine, candle_engine, reversal, flow_info or {})
     # A strong reversal warning acts as a scalp safety brake: do not keep telling the
     # user to chase a direction that multiple independent reversal clues oppose.
     if reversal.get("score", 0) >= 60:
@@ -2522,7 +2988,9 @@ def _render_live_dashboard_inner():
             rev_whale_text = "whales balanced"
         rev_confirm = str(rev.get("confirmation_state", "NOT CONFIRMED"))
         rev_confirm_strength = float(rev.get("confirmation_strength", 0.0) or 0.0)
-        rev_sub = f"{rev_confirm} · confirm {rev_confirm_strength:.0f}/100 · {rev_whale_text}"
+        rev_prob = rev.get("model_probability")
+        rev_prob_text = f"P(rev) {float(rev_prob)*100:.0f}%" if rev_prob is not None else "P(rev) learning"
+        rev_sub = f"{rev_confirm} · {rev_prob_text} · {rev_whale_text}"
         rev_color = "#36d7a4" if rev.get("direction") == "UP" else "#ff6c78" if rev.get("direction") == "DOWN" else "#ffcf77"
 
         intel = {
@@ -2604,11 +3072,17 @@ def _render_live_dashboard_inner():
                 f"Confirmation: {rev.get('confirmation_state','NOT CONFIRMED')} · "
                 f"strength {rev.get('confirmation_strength',0):.0f}/100 · guaranteed: NO"
             )
+            if rev.get("model_probability") is not None:
+                rm = rev.get("reversal_model") or {}
+                emp = rev.get("empirical_success")
+                emp_text = f" · similar scored signals succeeded {emp*100:.1f}% (n={rev.get('empirical_samples',0)})" if emp is not None else ""
+                st.caption(f"Learned 5m reversal probability {rev['model_probability']*100:.1f}% · false-reversal risk {rev.get('false_reversal_risk',0)*100:.1f}%{emp_text}")
+                st.caption(f"Reversal learner: {rm.get('status','COLLECTING')} · {rm.get('resolved_markets',0)} markets / {rm.get('resolved_rows',0)} labeled signals" + (f" · walk-forward Brier {rm.get('base_brier'):.3f} → {rm.get('brier'):.3f}" if rm.get('brier') is not None else ""))
             if rev.get("historical_prob") is not None:
                 hist = rev.get("historical") or {}
                 st.caption(f"Similar historical states reversed {rev['historical_prob']*100:.1f}% over ~{hist.get('horizon_min',5)}m · effective sample ≈ {hist.get('effective_n',0):.0f}")
             if rev.get("whale_pressure") is not None:
-                st.caption(f"Large-trade pressure {rev['whale_pressure']:+.2f} · ≥$100k buys ${rev.get('large_buy_usd',0)/1e6:.2f}M · sells ${rev.get('large_sell_usd',0)/1e6:.2f}M")
+                st.caption(f"Multi-exchange whale pressure {rev['whale_pressure']:+.2f} · CVD pressure {float(rev.get('cvd_pressure',0) or 0):+.2f} · venue agreement {float(rev.get('venue_agreement',0) or 0)*100:.0f}% · ≥$100k buys ${rev.get('large_buy_usd',0)/1e6:.2f}M · sells ${rev.get('large_sell_usd',0)/1e6:.2f}M")
             for why in rev.get("reasons", [])[:4]:
                 st.caption(f"• {why}")
             checks = rev.get("confirmation_checks", [])
@@ -2672,7 +3146,9 @@ def _render_live_dashboard_inner():
             else:
                 large = [(side, usd) for side, usd in whale_trades if usd >= 100000]
                 pressure_text = f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"
-                st.caption(f"Coinbase trades sampled: {len(whale_trades)} · ≥$100k: {len(large)} · Aggressive pressure: {pressure_text}")
+                st.caption(f"Multi-exchange trades sampled: {len(whale_trades)} across {int((flow_info or {}).get('venue_count',0))} venues · ≥$100k: {len(large)} · Aggressive pressure: {pressure_text}")
+                if flow_info:
+                    st.caption(f"CVD proxy ${(flow_info.get('cvd_usd',0) or 0)/1e6:+.2f}M · whale pressure {float(flow_info.get('whale_pressure',0) or 0):+.2f} · venue agreement {float(flow_info.get('venue_agreement',0) or 0)*100:.0f}%")
             if chain_error:
                 st.caption(f"Blockchain activity unavailable: {chain_error}")
             else:
@@ -2696,6 +3172,10 @@ def _render_live_dashboard_inner():
             )
             if lm.get("hit_rate") is not None:
                 st.caption(f"Held-out direction hit rate: {lm['hit_rate']*100:.1f}% · blend weight {lm.get('blend_weight',0)*100:.0f}% when active.")
+            cal = engine.get("calibration_report") or {}
+            ca = engine.get("probability_calibration") or {}
+            if cal.get("ece") is not None:
+                st.caption(f"Probability calibration: {cal.get('samples',0)} resolved snapshots · ECE {cal['ece']*100:.1f}pp · current bucket adjustment {ca.get('adjustment_pp',0):+.1f}pp (n={ca.get('n',0)}).")
             st.caption(
                 "The learner only changes the live probability after at least 20 independent settled markets AND grouped held-out Brier score improves. "
                 "That prevents a few lucky trades from making the bot overconfident."
@@ -2731,6 +3211,10 @@ def _render_live_dashboard_inner():
                 )
             else:
                 st.caption("Persistence: local runtime + CSV export. Streamlit may reset local files on a redeploy; add a LEARNING_GITHUB_TOKEN secret for automatic GitHub-backed history.")
+
+            st.markdown("**90-day research archive**")
+            st.caption(f"Market tape: {len(market_tape):,} five-minute snapshots · reversal journal: {len(reversal_history):,} signals · retention {ARCHIVE_RETENTION_DAYS} days.")
+            st.caption(f"Tape persistence: {st.session_state.get('market_tape_status','local cache')} · reversal persistence: {st.session_state.get('reversal_store_status','local cache')}. GitHub writes are batched to avoid a commit every live refresh.")
 
             st.markdown("**Paper signal tracker**")
             if "paper_signals" not in st.session_state:
