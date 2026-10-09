@@ -147,8 +147,16 @@ def _learning_path():
     return _secret("LEARNING_GITHUB_PATH", LEARNING_GITHUB_PATH) or LEARNING_GITHUB_PATH
 
 
+LEARNING_TEXT_COLUMNS = (
+    "recorded_utc", "ticker", "checkpoint", "outcome_call", "result", "settled_utc",
+)
+
+
 def _empty_learning_history():
-    return pd.DataFrame(columns=LEARNING_COLUMNS)
+    return pd.DataFrame({
+        col: pd.Series(dtype="string" if col in LEARNING_TEXT_COLUMNS else "float64")
+        for col in LEARNING_COLUMNS
+    })
 
 
 def _normalize_learning_history(df):
@@ -166,9 +174,12 @@ def _normalize_learning_history(df):
         "venue_count", "dispersion_bps", "disagreement", "settlement_value",
     ]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
-    out["ticker"] = out["ticker"].fillna("").astype(str)
-    out["checkpoint"] = out["checkpoint"].fillna("").astype(str)
-    out["result"] = out["result"].fillna("").astype(str).str.lower()
+    # CSV readers infer all-blank text columns (especially settled_utc) as
+    # float64. Restore their types before assigning ISO timestamps or labels.
+    # Keep timestamps as ISO strings to match the existing CSV/API format.
+    for col in LEARNING_TEXT_COLUMNS:
+        out[col] = out[col].fillna("").astype("string")
+    out["result"] = out["result"].str.lower()
     out = out.drop_duplicates(subset=["ticker", "checkpoint"], keep="last")
     return out.sort_values(["recorded_utc", "ticker"], na_position="last").reset_index(drop=True)
 
