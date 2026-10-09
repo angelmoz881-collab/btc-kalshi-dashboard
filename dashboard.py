@@ -433,7 +433,21 @@ if selected_page == "📈 LIVE CHART":
                   .reset_index())
     # Keep history available for panning; the initial view is set in JS.
     view = source.tail(300).copy()
-    view["epoch"] = (view["time"].astype("int64") // 1_000_000_000).astype("int64")
+
+    # Convert timestamps to real UNIX *seconds* in a way that does not depend on
+    # pandas' internal datetime resolution (ns/us/ms/s). Newer pandas builds can
+    # preserve a non-nanosecond dtype, so dividing astype("int64") by 1e9 can
+    # collapse many candles onto the same timestamp and make the chart appear empty.
+    def _unix_seconds(value):
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.timestamp())
+
+    view["epoch"] = view["time"].map(_unix_seconds).astype("int64")
+    view = view.sort_values("epoch").drop_duplicates("epoch", keep="last")
     bars = [{"time": int(r.epoch), "open": float(r.open), "high": float(r.high),
              "low": float(r.low), "close": float(r.close)} for r in view.itertuples()]
     if not bars:
