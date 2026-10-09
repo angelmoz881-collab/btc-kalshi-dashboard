@@ -400,6 +400,7 @@ with tab1:
                    f"{datetime.fromtimestamp(bars[0]['time'], timezone.utc):%H:%M}–"
                    f"{datetime.fromtimestamp(bars[-1]['time'], timezone.utc):%H:%M}.")
     # A compact, high-contrast contract status card inspired by trading terminals.
+    expiry_raw = None
     if kalshi_data:
         market_info = kalshi_data["market"]
         expiry_raw = market_info.get("close_time") or market_info.get("expiration_time")
@@ -429,11 +430,33 @@ with tab1:
         mood, mood_color = "DOWNWARD MOMENTUM", "#ff6c78"
     else:
         mood, mood_color = "NO CLEAR EDGE", "#ffcf77"
+    # Client-side timer ticks every second without Streamlit rerunning or resetting the chart.
+    # A separate server refresh is still required to roll over to a new Kalshi contract.
+    timer_expiry = None
+    if expiry_raw:
+        try:
+            timer_expiry = pd.to_datetime(expiry_raw, utc=True).isoformat()
+        except (ValueError, TypeError, OverflowError):
+            pass
+    timer_html = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>html,body{margin:0;background:transparent;color:#f4f6fb;font-family:system-ui,sans-serif}
+    .timer{box-sizing:border-box;padding:11px 15px;border:1px solid #793141;border-radius:12px;background:#210f18;display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .label{font-size:11px;font-weight:800;letter-spacing:.13em;color:#efa3b0}.value{font-size:26px;font-weight:850;font-variant-numeric:tabular-nums;color:#fff;letter-spacing:.035em}
+    .expired{color:#ff7183}.hint{font-size:10px;color:#aa8892}</style></head><body>
+    <div class="timer"><div><div class="label">KALSHI CONTRACT · TIME LEFT</div><div class="hint" id="hint">Countdown updates every second</div></div><div class="value" id="count">--:--</div></div>
+    <script>const expiry=__EXPIRY__;const el=document.getElementById('count');
+    function tick(){if(!expiry){el.textContent='--:--';document.getElementById('hint').textContent='Expiry unavailable';return;}
+    const ms=Date.parse(expiry)-Date.now();if(!Number.isFinite(ms)){el.textContent='--:--';return;}
+    if(ms<=0){el.textContent='EXPIRED';el.classList.add('expired');document.getElementById('hint').textContent='Refresh dashboard for next contract';return;}
+    const sec=Math.ceil(ms/1000);const hh=Math.floor(sec/3600);const mm=Math.floor((sec%3600)/60);const ss=sec%60;
+    el.textContent=(hh?String(hh).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0');}
+    tick();setInterval(tick,1000);</script></body></html>""".replace('__EXPIRY__', json.dumps(timer_expiry))
+    components.html(timer_html, height=78, scrolling=False)
     st.markdown(f"""<div class="position-panel">
       <div class="position-eyebrow">● LIVE POSITION INTEL · INDICATORS ONLY</div>
       <div class="position-mood" style="color:{mood_color}">{html.escape(mood)}</div>
       <div class="position-grid">
-        <div><small>15M TIME LEFT</small><strong>{clock}</strong></div>
+        <div><small>CONTRACT TIMER</small><strong>LIVE ABOVE ↑</strong></div>
         <div><small>BTC PRICE</small><strong>${price:,.2f}</strong></div>
         <div><small>CONTRACT TARGET*</small><strong>{target_text}</strong></div>
         <div><small>PRICE VS TARGET</small><strong>{distance_text}</strong></div>
