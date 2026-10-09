@@ -8,6 +8,9 @@ import numpy as np
 import streamlit as st
 import json
 import html
+import os
+import base64
+from pathlib import Path
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="BTC × Kalshi | Live Terminal", page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
@@ -83,6 +86,449 @@ st.markdown("""<div class="hero"><div class="eyebrow">HYPER-STYLE TERMINAL · BT
 COINBASE = "https://api.exchange.coinbase.com"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 HEADERS = {"User-Agent": "BTC-Kalshi-Scalp-Desk/1.0", "Accept": "application/json"}
+
+
+# -----------------------------------------------------------------------------
+# Adaptive outcome learning
+# -----------------------------------------------------------------------------
+# The live model can learn from its OWN earlier snapshots after Kalshi settles the
+# corresponding market. This is deliberately a conservative calibration layer:
+# it is not allowed to replace the core strike/volatility/BRTI-aware model until
+# enough independent resolved markets exist and walk-forward tests show an actual
+# Brier-score improvement.
+LEARNING_COLUMNS = [
+    "recorded_utc", "ticker", "checkpoint", "remaining_sec", "strike",
+    "reference_price", "base_prob_above", "adaptive_prob_above",
+    "stat_prob", "analog_prob", "market_prob", "flow_prob", "final60_prob",
+    "momentum", "pressure", "bid_balance", "spread", "candle_outcome_score",
+    "z_distance", "sigma_1m", "venue_count", "dispersion_bps", "disagreement",
+    "outcome_call", "result", "settled_utc", "settlement_value",
+]
+LEARNING_LOCAL_PATH = Path(os.environ.get("KALSHI_LEARNING_PATH", "data/btc_kalshi_learning.csv"))
+LEARNING_GITHUB_PATH = os.environ.get("LEARNING_GITHUB_PATH", "data/btc_kalshi_learning.csv")
+LEARNING_GITHUB_REPO = os.environ.get("LEARNING_GITHUB_REPO", "angelmoz881-collab/btc-kalshi-dashboard")
+LEARNING_GITHUB_BRANCH = os.environ.get("LEARNING_GITHUB_BRANCH", "main")
+
+
+def _secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def _learning_token():
+    return _secret("LEARNING_GITHUB_TOKEN") or os.environ.get("LEARNING_GITHUB_TOKEN")
+
+
+def _empty_learning_history():
+    return pd.DataFrame(columns=LEARNING_COLUMNS)
+
+
+def _normalize_learning_history(df):
+    if df is None or len(df) == 0:
+        return _empty_learning_history()
+    out = df.copy()
+    for col in LEARNING_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan if col not in ("recorded_utc", "ticker", "checkpoint", "outcome_call", "result", "settled_utc") else ""
+    out = out[LEARNING_COLUMNS]
+    for col in [
+        "remaining_sec", "strike", "reference_price", "base_prob_above", "adaptive_prob_above",
+        "stat_prob", "analog_prob", "market_prob", "flow_prob", "final60_prob", "momentum",
+        "pressure", "bid_balance", "spread", "candle_outcome_score", "z_distance", "sigma_1m",
+        "venue_count", "dispersion_bps", "disagreement", "settlement_value",
+    ]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["ticker"] = out["ticker"].fillna("").astype(str)
+    out["checkpoint"] = out["checkpoint"].fillna("").astype(str)
+    out["result"] = out["result"].fillna("").astype(str).str.lower()
+    out = out.drop_duplicates(subset=["ticker", "checkpoint"], keep="last")
+    return out.sort_values(["recorded_utc", "ticker"], na_position="last").reset_index(drop=True)
+
+
+def _github_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "BTC-Kalshi-Adaptive-Learner/1.0",
+    }
+
+
+def _load_learning_from_github():
+    token = _learning_token()
+    if not token:
+        return None
+    url = f"https://api.github.com/repos/{LEARNING_GITHUB_REPO}/contents/{LEARNING_GITHUB_PATH}"
+    try:
+        r = requests.get(url, params={"ref": LEARNING_GITHUB_BRANCH}, headers=_github_headers(token), timeout=10)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        payload = r.json()
+        raw = base64.b64decode(payload.get("content", "")).decode("utf-8")
+        from io import StringIO
+        return _normalize_learning_history(pd.read_csv(StringIO(raw)))
+    except Exception:
+        return None
+
+
+def load_learning_history():
+    """Load feedback history. Local disk is fastest; optional GitHub is durable.
+
+    Streamlit's local filesystem can be reset by a redeploy. If a
+    LEARNING_GITHUB_TOKEN secret is configured, the same CSV is also read/written
+    through the repository Contents API so the learner survives restarts.
+    """
+    try:
+        if LEARNING_LOCAL_PATH.exists():
+            return _normalize_learning_history(pd.read_csv(LEARNING_LOCAL_PATH))
+    except Exception:
+        pass
+    remote = _load_learning_from_github()
+    if remote is not None:
+        try:
+            LEARNING_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            remote.to_csv(LEARNING_LOCAL_PATH, index=False)
+        except Exception:
+            pass
+        return remote
+    return _empty_learning_history()
+
+
+def _push_learning_to_github(df):
+    token = _learning_token()
+    if not token:
+        return "local only"
+    url = f"https://api.github.com/repos/{LEARNING_GITHUB_REPO}/contents/{LEARNING_GITHUB_PATH}"
+    headers = _github_headers(token)
+    sha = None
+    try:
+        g = requests.get(url, params={"ref": LEARNING_GITHUB_BRANCH}, headers=headers, timeout=10)
+        if g.status_code == 200:
+            sha = g.json().get("sha")
+        elif g.status_code != 404:
+            g.raise_for_status()
+        payload = {
+            "message": "Update BTC Kalshi adaptive learning history",
+            "content": base64.b64encode(df.to_csv(index=False).encode("utf-8")).decode("ascii"),
+            "branch": LEARNING_GITHUB_BRANCH,
+        }
+        if sha:
+            payload["sha"] = sha
+        p = requests.put(url, headers=headers, json=payload, timeout=12)
+        p.raise_for_status()
+        return "GitHub synced"
+    except Exception as exc:
+        return f"GitHub sync failed: {exc}"
+
+
+def save_learning_history(df):
+    df = _normalize_learning_history(df)
+    status = "local only"
+    try:
+        LEARNING_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LEARNING_LOCAL_PATH.with_suffix(".tmp")
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, LEARNING_LOCAL_PATH)
+    except Exception as exc:
+        status = f"local save failed: {exc}"
+    if _learning_token():
+        status = _push_learning_to_github(df)
+    st.session_state["learning_save_status"] = status
+    return status
+
+
+def _market_result_payload(ticker):
+    """Fetch settlement outcome for one previously recorded market."""
+    try:
+        r = requests.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=10)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        m = r.json().get("market", r.json())
+        result = str(m.get("result") or m.get("market_result") or "").lower()
+        if result not in ("yes", "no"):
+            return None
+        value = m.get("expiration_value")
+        if value in (None, ""):
+            value = m.get("settlement_value")
+        if value in (None, ""):
+            value = m.get("settlement_value_dollars")
+        try:
+            value = float(value) if value not in (None, "") else np.nan
+        except Exception:
+            value = np.nan
+        settled = m.get("settlement_ts") or m.get("settled_time") or m.get("settlement_time") or ""
+        return {"result": result, "settled_utc": str(settled), "settlement_value": value}
+    except Exception:
+        return None
+
+
+def refresh_learning_outcomes(df, force=False, max_markets=12):
+    """Fill labels for old snapshots by checking official Kalshi market results."""
+    df = _normalize_learning_history(df)
+    now = time.time()
+    last_check = float(st.session_state.get("learning_last_result_check", 0.0) or 0.0)
+    if not force and now - last_check < 60:
+        return df, 0
+    st.session_state["learning_last_result_check"] = now
+    unresolved = df[~df["result"].isin(["yes", "no"])]
+    tickers = [x for x in unresolved["ticker"].dropna().astype(str).unique() if x and x != "none"]
+    if not tickers:
+        return df, 0
+    updated = 0
+    for ticker in tickers[:max_markets]:
+        info = _market_result_payload(ticker)
+        if not info:
+            continue
+        mask = df["ticker"].eq(ticker) & ~df["result"].isin(["yes", "no"])
+        if mask.any():
+            df.loc[mask, "result"] = info["result"]
+            df.loc[mask, "settled_utc"] = info["settled_utc"]
+            df.loc[mask, "settlement_value"] = info["settlement_value"]
+            updated += int(mask.sum())
+    if updated:
+        save_learning_history(df)
+    return _normalize_learning_history(df), updated
+
+
+def _checkpoint_name(remaining_sec):
+    s = float(remaining_sec)
+    if s > 720: return "15-12m"
+    if s > 540: return "12-9m"
+    if s > 360: return "9-6m"
+    if s > 180: return "6-3m"
+    if s > 60: return "3-1m"
+    return "final-60s"
+
+
+def _prob_logit(p):
+    p = float(np.clip(p, .005, .995))
+    return math.log(p/(1.0-p))
+
+
+ADAPTIVE_FEATURE_NAMES = [
+    "base_logit", "stat_delta", "analog_delta", "market_delta", "flow_delta", "final_delta",
+    "remaining_frac", "z_distance", "momentum", "pressure", "bid_balance", "candle_score",
+    "spread_quality", "disagreement", "venue_quality", "dispersion_quality",
+]
+
+
+def _adaptive_feature_vector(row):
+    def num(name, default=np.nan):
+        try:
+            v = float(row.get(name, default))
+            return v if np.isfinite(v) else default
+        except Exception:
+            return default
+    base = num("base_prob_above", .5)
+    base = float(np.clip(base, .005, .995))
+    def delta(name):
+        v = num(name, np.nan)
+        return float(v-base) if np.isfinite(v) else 0.0
+    remaining = float(np.clip(num("remaining_sec", 450.0)/900.0, 0.0, 1.0))
+    spread = num("spread", np.nan)
+    spread_q = 0.4 if not np.isfinite(spread) else float(np.clip(1.0-spread/12.0, 0.0, 1.0))
+    disp = num("dispersion_bps", np.nan)
+    disp_q = 0.5 if not np.isfinite(disp) else float(np.clip(1.0-disp/30.0, 0.0, 1.0))
+    return np.array([
+        _prob_logit(base), delta("stat_prob"), delta("analog_prob"), delta("market_prob"),
+        delta("flow_prob"), delta("final60_prob"), remaining,
+        float(np.clip(num("z_distance", 0.0), -4, 4)),
+        float(np.clip(num("momentum", 0.0), -4, 4)),
+        float(np.clip(num("pressure", 0.0), -1, 1)),
+        float(np.clip(num("bid_balance", 0.0), -1, 1)),
+        float(np.clip(num("candle_outcome_score", 0.0)/100.0, -1, 1)),
+        spread_q, float(np.clip(num("disagreement", .12), 0, .5)),
+        float(np.clip(num("venue_count", 0.0)/4.0, 0, 1)), disp_q,
+    ], dtype=float)
+
+
+def _fit_regularized_logit(X, y, sample_weight=None, l2=3.0, iterations=650, lr=.075):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if X.ndim != 2 or len(y) != len(X) or len(y) < 4 or len(np.unique(y)) < 2:
+        return None
+    mean = np.nanmean(X, axis=0)
+    std = np.nanstd(X, axis=0)
+    std = np.where((~np.isfinite(std)) | (std < 1e-6), 1.0, std)
+    Xn = np.nan_to_num((X-mean)/std, nan=0.0, posinf=0.0, neginf=0.0)
+    Xb = np.column_stack([np.ones(len(Xn)), Xn])
+    w = np.ones(len(y), dtype=float) if sample_weight is None else np.asarray(sample_weight, dtype=float)
+    w = np.where(np.isfinite(w) & (w > 0), w, 1.0)
+    w = w / max(np.mean(w), 1e-9)
+    beta = np.zeros(Xb.shape[1], dtype=float)
+    # Initialize the intercept from class balance; this speeds convergence.
+    prevalence = float(np.clip(np.average(y, weights=w), .02, .98))
+    beta[0] = _prob_logit(prevalence)
+    for i in range(iterations):
+        z = np.clip(Xb @ beta, -20, 20)
+        p = 1.0/(1.0+np.exp(-z))
+        grad = (Xb.T @ (w*(p-y))) / max(np.sum(w), 1.0)
+        reg = np.r_[0.0, beta[1:]] * (l2/max(len(y), 1))
+        step = lr / math.sqrt(1.0 + i/180.0)
+        beta -= step*(grad + reg)
+    return {"mean": mean, "std": std, "beta": beta}
+
+
+def _predict_regularized_logit(model, X):
+    if not model:
+        return np.full(len(np.atleast_2d(X)), .5)
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    Xn = np.nan_to_num((X-model["mean"])/model["std"], nan=0.0, posinf=0.0, neginf=0.0)
+    Xb = np.column_stack([np.ones(len(Xn)), Xn])
+    z = np.clip(Xb @ model["beta"], -20, 20)
+    return 1.0/(1.0+np.exp(-z))
+
+
+def train_adaptive_learner(history):
+    """Grouped walk-forward-style validation by market ticker.
+
+    Multiple checkpoints from one 15-minute contract share the same label, so all
+    snapshots from a ticker are kept in the same validation fold to reduce leakage.
+    The learner activates only when it beats the unlearned probability on held-out
+    markets and has enough independent settled markets.
+    """
+    hist = _normalize_learning_history(history)
+    resolved = hist[hist["result"].isin(["yes", "no"]) & hist["base_prob_above"].notna()].copy()
+    if resolved.empty:
+        return {"active": False, "status": "COLLECTING", "resolved_rows": 0, "resolved_markets": 0,
+                "base_brier": None, "learned_brier": None, "hit_rate": None, "blend_weight": 0.0, "model": None}
+    groups = resolved["ticker"].astype(str).to_numpy()
+    unique_groups = sorted(set(groups))
+    n_markets = len(unique_groups)
+    y = (resolved["result"].eq("yes")).astype(float).to_numpy()
+    X = np.vstack([_adaptive_feature_vector(row) for _, row in resolved.iterrows()])
+    base = np.clip(pd.to_numeric(resolved["base_prob_above"], errors="coerce").fillna(.5).to_numpy(dtype=float), .005, .995)
+    counts = resolved.groupby("ticker")["ticker"].transform("count").to_numpy(dtype=float)
+    weights = 1.0/np.maximum(counts, 1.0)
+    base_brier = float(np.average((base-y)**2, weights=weights))
+    if n_markets < 20 or len(np.unique(y)) < 2:
+        return {"active": False, "status": f"COLLECTING {n_markets}/20 MARKETS", "resolved_rows": len(resolved),
+                "resolved_markets": n_markets, "base_brier": base_brier, "learned_brier": None,
+                "hit_rate": float(np.average((base>=.5)==(y>=.5), weights=weights)), "blend_weight": 0.0, "model": None}
+
+    folds = min(5, max(3, n_markets//6))
+    group_to_fold = {g: i % folds for i, g in enumerate(unique_groups)}
+    oof = np.full(len(resolved), np.nan)
+    for fold in range(folds):
+        test = np.array([group_to_fold[g] == fold for g in groups])
+        train = ~test
+        if test.sum() == 0 or train.sum() < 8 or len(np.unique(y[train])) < 2:
+            continue
+        model = _fit_regularized_logit(X[train], y[train], weights[train], l2=4.0)
+        if model:
+            oof[test] = _predict_regularized_logit(model, X[test])
+    valid = np.isfinite(oof)
+    if valid.sum() < max(12, len(resolved)*.65):
+        return {"active": False, "status": "WAITING FOR VALIDATION", "resolved_rows": len(resolved),
+                "resolved_markets": n_markets, "base_brier": base_brier, "learned_brier": None,
+                "hit_rate": None, "blend_weight": 0.0, "model": None}
+    learned_brier = float(np.average((oof[valid]-y[valid])**2, weights=weights[valid]))
+    learned_hit = float(np.average((oof[valid]>=.5)==(y[valid]>=.5), weights=weights[valid]))
+    relative_improvement = (base_brier-learned_brier)/max(base_brier, 1e-9)
+    active = learned_brier + 0.001 < base_brier and relative_improvement > .01
+    # The learned layer grows slowly with independent settled markets and proven OOF gain.
+    sample_strength = float(np.clip((n_markets-20)/80.0, 0.0, 1.0))
+    performance_strength = float(np.clip(relative_improvement/.12, 0.0, 1.0))
+    blend = float(np.clip((.12 + .48*sample_strength)*performance_strength, 0.0, .60)) if active else 0.0
+    final_model = _fit_regularized_logit(X, y, weights, l2=4.0) if active else None
+    return {
+        "active": bool(active), "status": "ACTIVE" if active else "VALIDATED · NO IMPROVEMENT YET",
+        "resolved_rows": int(len(resolved)), "resolved_markets": int(n_markets),
+        "base_brier": base_brier, "learned_brier": learned_brier,
+        "hit_rate": learned_hit, "relative_improvement": float(relative_improvement),
+        "blend_weight": blend, "model": final_model,
+    }
+
+
+def get_adaptive_learner(history):
+    """Retrain only when the set of resolved labels changes, not every 2-second refresh."""
+    hist = _normalize_learning_history(history)
+    resolved = hist[hist["result"].isin(["yes", "no"])].copy()
+    latest = ""
+    if len(resolved) and "settled_utc" in resolved:
+        latest = str(resolved["settled_utc"].fillna("").max())
+    signature = (
+        int(len(resolved)),
+        int(resolved["ticker"].nunique()) if len(resolved) else 0,
+        int(resolved["result"].eq("yes").sum()) if len(resolved) else 0,
+        latest,
+    )
+    if st.session_state.get("adaptive_model_signature") == signature and "adaptive_model_cache" in st.session_state:
+        return st.session_state["adaptive_model_cache"]
+    model = train_adaptive_learner(hist)
+    st.session_state["adaptive_model_signature"] = signature
+    st.session_state["adaptive_model_cache"] = model
+    return model
+
+
+def apply_adaptive_learner(base_prob, feature_row, learner):
+    base_prob = float(np.clip(base_prob, .005, .995))
+    if not learner or not learner.get("active") or not learner.get("model"):
+        return base_prob, {"active": False, "raw_prob": None, "adjustment_pp": 0.0, "blend": 0.0}
+    x = _adaptive_feature_vector(feature_row)
+    learned = float(_predict_regularized_logit(learner["model"], x.reshape(1,-1))[0])
+    remaining = float(np.clip(float(feature_row.get("remaining_sec", 450.0))/900.0, 0.0, 1.0))
+    # Near the final 60-second settlement window, direct BRTI-average evidence is
+    # more trustworthy than a historical learner, so the adaptive layer fades down.
+    late_scale = .35 + .65*remaining
+    blend = float(learner.get("blend_weight", 0.0))*late_scale
+    candidate = (1.0-blend)*base_prob + blend*learned
+    n = float(learner.get("resolved_markets", 0))
+    max_adjust = .06 + .10*float(np.clip(n/100.0, 0.0, 1.0))
+    final = float(np.clip(candidate, base_prob-max_adjust, base_prob+max_adjust))
+    final = float(np.clip(final, .005, .995))
+    return final, {"active": True, "raw_prob": learned, "adjustment_pp": (final-base_prob)*100.0, "blend": blend}
+
+
+def current_learning_feature_row(engine, candle_engine):
+    comps = engine.get("components") or {}
+    def cp(name):
+        try: return float(comps.get(name, {}).get("prob"))
+        except Exception: return np.nan
+    stat = engine.get("stat") or {}
+    proxy = engine.get("brti_proxy") or {}
+    final = engine.get("final_minute") or {}
+    return {
+        "remaining_sec": engine.get("remaining_sec", np.nan),
+        "strike": engine.get("target", np.nan),
+        "reference_price": engine.get("reference_price", np.nan),
+        "base_prob_above": engine.get("base_prob_above", engine.get("prob_above", np.nan)),
+        "adaptive_prob_above": engine.get("prob_above", np.nan),
+        "stat_prob": cp("statistical"), "analog_prob": cp("historical_analogs"),
+        "market_prob": cp("kalshi_market"), "flow_prob": cp("flow_candles"),
+        "final60_prob": cp("final_60s_avg") if "final_60s_avg" in comps else final.get("prob", np.nan),
+        "momentum": engine.get("momentum", np.nan), "pressure": engine.get("pressure", np.nan),
+        "bid_balance": engine.get("bid_balance", np.nan), "spread": engine.get("spread", np.nan),
+        "candle_outcome_score": candle_engine.get("outcome_score", np.nan),
+        "z_distance": stat.get("z_distance", np.nan), "sigma_1m": stat.get("sigma_1m", np.nan),
+        "venue_count": proxy.get("count", np.nan), "dispersion_bps": proxy.get("dispersion_bps", np.nan),
+        "disagreement": engine.get("disagreement", np.nan),
+    }
+
+
+def record_learning_snapshot(history, ticker, engine, candle_engine):
+    if not ticker or ticker == "none" or engine.get("target") is None or engine.get("base_prob_above") is None:
+        return _normalize_learning_history(history), False
+    df = _normalize_learning_history(history)
+    checkpoint = _checkpoint_name(engine.get("remaining_sec", 900.0))
+    exists = ((df["ticker"] == str(ticker)) & (df["checkpoint"] == checkpoint)).any()
+    if exists:
+        return df, False
+    row = current_learning_feature_row(engine, candle_engine)
+    row.update({
+        "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ticker": str(ticker), "checkpoint": checkpoint,
+        "outcome_call": str(engine.get("outcome", "UNCERTAIN")),
+        "result": "", "settled_utc": "", "settlement_value": np.nan,
+    })
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df = _normalize_learning_history(df).tail(2500).reset_index(drop=True)
+    save_learning_history(df)
+    return df, True
 
 @st.cache_data(ttl=2, show_spinner=False)
 def get_candles(granularity=60):
@@ -959,6 +1405,13 @@ def render_live_dashboard():
                 active_ticker = _live_markets[0]["ticker"]
         except Exception:
             pass
+    # Load previous prediction snapshots, automatically attach any newly settled
+    # Kalshi results, then train the adaptive calibration layer. The model only
+    # activates after grouped held-out validation proves it improves Brier score.
+    learning_history = load_learning_history()
+    learning_history, _learning_updates = refresh_learning_outcomes(learning_history, force=False)
+    learning_model = get_adaptive_learner(learning_history)
+
     try:
         candles = get_candles(60)
         if len(candles) < 10:
@@ -1048,7 +1501,7 @@ def render_live_dashboard():
         data = r.json()
         return int(data.get("count", 0)), int(data.get("vsize", 0))
 
-    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples):
+    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples, adaptive_learner):
         closes = frame["close"].astype(float)
         if len(closes) < 40:
             return {"outcome": "UNCERTAIN", "scalp": "WAIT", "reason": "Insufficient BTC history", "momentum": 0.0,
@@ -1142,6 +1595,8 @@ def render_live_dashboard():
             outcome = "UNCERTAIN"
             outcome_score = 0.0
             disagreement = None
+            base_prob_above = None
+            learning_adjustment = {"active": False, "raw_prob": None, "adjustment_pp": 0.0, "blend": 0.0}
         else:
             total_w = sum(v["weight"] for v in components.values())
             if total_w <= 0:
@@ -1152,7 +1607,24 @@ def render_live_dashboard():
             probs = np.array([v["prob"] for v in components.values()], dtype=float)
             ws = np.array([v["norm_weight"] for v in components.values()], dtype=float)
             disagreement = float(math.sqrt(np.sum(ws * (probs-prob_above)**2))) if len(probs) > 1 else 0.0
-            prob_above = float(np.clip(prob_above, .005, .995))
+            base_prob_above = float(np.clip(prob_above, .005, .995))
+            # Feed only information that existed at this moment into the learner.
+            # The outcome label is added later, after Kalshi settles the contract.
+            _learn_features = {
+                "remaining_sec": remaining_sec, "base_prob_above": base_prob_above,
+                "stat_prob": stat.get("prob") if stat else np.nan,
+                "analog_prob": analog.get("prob") if analog else np.nan,
+                "market_prob": market_p, "flow_prob": flow_p,
+                "final60_prob": final_min.get("prob") if final_min else np.nan,
+                "momentum": momentum, "pressure": pressure, "bid_balance": balance, "spread": spread,
+                "candle_outcome_score": candle_intel.get("outcome_score", 0.0),
+                "z_distance": stat.get("z_distance", np.nan) if stat else np.nan,
+                "sigma_1m": stat.get("sigma_1m", np.nan) if stat else np.nan,
+                "venue_count": brti_proxy.get("count", 0) if isinstance(brti_proxy, dict) else 0,
+                "dispersion_bps": brti_proxy.get("dispersion_bps", np.nan) if isinstance(brti_proxy, dict) else np.nan,
+                "disagreement": disagreement,
+            }
+            prob_above, learning_adjustment = apply_adaptive_learner(base_prob_above, _learn_features, adaptive_learner)
 
             separation = float(abs(prob_above-.5)*2.0)
             agreement = float(np.clip(1.0 - disagreement/.22, 0.0, 1.0))
@@ -1224,7 +1696,8 @@ def render_live_dashboard():
             "remaining_min": remaining_min, "remaining_sec": remaining_sec,
             "analog": analog, "stat": stat, "market_prob": market_p,
             "flow_prob": flow_p, "final_minute": final_min, "model_edge": model_edge,
-            "brti_proxy": brti_proxy,
+            "brti_proxy": brti_proxy, "base_prob_above": base_prob_above,
+            "learning_adjustment": learning_adjustment, "learning_model": adaptive_learner,
         }
 
     try:
@@ -1263,7 +1736,12 @@ def render_live_dashboard():
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
-                              outcome_history, brti_proxy, proxy_samples)
+                              outcome_history, brti_proxy, proxy_samples, learning_model)
+
+    # Automatically journal one snapshot in each time bucket (max six per market).
+    # Once the market settles, refresh_learning_outcomes supplies the official YES/NO
+    # label and the next model fit can learn from the mistake or correct call.
+    learning_history, _learning_added = record_learning_snapshot(learning_history, active_ticker, engine, candle_engine)
 
     # Compact mobile navigation. Short labels keep all three choices on one row.
     selected_page = st.radio(
@@ -1547,7 +2025,12 @@ def render_live_dashboard():
         prob_above_text = f"{prob_above*100:.0f}%" if prob_above is not None else "—"
         prob_below_text = f"{prob_below*100:.0f}%" if prob_below is not None else "—"
         conf_text = f"{engine.get('confidence',0):.0f}/100"
-        conf_sub = str(engine.get("confidence_label", "LOW")).lower()
+        _learn = engine.get("learning_adjustment") or {}
+        _lm = engine.get("learning_model") or {}
+        if _learn.get("active"):
+            conf_sub = f"{str(engine.get('confidence_label','LOW')).lower()} · learn {_learn.get('adjustment_pp',0):+.1f}pp"
+        else:
+            conf_sub = f"{str(engine.get('confidence_label','LOW')).lower()} · {_lm.get('resolved_markets',0)} learned"
         venues = int((engine.get("brti_proxy") or {}).get("count", 0))
         proxy_sub = f"{venues} venue proxy · not official BRTI" if venues else "Coinbase fallback · not BRTI"
         edge = engine.get("model_edge")
@@ -1693,6 +2176,51 @@ def render_live_dashboard():
             spread_text = f"{engine['spread']:.1f}¢" if engine['spread'] is not None else "Unavailable"
             st.caption(f"Kalshi top-five bid balance: {bid_text} · YES spread: {spread_text}")
 
+            st.markdown("**Adaptive learning**")
+            lm = engine.get("learning_model") or {}
+            la = engine.get("learning_adjustment") or {}
+            rb = lm.get("base_brier")
+            rl = lm.get("learned_brier")
+            brier_text = "collecting labels" if rb is None else (
+                f"Brier {rb:.3f}" if rl is None else f"held-out Brier {rb:.3f} → {rl:.3f}"
+            )
+            learn_status = lm.get("status", "COLLECTING")
+            st.caption(
+                f"{learn_status} · {lm.get('resolved_markets',0)} resolved markets / {lm.get('resolved_rows',0)} snapshots · "
+                f"{brier_text} · current adjustment {la.get('adjustment_pp',0):+.1f}pp"
+            )
+            if lm.get("hit_rate") is not None:
+                st.caption(f"Held-out direction hit rate: {lm['hit_rate']*100:.1f}% · blend weight {lm.get('blend_weight',0)*100:.0f}% when active.")
+            st.caption(
+                "The learner only changes the live probability after at least 20 independent settled markets AND grouped held-out Brier score improves. "
+                "That prevents a few lucky trades from making the bot overconfident."
+            )
+            if st.button("Check old markets for new settlements", key="refresh_learning_results"):
+                learning_history, newly = refresh_learning_outcomes(learning_history, force=True, max_markets=40)
+                st.success(f"Updated {newly} learning snapshots." if newly else "No new settled labels found yet.")
+            import_file = st.file_uploader("Import previous learning CSV", type=["csv"], key="learning_csv_import")
+            if import_file is not None and st.button("Merge imported history", key="merge_learning_csv"):
+                try:
+                    imported = _normalize_learning_history(pd.read_csv(import_file))
+                    merged = pd.concat([learning_history, imported], ignore_index=True)
+                    merged = _normalize_learning_history(merged).tail(2500)
+                    save_learning_history(merged)
+                    st.success(f"Merged {len(imported)} rows. The learner will re-evaluate them on the next refresh.")
+                except Exception as exc:
+                    st.error(f"Could not import learning history: {exc}")
+            if len(learning_history):
+                st.download_button(
+                    "Export learning history (CSV)", learning_history.to_csv(index=False),
+                    file_name="btc_kalshi_learning.csv", mime="text/csv", key="export_learning_history"
+                )
+                preview_cols = [c for c in ["recorded_utc","ticker","checkpoint","base_prob_above","adaptive_prob_above","outcome_call","result"] if c in learning_history.columns]
+                st.dataframe(learning_history[preview_cols].tail(20), hide_index=True, use_container_width=True, height=180)
+            persistence = st.session_state.get("learning_save_status", "local only")
+            if _learning_token():
+                st.caption(f"Persistence: {persistence}. GitHub-backed history is enabled via LEARNING_GITHUB_TOKEN.")
+            else:
+                st.caption("Persistence: local runtime + CSV export. Streamlit may reset local files on a redeploy; add a LEARNING_GITHUB_TOKEN secret for automatic GitHub-backed history.")
+
             st.markdown("**Paper signal tracker**")
             if "paper_signals" not in st.session_state:
                 st.session_state.paper_signals = []
@@ -1710,7 +2238,7 @@ def render_live_dashboard():
                 st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True, height=180)
                 st.download_button("Export paper signals (CSV)", pd.DataFrame(st.session_state.paper_signals).to_csv(index=False),
                                    file_name="btc_kalshi_paper_signals.csv", mime="text/csv")
-            st.caption("Signals are research indicators only; paper outcomes are not automatically verified.")
+            st.caption("Manual paper signals remain session-only. The adaptive journal above is separate: it records fixed checkpoints automatically and verifies settled YES/NO outcomes through Kalshi.")
 
 
     if selected_page == "📊 FLOW":
@@ -1799,7 +2327,14 @@ def render_live_dashboard():
     - Hidden liquidity, exchange outages, sudden news and second-by-second volatility can still flip a 15-minute result.
     - The bot does not place orders and cannot guarantee a settlement outcome.
 
-    **Best next validation step:** save each timestamped prediction, BRTI proxy, Kalshi price, component probabilities and eventual official settlement. Then evaluate Brier score, calibration, hit rate by confidence bucket, spread/fee-adjusted profitability and walk-forward performance before trusting the percentages with real money.
+    **Adaptive learning from previous contracts**
+    - The bot now journals fixed checkpoints during each 15-minute contract and automatically attaches Kalshi's official YES/NO result after settlement.
+    - A strongly regularized logistic calibration layer learns from the base probability, statistical model, historical analogs, Kalshi price, candle/flow context, strike-distance z-score, spread and cross-exchange quality.
+    - All snapshots from the same market stay in the same held-out validation fold. The learner stays inactive until it has at least **20 independent resolved markets** and its held-out **Brier score** actually beats the unlearned model.
+    - Even when active, the learner is blended conservatively, its maximum probability adjustment is capped, and it fades down during the final 60-second settlement window.
+    - This can correct repeated biases, but it cannot guarantee future accuracy and can stop helping if market behavior changes.
+
+    **Validation target:** keep collecting settled contracts and watch held-out Brier score, calibration, direction hit rate, and fee/slippage-adjusted paper results. The learner only receives weight when out-of-sample probability accuracy improves.
     """)
     st.caption(f"Last dashboard update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} • Data may be delayed.")
 
