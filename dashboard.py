@@ -260,6 +260,310 @@ def safe_float(x):
     try: return float(x)
     except (ValueError, TypeError): return np.nan
 
+
+def extract_strike(snapshot):
+    """Return a plausible BTC strike/threshold from a Kalshi market snapshot."""
+    if not snapshot or not isinstance(snapshot, dict):
+        return None
+    market = snapshot.get("market") or {}
+    for key in ("floor_strike", "cap_strike", "strike_price"):
+        try:
+            value = float(market.get(key))
+            if np.isfinite(value) and 1000 < value < 1000000:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def resample_ohlcv(frame, minutes):
+    """Build clean OHLCV bars for candle analysis without adding dependencies."""
+    df = frame.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["time", "open", "high", "low", "close"])
+    df = df.sort_values("time").drop_duplicates("time", keep="last")
+    if minutes > 1:
+        df = (df.set_index("time")
+              .resample(f"{minutes}min", label="left", closed="left")
+              .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+              .dropna(subset=["open", "high", "low", "close"])
+              .reset_index())
+    return df.reset_index(drop=True)
+
+
+def analyze_candle_timeframe(frame, minutes=1, strike=None):
+    """Context-aware candle reader.
+
+    Classical candle names are treated as *features*, not standalone forecasts. The
+    engine checks trend context, range/ATR, volume, market structure and strike
+    interaction. Completed candles carry most of the weight; the still-forming bar is
+    down-weighted so a mid-candle shape cannot masquerade as a confirmed pattern.
+    """
+    df = resample_ohlcv(frame, minutes)
+    empty = {"score": 0.0, "closed_score": 0.0, "forming_score": 0.0,
+             "bias": "NEUTRAL", "quality": "LOW", "patterns": [],
+             "strike_event": "", "volume_ratio": None, "trend": "MIXED"}
+    if len(df) < 8:
+        return empty
+
+    now = pd.Timestamp.now(tz="UTC")
+    end_time = df["time"] + pd.to_timedelta(minutes, unit="min")
+    closed = df[end_time <= now].copy()
+    forming = df[end_time > now].copy()
+    if closed.empty:
+        closed = df.iloc[:-1].copy() if len(df) > 1 else df.copy()
+    if closed.empty:
+        return empty
+
+    # Use rolling, volatility-adaptive definitions instead of fixed dollar sizes.
+    o = closed["open"].astype(float)
+    h = closed["high"].astype(float)
+    l = closed["low"].astype(float)
+    c = closed["close"].astype(float)
+    v = closed["volume"].fillna(0).astype(float)
+    body = c - o
+    abody = body.abs()
+    rng = (h - l).clip(lower=1e-9)
+    upper = (h - pd.concat([o, c], axis=1).max(axis=1)).clip(lower=0)
+    lower = (pd.concat([o, c], axis=1).min(axis=1) - l).clip(lower=0)
+    prev_close = c.shift(1)
+    tr = pd.concat([rng, (h-prev_close).abs(), (l-prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=5).mean()
+    body_ref = abody.shift(1).rolling(20, min_periods=5).median()
+    range_ref = rng.shift(1).rolling(20, min_periods=5).median()
+    vol_ref = v.shift(1).rolling(20, min_periods=5).median()
+    ema5 = c.ewm(span=5, adjust=False).mean()
+    ema13 = c.ewm(span=13, adjust=False).mean()
+
+    i = len(closed) - 1
+    cur = closed.iloc[i]
+    eps = max(float(atr.iloc[i]) if pd.notna(atr.iloc[i]) else float(rng.iloc[i]), 1e-9)
+    trend_raw = float((ema5.iloc[max(0, i-1)] - ema13.iloc[max(0, i-1)]) / eps)
+    trend_unit = float(np.tanh(trend_raw * 1.8))
+    trend = "UP" if trend_unit > 0.12 else "DOWN" if trend_unit < -0.12 else "MIXED"
+
+    patterns = []
+    score = 0.0
+    strike_event = ""
+
+    def add(name, pts, note=""):
+        nonlocal score
+        score += float(pts)
+        patterns.append({"name": name, "score": float(pts), "note": note, "tf": f"{minutes}m"})
+
+    cr = float(rng.iloc[i]); cb = float(abody.iloc[i]); cs = 1 if body.iloc[i] > 0 else -1 if body.iloc[i] < 0 else 0
+    cup = float(upper.iloc[i]); clo = float(lower.iloc[i])
+    close_pos = float(np.clip((c.iloc[i] - l.iloc[i]) / cr, 0, 1))
+    body_ratio = float(np.clip(cb / cr, 0, 1))
+    med_body = float(body_ref.iloc[i]) if pd.notna(body_ref.iloc[i]) and body_ref.iloc[i] > 0 else max(cb, cr * .35)
+    med_range = float(range_ref.iloc[i]) if pd.notna(range_ref.iloc[i]) and range_ref.iloc[i] > 0 else cr
+
+    # Continuous candle anatomy: body conviction + where the candle actually closed.
+    score += cs * body_ratio * 9.0
+    score += (close_pos - .5) * 8.0
+
+    # Long body / range expansion = stronger directional information than color alone.
+    if cb >= 1.25 * med_body and cr >= 1.10 * med_range:
+        add("Range expansion", cs * 8, "large body and range vs recent bars")
+    if body_ratio >= .78 and cup <= .12 * cr and clo <= .12 * cr and cs:
+        add("Bullish marubozu" if cs > 0 else "Bearish marubozu", cs * 16, "close held near the candle extreme")
+
+    # Doji / high-wave candles are indecision, so reduce directional conviction.
+    is_doji = cb <= max(.10 * cr, .18 * med_body)
+    if is_doji:
+        patterns.append({"name": "Doji / indecision", "score": 0.0, "note": "small real body", "tf": f"{minutes}m"})
+        score *= .78
+    elif cb <= .35 * med_body and cup >= .28 * cr and clo >= .28 * cr:
+        patterns.append({"name": "High-wave / indecision", "score": 0.0, "note": "long two-sided wicks", "tf": f"{minutes}m"})
+        score *= .82
+
+    # Pin bars only become meaningful with context. A hammer in an uptrend is not
+    # automatically bullish; a shooting-star shape in a downtrend is not automatically bearish.
+    hammer_shape = clo >= max(2.0 * max(cb, 1e-9), .48 * cr) and cup <= .20 * cr and close_pos >= .62
+    star_shape = cup >= max(2.0 * max(cb, 1e-9), .48 * cr) and clo <= .20 * cr and close_pos <= .38
+    if hammer_shape:
+        add("Hammer / lower-wick rejection", 22 if trend_unit < -.12 else 8,
+            "stronger after a decline" if trend_unit < -.12 else "shape present without ideal downtrend context")
+    if star_shape:
+        add("Shooting star / upper-wick rejection", -22 if trend_unit > .12 else -8,
+            "stronger after an advance" if trend_unit > .12 else "shape present without ideal uptrend context")
+
+    if i >= 1:
+        po, pc, ph, pl = map(float, (o.iloc[i-1], c.iloc[i-1], h.iloc[i-1], l.iloc[i-1]))
+        co, cc, ch, cl = map(float, (o.iloc[i], c.iloc[i], h.iloc[i], l.iloc[i]))
+        prev_body = abs(pc-po)
+        # Real-body engulfing with trend-context confirmation.
+        bull_engulf = pc < po and cc > co and co <= pc and cc >= po and cb >= .60 * med_body
+        bear_engulf = pc > po and cc < co and co >= pc and cc <= po and cb >= .60 * med_body
+        if bull_engulf:
+            add("Bullish engulfing", 24 if trend_unit < .20 else 14, "second body engulfs prior bearish body")
+        if bear_engulf:
+            add("Bearish engulfing", -24 if trend_unit > -.20 else -14, "second body engulfs prior bullish body")
+
+        # Harami is useful as an alert but gets a deliberately modest weight.
+        first_lo, first_hi = sorted((po, pc)); second_lo, second_hi = sorted((co, cc))
+        harami = prev_body >= 1.15 * med_body and cb <= .65 * prev_body and second_lo >= first_lo and second_hi <= first_hi
+        if harami:
+            harami_dir = 1 if pc < po else -1
+            add("Bullish harami" if harami_dir > 0 else "Bearish harami", harami_dir * 9,
+                "contained second body; treated as a weak reversal feature")
+
+        inside = ch <= ph and cl >= pl
+        outside = ch > ph and cl < pl
+        if inside:
+            patterns.append({"name": "Inside bar compression", "score": 0.0, "note": "range contracted inside prior bar", "tf": f"{minutes}m"})
+        if outside and cs:
+            add("Bullish outside bar" if cs > 0 else "Bearish outside bar", cs * 11,
+                "range engulfed prior bar and closed directionally")
+
+    # 3-bar reversal/continuation structures.
+    if i >= 2:
+        a, b, d = closed.iloc[i-2], closed.iloc[i-1], closed.iloc[i]
+        a_body = abs(float(a.close-a.open)); b_body = abs(float(b.close-b.open)); d_body = abs(float(d.close-d.open))
+        a_lo, a_hi = sorted((float(a.open), float(a.close)))
+        b_lo, b_hi = sorted((float(b.open), float(b.close)))
+        bull_3inside = (a.close < a.open and b_lo >= a_lo and b_hi <= a_hi and
+                        d.close > d.open and d.close > a.open)
+        bear_3inside = (a.close > a.open and b_lo >= a_lo and b_hi <= a_hi and
+                        d.close < d.open and d.close < a.open)
+        if bull_3inside: add("Three inside up", 22, "harami-style reversal confirmed by third candle")
+        if bear_3inside: add("Three inside down", -22, "harami-style reversal confirmed by third candle")
+
+        greens = [x.close > x.open for x in (a, b, d)]
+        reds = [x.close < x.open for x in (a, b, d)]
+        if all(greens) and a.close < b.close < d.close and min(a_body,b_body,d_body) >= .45*med_body:
+            add("Three advancing bullish candles", 15, "persistent closes higher")
+        if all(reds) and a.close > b.close > d.close and min(a_body,b_body,d_body) >= .45*med_body:
+            add("Three declining bearish candles", -15, "persistent closes lower")
+
+    # Confirmed Hikkake: an inside bar, false breakout, then a close back through the
+    # trap bar within three bars. This is especially useful for short-horizon scalping.
+    if len(closed) >= 5:
+        start = max(1, len(closed)-6)
+        for j in range(start, len(closed)-1):
+            mother = closed.iloc[j-1]; inside_bar = closed.iloc[j]
+            if not (inside_bar.high <= mother.high and inside_bar.low >= mother.low):
+                continue
+            k = j + 1
+            trap = closed.iloc[k]
+            bull_setup = trap.high < inside_bar.high and trap.low < inside_bar.low
+            bear_setup = trap.high > inside_bar.high and trap.low > inside_bar.low
+            later = closed.iloc[k+1:min(len(closed), k+4)]
+            if bull_setup and len(later) and (later["close"] > trap.high).any():
+                add("Confirmed bullish Hikkake", 24, "false downside breakout was reclaimed")
+                break
+            if bear_setup and len(later) and (later["close"] < trap.low).any():
+                add("Confirmed bearish Hikkake", -24, "false upside breakout failed")
+                break
+
+    # Market structure: higher-high/higher-low or lower-high/lower-low sequence.
+    if i >= 4:
+        hh = h.iloc[i-2] > h.iloc[i-3] > h.iloc[i-4]
+        hl = l.iloc[i-2] > l.iloc[i-3] > l.iloc[i-4]
+        lh = h.iloc[i-2] < h.iloc[i-3] < h.iloc[i-4]
+        ll = l.iloc[i-2] < l.iloc[i-3] < l.iloc[i-4]
+        if hh and hl: add("Higher-high / higher-low structure", 10, "short-term structure rising")
+        if lh and ll: add("Lower-high / lower-low structure", -10, "short-term structure falling")
+
+    # Breakout / rejection of recent local structure.
+    if i >= 10:
+        prior_high = float(h.iloc[i-10:i].max()); prior_low = float(l.iloc[i-10:i].min())
+        if c.iloc[i] > prior_high and close_pos >= .68:
+            add("Local high breakout", 16, "closed above the prior 10-bar high")
+        elif h.iloc[i] > prior_high and c.iloc[i] < prior_high:
+            add("Failed high breakout", -11, "wicked above resistance but closed back below")
+        if c.iloc[i] < prior_low and close_pos <= .32:
+            add("Local low breakdown", -16, "closed below the prior 10-bar low")
+        elif l.iloc[i] < prior_low and c.iloc[i] > prior_low:
+            add("Failed low breakdown", 11, "wicked below support but closed back above")
+
+    # Strike interaction is directly relevant to a 15-minute binary outcome market.
+    if strike is not None and np.isfinite(strike):
+        co, cc, ch, cl = map(float, (o.iloc[i], c.iloc[i], h.iloc[i], l.iloc[i]))
+        if cl <= strike <= ch:
+            if co < strike < cc:
+                strike_event = "Bullish strike reclaim"
+                add(strike_event, 24, "opened below strike and closed above it")
+            elif co > strike > cc:
+                strike_event = "Bearish strike breakdown"
+                add(strike_event, -24, "opened above strike and closed below it")
+            elif co >= strike and cc >= strike and cl < strike:
+                strike_event = "Lower-wick strike rejection"
+                add(strike_event, 15, "traded below strike but recovered above it")
+            elif co <= strike and cc <= strike and ch > strike:
+                strike_event = "Upper-wick strike rejection"
+                add(strike_event, -15, "traded above strike but fell back below it")
+            else:
+                strike_event = "Strike touched"
+                patterns.append({"name": strike_event, "score": 0.0, "note": "price traded through the strike", "tf": f"{minutes}m"})
+        if i >= 2:
+            recent = c.iloc[i-2:i+1]
+            if (recent > strike).all() and c.iloc[i-3] <= strike if i >= 3 else False:
+                add("Strike acceptance above", 10, "three closes held above strike")
+            if (recent < strike).all() and c.iloc[i-3] >= strike if i >= 3 else False:
+                add("Strike acceptance below", -10, "three closes held below strike")
+
+    # Volume is confirmation, not direction. Current synthetic live bars can have zero
+    # volume, so only completed candles with a valid historical comparison affect weight.
+    volume_ratio = None
+    if pd.notna(vol_ref.iloc[i]) and vol_ref.iloc[i] > 0 and v.iloc[i] > 0:
+        volume_ratio = float(v.iloc[i] / vol_ref.iloc[i])
+        if volume_ratio >= 1.6:
+            score *= 1.14
+            patterns.append({"name": "Volume confirmation", "score": 0.0, "note": f"{volume_ratio:.1f}× median volume", "tf": f"{minutes}m"})
+        elif volume_ratio < .55:
+            score *= .88
+
+    closed_score = float(np.clip(score, -100, 100))
+
+    # Forming candle: only anatomy + strike interaction; no classical pattern claims.
+    forming_score = 0.0
+    if not forming.empty:
+        f = forming.iloc[-1]
+        fr = max(float(f.high-f.low), 1e-9)
+        fb = float(f.close-f.open)
+        fbr = min(abs(fb)/fr, 1.0)
+        fpos = float(np.clip((f.close-f.low)/fr, 0, 1))
+        forming_score = (1 if fb > 0 else -1 if fb < 0 else 0) * fbr * 16 + (fpos-.5)*8
+        if strike is not None and np.isfinite(strike) and f.low <= strike <= f.high:
+            if f.open < strike < f.close: forming_score += 10
+            elif f.open > strike > f.close: forming_score -= 10
+        forming_score = float(np.clip(forming_score, -40, 40))
+
+    # Different use cases weight the still-forming candle differently downstream.
+    combined = float(np.clip(.78*closed_score + .22*forming_score, -100, 100))
+    bias = "BULLISH" if combined >= 12 else "BEARISH" if combined <= -12 else "NEUTRAL"
+    directional_patterns = [p for p in patterns if abs(p.get("score", 0)) >= 8]
+    quality = "HIGH" if abs(combined) >= 38 and len(directional_patterns) >= 2 else "MEDIUM" if abs(combined) >= 20 else "LOW"
+    return {"score": combined, "closed_score": closed_score, "forming_score": forming_score,
+            "bias": bias, "quality": quality, "patterns": patterns[-10:],
+            "strike_event": strike_event, "volume_ratio": volume_ratio, "trend": trend}
+
+
+def multi_timeframe_candle_intelligence(frame, strike=None):
+    """Blend 1m/5m/15m candle context for scalp and expiry decisions."""
+    results = {m: analyze_candle_timeframe(frame, m, strike) for m in (1, 5, 15)}
+    scalp_weights = {1: .50, 5: .35, 15: .15}
+    outcome_weights = {1: .25, 5: .35, 15: .40}
+    scalp_score = sum(results[m]["score"] * scalp_weights[m] for m in results)
+    outcome_score = sum(results[m]["score"] * outcome_weights[m] for m in results)
+    signs = [np.sign(results[m]["score"]) for m in results if abs(results[m]["score"]) >= 12]
+    agreement = float(abs(sum(signs)) / len(signs)) if signs else 0.0
+    bias = "BULLISH" if scalp_score >= 12 else "BEARISH" if scalp_score <= -12 else "NEUTRAL"
+    quality = "HIGH" if abs(scalp_score) >= 35 and agreement >= .66 else "MEDIUM" if abs(scalp_score) >= 18 else "LOW"
+    pats = []
+    for m in (1,5,15):
+        pats.extend(results[m]["patterns"])
+    pats = sorted(pats, key=lambda p: abs(p.get("score", 0)), reverse=True)
+    return {"bias": bias, "quality": quality,
+            "scalp_score": float(np.clip(scalp_score, -100, 100)),
+            "outcome_score": float(np.clip(outcome_score, -100, 100)),
+            "agreement": agreement, "timeframes": results, "patterns": pats[:8]}
+
 with st.sidebar:
     st.header("Settings")
     st.caption("Automatically searches Kalshi for open BTC 15-minute markets; refreshes discovery about every 5 seconds.")
@@ -409,11 +713,12 @@ def render_live_dashboard():
         data = r.json()
         return int(data.get("count", 0)), int(data.get("vsize", 0))
 
-    def research_signals(frame, snapshot, exchange_trades):
+    def research_signals(frame, snapshot, exchange_trades, candle_intel):
         closes = frame["close"].astype(float)
         if len(closes) < 40:
             return {"outcome": "UNCERTAIN", "scalp": "WAIT", "reason": "Insufficient BTC history", "momentum": 0.0,
-                    "pressure": None, "bid_balance": None, "spread": None, "target": None}
+                    "pressure": None, "bid_balance": None, "spread": None, "target": None,
+                    "outcome_score": 0.0, "scalp_score": 0.0}
         p = float(closes.iloc[-1])
         r5 = p / float(closes.iloc[-6]) - 1
         r15 = p / float(closes.iloc[-16]) - 1
@@ -423,7 +728,9 @@ def render_live_dashboard():
         if exchange_trades:
             total = sum(v for _, v in exchange_trades)
             pressure = sum((1 if side == "buy" else -1) * v for side, v in exchange_trades) / total if total else None
-        balance, spread, target = None, None, None
+        balance, spread = None, None
+        target = extract_strike(snapshot)
+        remaining_min = 15.0
         if snapshot:
             yes_depth = sum(q for _, q in snapshot["yes"][:5])
             no_depth = sum(q for _, q in snapshot["no"][:5])
@@ -431,33 +738,48 @@ def render_live_dashboard():
                 balance = (yes_depth - no_depth) / (yes_depth + no_depth)
             if snapshot["yes_ask"] is not None and snapshot["yes_bid"] is not None:
                 spread = snapshot["yes_ask"] - snapshot["yes_bid"]
-            m = snapshot["market"]
-            # Strike is not universally present/meaningful; avoid inventing it.
-            for key in ("floor_strike", "cap_strike", "strike_price"):
+            expiry = snapshot.get("market", {}).get("close_time") or snapshot.get("market", {}).get("expiration_time")
+            if expiry:
                 try:
-                    value = float(m[key])
-                    if 1000 < value < 1000000:
-                        target = value
-                        break
-                except (KeyError, TypeError, ValueError):
-                    continue
-        outcome = "UNCERTAIN"
+                    remaining_min = float(np.clip((pd.to_datetime(expiry, utc=True) - pd.Timestamp.now(tz="UTC")).total_seconds()/60, .25, 15))
+                except Exception:
+                    pass
+
+        # Expiry score: strike distance dominates; candles are confirmation, not destiny.
+        outcome_score = 0.0
         if target is not None:
-            distance = (p - target) / p
-            if distance > max(0.0003, vol * 2):
-                outcome = "YES LEAN"
-            elif distance < -max(0.0003, vol * 2):
-                outcome = "NO LEAN"
-        # A short-lived scalp setup is NOT an execution recommendation.
+            expected_move_frac = max(vol * np.sqrt(max(remaining_min, .25)), 0.00015)
+            zdist = ((p - target) / p) / expected_move_frac
+            outcome_score += 52 * np.tanh(zdist / 1.25)
+        outcome_score += 14 * np.tanh(momentum / 1.5)
+        outcome_score += 18 * (candle_intel.get("outcome_score", 0.0) / 100.0)
+        if pressure is not None: outcome_score += 8 * pressure
+        if balance is not None: outcome_score += 8 * balance
+        outcome_score = float(np.clip(outcome_score, -100, 100))
+        outcome = "YES LEAN" if outcome_score >= 20 else "NO LEAN" if outcome_score <= -20 else "UNCERTAIN"
+
+        # Scalp score reacts faster: 1m/5m candle action + aggressive trades + visible Kalshi depth.
+        scalp_score = 32 * np.tanh(momentum / 1.25)
+        scalp_score += 34 * (candle_intel.get("scalp_score", 0.0) / 100.0)
+        if pressure is not None: scalp_score += 20 * pressure
+        if balance is not None: scalp_score += 14 * balance
+        scalp_score = float(np.clip(scalp_score, -100, 100))
+
         scalp = "WAIT"
-        reason = "Signals disagree, missing quotes, or insufficient edge"
-        if snapshot and spread is not None and 0 <= spread <= 3 and pressure is not None and balance is not None:
-            if momentum > 0.55 and pressure > 0.18 and balance > 0.12:
-                scalp, reason = "WATCH YES", "Positive BTC momentum and trade/order-book pressure; check fees and depth"
-            elif momentum < -0.55 and pressure < -0.18 and balance < -0.12:
-                scalp, reason = "WATCH NO", "Negative BTC momentum and trade/order-book pressure; check fees and depth"
+        reason = "Signals disagree, quotes are missing, or the edge is too small"
+        liquid = snapshot and spread is not None and 0 <= spread <= 3 and pressure is not None and balance is not None
+        if liquid and scalp_score >= 34 and candle_intel.get("quality") != "LOW":
+            scalp, reason = "WATCH YES", "Candle structure, BTC momentum and live flow align upward; verify price/fees"
+        elif liquid and scalp_score <= -34 and candle_intel.get("quality") != "LOW":
+            scalp, reason = "WATCH NO", "Candle structure, BTC momentum and live flow align downward; verify price/fees"
+        elif liquid and abs(scalp_score) >= 42:
+            # A strong non-candle signal can still be watched, but label it as lower confirmation.
+            scalp = "WATCH YES" if scalp_score > 0 else "WATCH NO"
+            reason = "Strong flow/momentum, but candle confirmation is weak; use extra caution"
+
         return {"outcome": outcome, "scalp": scalp, "reason": reason, "momentum": momentum,
-                "pressure": pressure, "bid_balance": balance, "spread": spread, "target": target}
+                "pressure": pressure, "bid_balance": balance, "spread": spread, "target": target,
+                "outcome_score": outcome_score, "scalp_score": scalp_score}
 
     try:
         whale_trades = recent_exchange_trades()
@@ -469,7 +791,9 @@ def render_live_dashboard():
         chain_error = None
     except (requests.RequestException, ValueError, TypeError) as exc:
         chain_count, chain_vsize, chain_error = None, None, str(exc)
-    engine = research_signals(candles, kalshi_data, whale_trades)
+    target_hint = extract_strike(kalshi_data)
+    candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
+    engine = research_signals(candles, kalshi_data, whale_trades, candle_engine)
 
     # Compact mobile navigation. Short labels keep all three choices on one row.
     selected_page = st.radio(
@@ -738,6 +1062,7 @@ def render_live_dashboard():
             "expiry": timer_expiry, "btc": f"${price:,.0f}", "yes": yes_buy, "no": no_buy,
             "yesSell": yes_sell, "noSell": no_sell, "outcome": engine["outcome"],
             "scalp": engine["scalp"], "whale": whale_pressure, "target": target_text,
+            "candle": candle_engine["bias"], "candleSub": f"{candle_engine['scalp_score']:+.0f} · {candle_engine['quality'].lower()}",
             "distance": distance_text, "mood": mood, "moodColor": mood_color,
         }
         intel_json = json.dumps(intel)
@@ -747,11 +1072,11 @@ def render_live_dashboard():
         .panel{border:1px solid #71303d;border-radius:11px;background:linear-gradient(125deg,#210e17,#10111a 72%);padding:8px}
         .head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
         .mood{font-size:10px;font-weight:900;letter-spacing:.08em}.sub{font-size:9px;color:#967985;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:5px}
+        .grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:5px}.grid4b{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:5px}
         .tile{background:#111722;border:1px solid #302631;border-radius:8px;padding:6px;min-width:0}.tile small{display:block;color:#8197b2;font-size:8px;font-weight:800;letter-spacing:.06em;white-space:nowrap}
         .tile strong{display:block;margin-top:2px;font-size:13px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tile em{display:block;margin-top:2px;color:#8fa0b3;font-size:8px;font-style:normal;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .foot{margin-top:5px;color:#8e7a84;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        @media(max-width:430px){.panel{padding:6px}.grid4,.grid3{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
+        @media(max-width:430px){.panel{padding:6px}.grid4,.grid3,.grid4b{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
         </style></head><body><div class="panel">
           <div class="head"><div class="mood" id="mood"></div><div class="sub">15M OUTCOME + SCALP + FLOW</div></div>
           <div class="grid4">
@@ -760,17 +1085,18 @@ def render_live_dashboard():
             <div class="tile"><small>YES BUY</small><strong id="yes"></strong><em id="yesSell"></em></div>
             <div class="tile"><small>NO BUY</small><strong id="no"></strong><em id="noSell"></em></div>
           </div>
-          <div class="grid3">
+          <div class="grid4b">
             <div class="tile"><small>OUTCOME</small><strong id="outcome"></strong><em>expiration lean</em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>short-term watch</em></div>
-            <div class="tile"><small>WHALE FLOW</small><strong id="whale"></strong><em>aggressive trades</em></div>
+            <div class="tile"><small>CANDLES</small><strong id="candle"></strong><em id="candleSub"></em></div>
+            <div class="tile"><small>WHALE</small><strong id="whale"></strong><em>aggressive trades</em></div>
           </div>
           <div class="foot" id="distance"></div>
         </div><script>
         const d=__INTEL__;
-        for(const id of ['btc','yes','no','outcome','scalp','whale']) document.getElementById(id).textContent=d[id]||'—';
+        for(const id of ['btc','yes','no','outcome','scalp','candle','whale']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
-        document.getElementById('target').textContent='target '+(d.target||'—');document.getElementById('distance').textContent='Price vs target: '+(d.distance||'—')+' · indicators only, not a guarantee';
+        document.getElementById('target').textContent='target '+(d.target||'—');document.getElementById('candleSub').textContent=d.candleSub||'—';document.getElementById('distance').textContent='Price vs target: '+(d.distance||'—')+' · indicators only, not a guarantee';
         const m=document.getElementById('mood');m.textContent=d.mood||'NO CLEAR EDGE';m.style.color=d.moodColor||'#ffcf77';
         const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
         </script></body></html>""".replace("__INTEL__", intel_json)
@@ -794,6 +1120,14 @@ def render_live_dashboard():
                 st.warning(f"Kalshi quotes unavailable: {kalshi_error}")
             else:
                 st.info("No active Kalshi contract selected.")
+
+            st.markdown("**Candle intelligence**")
+            tf_text = " · ".join([f"{m}m {candle_engine['timeframes'][m]['score']:+.0f}" for m in (1,5,15)])
+            st.caption(f"{candle_engine['bias']} · scalp score {candle_engine['scalp_score']:+.0f}/100 · expiry score {candle_engine['outcome_score']:+.0f}/100 · agreement {candle_engine['agreement']:.0%} · {tf_text}")
+            if candle_engine["patterns"]:
+                pattern_text = " · ".join([f"{p['tf']} {p['name']} ({p['score']:+.0f})" for p in candle_engine["patterns"][:6]])
+                st.caption(f"Confirmed/observed: {pattern_text}")
+            st.caption("Completed candles carry most of the weight. The still-forming candle is down-weighted because its shape can change before close.")
 
             st.markdown("**Momentum**")
             st.caption(f"{context} · Score {direction_score:+.1f}/100 · 15m realized volatility {vol15:.3f}%" if pd.notna(vol15) else f"{context} · Score {direction_score:+.1f}/100")
@@ -819,7 +1153,9 @@ def render_live_dashboard():
             if st.button("Record current signals", type="secondary"):
                 st.session_state.paper_signals.append({"recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "ticker": active_ticker or "none", "btc": round(price, 2), "outcome_lean": engine["outcome"],
-                    "scalp_watch": engine["scalp"], "settled_result": "NOT VERIFIED"})
+                    "scalp_watch": engine["scalp"], "candle_bias": candle_engine["bias"],
+                    "candle_scalp_score": round(candle_engine["scalp_score"], 1),
+                    "candle_expiry_score": round(candle_engine["outcome_score"], 1), "settled_result": "NOT VERIFIED"})
                 st.session_state.paper_signals = st.session_state.paper_signals[-200:]
             if st.session_state.paper_signals:
                 st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True, height=180)
@@ -888,10 +1224,19 @@ def render_live_dashboard():
     - **GUIDE:** Explains signals and limitations.
 
     **What this version does**
-    - Pulls recent BTC-USD 1-minute candles from Coinbase public market data.
-    - Calculates short-term returns, EMA trend and a simple momentum heuristic.
-    - Automatically discovers open Kalshi BTC 15-minute markets and displays available YES/NO quotes and visible bids.
-    - Shows a cautious candidate/no-trade checklist.
+    - Pulls recent BTC-USD 1-minute OHLCV candles from Coinbase and builds 5m/15m bars locally.
+    - Reads candle anatomy (body, upper/lower wick, close location), ATR/range expansion, relative volume and higher-high/lower-low structure.
+    - Detects context-aware engulfing, hammer/shooting-star rejection, marubozu, harami, inside/outside bars, three-inside, multi-candle persistence, Hikkake traps, local breakouts/failures and direct strike reclaims/rejections.
+    - Blends **1m + 5m + 15m** candle scores differently for scalping and for the 15-minute expiry lean.
+    - Gives completed candles most of the weight and down-weights the still-forming candle.
+    - Combines candle intelligence with BTC momentum, large Coinbase trades, Kalshi spread/depth and distance from the strike.
+
+    **How candle reading is used**
+    - Long bodies and closes near an extreme imply stronger one-sided control; long two-sided wicks imply conflict/indecision.
+    - Reversal shapes only get full weight when the prior trend supports the textbook context.
+    - Breakouts get more weight when range and volume expand; failed breaks/rejections point the other way.
+    - A candle crossing the Kalshi strike gets special treatment: reclaim, breakdown, wick rejection, and multi-close acceptance are tracked separately.
+    - Classical candle names are **features**, not guaranteed predictions. Context and agreement matter more than any single pattern.
 
     **What it does not claim**
     - It does not know the exact final BTC price.
@@ -899,7 +1244,7 @@ def render_live_dashboard():
     - It does not use private order flow, hidden liquidity or every trade print.
     - It does not place orders.
 
-    **For a proper model:** save timestamped BTC and Kalshi snapshots, collect realized outcomes, then backtest with walk-forward validation, fees, spread, slippage and calibration. A signal should be promoted only if out-of-sample performance supports it.
+    **For a proper model:** save every timestamped candle/flow feature and the eventual Kalshi settlement, then run walk-forward validation with fees, spread, slippage and probability calibration. Pattern weights should eventually be learned from BTC/Kalshi history instead of treated as permanent constants.
     """)
     st.caption(f"Last dashboard update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} • Data may be delayed.")
 
