@@ -44,19 +44,48 @@ COINBASE = "https://api.exchange.coinbase.com"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 HEADERS = {"User-Agent": "BTC-Kalshi-Scalp-Desk/1.0", "Accept": "application/json"}
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=15)
 def get_candles(granularity=60):
-    # Coinbase candle rows: [time, low, high, open, close, volume]
-    r = requests.get(
-        f"{COINBASE}/products/BTC-USD/candles",
-        params={"granularity": granularity},
-        headers=HEADERS, timeout=12
-    )
-    r.raise_for_status()
-    rows = r.json()
-    df = pd.DataFrame(rows, columns=["time", "low", "high", "open", "close", "volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    return df.sort_values("time").reset_index(drop=True)
+    """Get distinct UTC one-minute BTC candles; retry a bounded historical window."""
+    def normalize(rows):
+        df = pd.DataFrame(rows, columns=["time", "low", "high", "open", "close", "volume"])
+        if df.empty:
+            return df
+        for col in ("time", "low", "high", "open", "close", "volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["time", "low", "high", "open", "close"])
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+    # Coinbase Exchange candles supports at most 300 buckets per request.
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start = end - pd.Timedelta(minutes=299)
+    params = {"granularity": granularity, "start": start.isoformat(), "end": end.isoformat()}
+    response = requests.get(f"{COINBASE}/products/BTC-USD/candles",
+                            params=params, headers=HEADERS, timeout=15)
+    response.raise_for_status()
+    df = normalize(response.json())
+    if len(df) >= 30:
+        return df
+
+    # If the primary endpoint provides insufficient history, try Coinbase's
+    # alternate public Advanced Trade candles feed before showing an error.
+    # Kraken provides public BTC/USD minute OHLC history without credentials.
+    kr = requests.get("https://api.kraken.com/0/public/OHLC",
+                      params={"pair": "XBTUSD", "interval": 1}, timeout=15)
+    kr.raise_for_status()
+    body = kr.json()
+    if body.get("error"):
+        raise ValueError(f"Kraken candle API: {body['error']}")
+    pairs = [v for k, v in body.get("result", {}).items() if k != "last"]
+    if not pairs:
+        raise ValueError("Both candle feeds returned insufficient historical data")
+    # Kraken rows: [time, open, high, low, close, vwap, volume, count]
+    fallback = [[row[0], row[3], row[2], row[1], row[4], row[6]] for row in pairs[0]]
+    df = normalize(fallback)
+    if len(df) < 30:
+        raise ValueError(f"Candle feeds returned only {len(df)} distinct minutes")
+    return df.tail(300).reset_index(drop=True)
 
 @st.cache_data(ttl=8)
 def get_market(ticker):
@@ -292,11 +321,9 @@ with tab1:
         st.error("Chart data has too few distinct candle timestamps. Please retry shortly.")
         st.stop()
     line = [{"time": b["time"], "value": b["close"]} for b in bars]
-    # Calculate EMAs from the entire history, not just the displayed window.
-    all_ema5 = candles["close"].ewm(span=5, adjust=False).mean()
-    all_ema15 = candles["close"].ewm(span=15, adjust=False).mean()
-    ema5 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], all_ema5.tail(len(view)))]
-    ema15 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], all_ema15.tail(len(view)))]
+    # Compute overlays from the exact same sorted timestamps as chart bars.
+    ema5 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=5, adjust=False).mean())]
+    ema15 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=15, adjust=False).mean())]
     payload = json.dumps({"bars": bars, "line": line, "ema5": ema5, "ema15": ema15,
                           "visibleCount": min(minutes, len(bars)),
                           "showEma": show_ema, "style": chart_style})
