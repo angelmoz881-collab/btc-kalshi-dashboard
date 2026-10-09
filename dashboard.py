@@ -5,41 +5,52 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import json
+import html
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="BTC × Kalshi Scalp Desk", page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="BTC × Kalshi | Live Terminal", page_icon="₿", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
 :root {color-scheme:dark}
-.stApp {background:radial-gradient(ellipse at 90% -10%,rgba(33,79,125,.24),transparent 42%),linear-gradient(180deg,#08111e 0%,#0b1422 58%,#0b1422 100%);color:#e9f1fc;font-family:'DM Sans',sans-serif}
+.stApp {background:radial-gradient(ellipse at 90% -10%,rgba(130,23,35,.24),transparent 42%),linear-gradient(180deg,#08090e 0%,#0b0d14 58%,#0b0d14 100%);color:#e9f1fc;font-family:'DM Sans',sans-serif}
 .block-container {padding-top:1.5rem;max-width:1420px;padding-left:1.5rem;padding-right:1.5rem;padding-bottom:3rem}
 h1,h2,h3 {font-family:'Space Grotesk',sans-serif!important;letter-spacing:-.035em!important}
 h3 {color:#dceaff!important}
 p, label {color:#c2d0e4}
-[data-testid="stMetric"] {background:linear-gradient(145deg,rgba(26,43,66,.95),rgba(15,28,46,.96));padding:18px 19px;border:1px solid #263a54;border-radius:17px;box-shadow:0 9px 25px rgba(0,0,0,.13);min-height:108px}
+[data-testid="stMetric"] {background:linear-gradient(145deg,rgba(26,43,66,.95),rgba(15,28,46,.96));padding:18px 19px;border:1px solid #39212a;border-radius:17px;box-shadow:0 9px 25px rgba(0,0,0,.13);min-height:108px}
 [data-testid="stMetricLabel"] {color:#94a9c4!important;font-size:.79rem!important;letter-spacing:.02em}
 [data-testid="stMetricValue"] {font-family:'Space Grotesk',sans-serif;font-weight:700;letter-spacing:-.04em;font-size:clamp(1.25rem,2vw,1.85rem)!important}
 [data-testid="stMetricDelta"] {font-weight:700}
 [data-testid="stTabs"] {margin-top:1rem}
-[data-testid="stTabs"] [role="tablist"] {gap:8px;border-bottom:1px solid #27374e}
+[data-testid="stTabs"] [role="tablist"] {gap:8px;border-bottom:1px solid #39212a}
 [data-testid="stTabs"] button {font-weight:700;border-radius:10px 10px 0 0;padding:12px 17px;color:#9bb1cf}
-[data-testid="stTabs"] button[aria-selected="true"] {color:#64d8d0!important;background:#13263a}
-[data-testid="stSidebar"] {background:#0d1a2a;border-right:1px solid #263a54}
+[data-testid="stTabs"] button[aria-selected="true"] {color:#ff6c78!important;background:#35161e}
+[data-testid="stSidebar"] {background:#100c12;border-right:1px solid #39212a}
 [data-testid="stSidebar"] h2 {color:#ecf7ff}
 [data-testid="stRadio"] div[role="radiogroup"] {gap:6px;flex-wrap:wrap}
-[data-testid="stRadio"] label {border:1px solid #30455f;background:#12243a;border-radius:9px;padding:4px 10px}
+[data-testid="stRadio"] label {border:1px solid #56303a;background:#1a1119;border-radius:9px;padding:4px 10px}
 [data-testid="stAlert"] {border-radius:13px}
-hr {border-color:#243850!important}
-.hero {padding:22px 25px;border:1px solid #2a415e;border-radius:21px;background:linear-gradient(112deg,rgba(24,50,74,.92),rgba(12,28,48,.94) 60%,rgba(10,54,63,.8));margin-bottom:18px;box-shadow:0 12px 38px rgba(0,0,0,.13)}
-.eyebrow {font-size:.72rem;letter-spacing:.16em;font-weight:800;color:#68d8cc;text-transform:uppercase;margin-bottom:7px}
+hr {border-color:#3b222b!important}
+.hero {padding:22px 25px;border:1px solid #5d2835;border-radius:21px;background:linear-gradient(112deg,rgba(52,15,24,.95),rgba(20,12,20,.95) 60%,rgba(55,17,28,.8));margin-bottom:18px;box-shadow:0 12px 38px rgba(0,0,0,.13)}
+.eyebrow {font-size:.72rem;letter-spacing:.16em;font-weight:800;color:#ff6575;text-transform:uppercase;margin-bottom:7px}
 .hero-title {font-family:'Space Grotesk',sans-serif;font-size:clamp(1.5rem,3vw,2.4rem);font-weight:700;letter-spacing:-.05em;color:#f1f7ff;line-height:1.13}
 .hero-sub {color:#a6bbd2;font-size:.87rem;margin-top:8px}
-.badge {display:inline-block;border:1px solid #276d6d;border-radius:20px;background:rgba(16,109,102,.2);color:#7aede0;font-weight:800;font-size:.72rem;padding:6px 11px;margin-top:13px}
+.badge {display:inline-block;border:1px solid #a93d4e;border-radius:20px;background:rgba(155,35,52,.18);color:#ff8c96;font-weight:800;font-size:.72rem;padding:6px 11px;margin-top:13px}
 .section-heading {font-size:.72rem;font-weight:800;color:#8fa6c1;letter-spacing:.14em;text-transform:uppercase;margin:20px 0 11px}
 @media(max-width:650px){.block-container{padding:.55rem .65rem 2rem}.hero{padding:12px 14px;border-radius:13px;margin-bottom:8px}.hero-title{font-size:1.35rem}.hero-sub{font-size:.76rem}.badge{margin-top:7px;font-size:.63rem;padding:4px 8px}[data-testid="stMetric"]{padding:9px 10px;min-height:72px;border-radius:11px}[data-testid="stMetricValue"]{font-size:1.08rem!important}[data-testid="stTabs"] button{padding:8px 7px;font-size:.75rem}.section-heading{margin:10px 0 6px}[data-testid="stVerticalBlock"]{gap:.48rem}div[data-testid="stPlotlyChart"]{margin:0!important}}
+
+.position-panel {background:linear-gradient(125deg,#250d17,#120e16 75%);border:1px solid #783140;border-radius:16px;padding:17px 18px;margin:10px 0 15px;box-shadow:0 9px 32px rgba(0,0,0,.2)}
+.position-eyebrow{font-size:.66rem;color:#e7a6b0;font-weight:800;letter-spacing:.12em}
+.position-mood{font-size:clamp(1.15rem,4vw,1.75rem);font-weight:900;letter-spacing:.035em;margin:9px 0 15px}
+.position-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
+.position-grid>div{background:#140e16;border:1px solid #43242d;border-radius:9px;padding:10px;min-width:0}
+.position-grid small{display:block;font-size:.6rem;color:#aa8894;letter-spacing:.07em;margin-bottom:6px}
+.position-grid strong{display:block;font-size:clamp(.88rem,1.6vw,1.15rem);color:#f7e9ed;overflow-wrap:anywhere}
+.position-note{font-size:.7rem;color:#ac8996;margin-top:12px}
+@media(max-width:650px){.position-panel{padding:12px}.position-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.position-grid>div{padding:8px}.position-grid strong{font-size:.95rem}}
 </style>""", unsafe_allow_html=True)
-st.markdown("""<div class="hero"><div class="eyebrow">Live market intelligence · Bitcoin / Kalshi</div><div class="hero-title">₿ &nbsp; BTC Scalp Terminal</div><div class="hero-sub">Live BTC chart and Kalshi prices, built for your phone.</div><span class="badge">● RESEARCH MODE &nbsp;·&nbsp; NO AUTO-TRADING</span></div>""", unsafe_allow_html=True)
+st.markdown("""<div class="hero"><div class="eyebrow">HYPER-STYLE TERMINAL · BTC × KALSHI</div><div class="hero-title">₿ &nbsp; BTC / KALSHI LIVE</div><div class="hero-sub">Live candles · 15-minute contracts · order flow · risk first</div><span class="badge">● LIVE DATA &nbsp;·&nbsp; RESEARCH ONLY</span></div>""", unsafe_allow_html=True)
 
 COINBASE = "https://api.exchange.coinbase.com"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
@@ -286,7 +297,7 @@ if market_ticker:
     except requests.RequestException as exc:
         kalshi_error = str(exc)
 
-tab1, tab2, tab3 = st.tabs(["📈 Chart", "📚 Order book", "ℹ️ Guide"])
+tab1, tab2, tab3 = st.tabs(["🔴 LIVE CHART", "📊 MARKET FLOW", "⚙️ GUIDE"])
 
 with tab1:
     if market_ticker:
@@ -300,7 +311,7 @@ with tab1:
     with wcol:
         window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
     with st.expander("⚙️ Chart options", expanded=False):
-        show_ema = st.toggle("Show EMA 5 / 15", value=False)
+        show_ema = st.toggle("Show EMA 5 / 15", value=True)
         chart_style = st.radio("Chart type", ["Candles", "Line"], horizontal=True)
     minutes = {"15m": 15, "30m": 30, "1h": 60, "3h": 180, "6h": 360}[window]
     candle_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}[timeframe]
@@ -366,13 +377,13 @@ with tab1:
     right_edge = view["time"].iloc[-1] + pd.Timedelta(minutes=candle_minutes * 2)
     left_edge = right_edge - pd.Timedelta(minutes=max(minutes, candle_minutes * 4) * st.session_state[zoom_key])
     chart.update_layout(
-        height=385, margin=dict(l=2, r=2, t=22, b=5),
-        paper_bgcolor="#0c1929", plot_bgcolor="#0c1929",
+        height=440, margin=dict(l=2, r=2, t=22, b=5),
+        paper_bgcolor="#0b0b11", plot_bgcolor="#0b0b11",
         font=dict(color="#c6d3e5", size=12),
         xaxis=dict(type="date", range=[left_edge, right_edge],
-                   showgrid=True, gridcolor="#1b2e44",
+                   showgrid=True, gridcolor="#29202a",
                    rangeslider=dict(visible=False), tickformat="%H:%M"),
-        yaxis=dict(side="right", showgrid=True, gridcolor="#1b2e44",
+        yaxis=dict(side="right", showgrid=True, gridcolor="#29202a",
                    tickprefix="$", tickformat=",.2f", fixedrange=False),
         showlegend=False,
         dragmode=False, uirevision=f"{timeframe}-{window}-{chart_style}-{st.session_state[zoom_key]}",
@@ -383,12 +394,52 @@ with tab1:
         "doubleClick": "reset", "displayModeBar": False,
         "modeBarButtonsToRemove": ["lasso2d", "select2d"],
     })
-    st.caption("🤏 Use two fingers to pinch in or out. Drag-to-zoom is disabled. Use +/− or Reset if your browser blocks pinch gestures.")
+    st.caption("🤏 Two fingers: pinch to zoom · Drag-to-zoom OFF · + / − available as backup.")
     with st.expander("Chart data / troubleshooting", expanded=False):
         st.caption(f"Loaded {len(bars)} distinct {timeframe} candles · UTC "
                    f"{datetime.fromtimestamp(bars[0]['time'], timezone.utc):%H:%M}–"
                    f"{datetime.fromtimestamp(bars[-1]['time'], timezone.utc):%H:%M}.")
-    st.markdown('<div class="section-heading">Kalshi live quotes · directly below BTC chart</div>', unsafe_allow_html=True)
+    # A compact, high-contrast contract status card inspired by trading terminals.
+    if kalshi_data:
+        market_info = kalshi_data["market"]
+        expiry_raw = market_info.get("close_time") or market_info.get("expiration_time")
+        seconds_left = None
+        if expiry_raw:
+            try:
+                expires = pd.to_datetime(expiry_raw, utc=True)
+                seconds_left = max(0, int((expires - pd.Timestamp.now(tz="UTC")).total_seconds()))
+            except (ValueError, TypeError):
+                pass
+        clock = f"{seconds_left // 60:02d}:{seconds_left % 60:02d}" if seconds_left is not None else "—:—"
+        target_raw = market_info.get("floor_strike") or market_info.get("strike_price")
+        try:
+            target_value = float(target_raw)
+            distance = price - target_value
+            target_text = f"${target_value:,.2f}"
+            distance_text = f"${distance:+,.2f}"
+        except (ValueError, TypeError):
+            target_text = "—"
+            distance_text = "—"
+    else:
+        clock, target_text, distance_text = "—:—", "—", "—"
+    momentum = float(np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100))
+    if momentum > 8:
+        mood, mood_color = "UPWARD MOMENTUM", "#36d7a4"
+    elif momentum < -8:
+        mood, mood_color = "DOWNWARD MOMENTUM", "#ff6c78"
+    else:
+        mood, mood_color = "NO CLEAR EDGE", "#ffcf77"
+    st.markdown(f"""<div class="position-panel">
+      <div class="position-eyebrow">● LIVE POSITION INTEL · INDICATORS ONLY</div>
+      <div class="position-mood" style="color:{mood_color}">{html.escape(mood)}</div>
+      <div class="position-grid">
+        <div><small>15M TIME LEFT</small><strong>{clock}</strong></div>
+        <div><small>BTC PRICE</small><strong>${price:,.2f}</strong></div>
+        <div><small>CONTRACT TARGET*</small><strong>{target_text}</strong></div>
+        <div><small>PRICE VS TARGET</small><strong>{distance_text}</strong></div>
+      </div><div class="position-note">Momentum is descriptive, not a prediction. *Target shown only when the Kalshi API supplies an interpretable strike.</div>
+    </div>""", unsafe_allow_html=True)
+    st.markdown('<div class="section-heading">Kalshi YES / NO · live quotes</div>', unsafe_allow_html=True)
     if kalshi_data:
         k = kalshi_data
         yes_col, no_col = st.columns(2)
