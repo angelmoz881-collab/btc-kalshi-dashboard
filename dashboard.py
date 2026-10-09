@@ -184,6 +184,26 @@ def _normalize_learning_history(df):
     return out.sort_values(["recorded_utc", "ticker"], na_position="last").reset_index(drop=True)
 
 
+def possible_expiration_outcome(engine):
+    """A tentative view of the same expiry estimate, independent of the regular call."""
+    try:
+        p = float(engine.get("prob_above"))
+        confidence = float(engine.get("confidence", 0))
+        remaining = float(engine.get("remaining_sec"))
+        target = float(engine.get("target"))
+    except (TypeError, ValueError):
+        return "UNAVAILABLE", "Waiting for expiry inputs"
+    if not all(math.isfinite(x) for x in (p, confidence, remaining, target)) or not 0 <= p <= 1:
+        return "UNAVAILABLE", "Waiting for valid expiry inputs"
+    if remaining <= 0:
+        return "EXPIRED", "Waiting for official settlement"
+    if confidence < 35 or .45 < p < .55:
+        return "NO CLEAR LEAN", "Evidence too weak or close to 50/50"
+    direction = "ABOVE" if p > .5 else "BELOW"
+    probability = p if p > .5 else 1 - p
+    return f"POSSIBLE {direction}", f"Est. {probability:.0%} · confidence {confidence:.0f}/100 · tentative"
+
+
 def _github_headers(token):
     return {
         "Authorization": f"Bearer {token}",
@@ -2414,6 +2434,7 @@ def _render_live_dashboard_inner():
             settle_note = "Kalshi settles on 60s BRTI average"
 
         outcome_text = str(engine.get("outcome", "UNCERTAIN"))
+        possible_outcome, possible_detail = possible_expiration_outcome(engine)
         if outcome_text.startswith("ABOVE"):
             mood, mood_color = "OUTCOME MODEL FAVORS ABOVE", "#36d7a4"
         elif outcome_text.startswith("BELOW"):
@@ -2446,6 +2467,7 @@ def _render_live_dashboard_inner():
             "confSub": conf_sub, "proxySub": proxy_sub, "edge": edge_text,
             "settleNote": settle_note, "mood": mood, "moodColor": mood_color,
             "reversal": rev_status, "reversalSub": rev_sub, "reversalColor": rev_color,
+            "possibleOutcome": possible_outcome, "possibleDetail": possible_detail,
         }
         intel_json = json.dumps(intel)
         intel_html = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2469,15 +2491,17 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>NO BUY</small><strong id="no"></strong><em id="noSell"></em></div>
           </div>
           <div class="grid4b">
-            <div class="tile"><small>OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
+            <div class="tile"><small>EXPIRATION OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
             <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
             <div class="tile"><small>MODEL CONF</small><strong id="confidence"></strong><em id="confSub"></em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>short-term watch</em></div>
           </div>
+          <div class="rev"><b id="possibleOutcome" style="color:#ffcf77"></b><span id="possibleDetail"></span></div>
           <div class="rev" id="revBox"><b id="reversal"></b><span id="reversalSub"></span></div>
           <div class="foot" id="distance"></div>
         </div><script>
         const d=__INTEL__;
+        document.getElementById('possibleOutcome').textContent=d.possibleOutcome||'UNAVAILABLE';document.getElementById('possibleDetail').textContent=d.possibleDetail||'';
         for(const id of ['btc','yes','no','outcome','above','confidence','scalp']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
         document.getElementById('below').textContent='below '+(d.below||'—');document.getElementById('confSub').textContent=d.confSub||'—';document.getElementById('proxySub').textContent=d.proxySub||'—';document.getElementById('edge').textContent=d.edge||'—';document.getElementById('settleNote').textContent=d.settleNote||'—';
@@ -2486,7 +2510,7 @@ def _render_live_dashboard_inner():
         const m=document.getElementById('mood');m.textContent=d.mood||'NO HIGH-CONFIDENCE OUTCOME CALL';m.style.color=d.moodColor||'#ffcf77';
         const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
         </script></body></html>""".replace("__INTEL__", intel_json)
-        components.html(intel_html, height=188, scrolling=False)
+        components.html(intel_html, height=216, scrolling=False)
         direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
         if abs(direction_score) < 8:
             context = "NO CLEAR EDGE — wait for confirmation"
@@ -2667,6 +2691,8 @@ def _render_live_dashboard_inner():
             b.metric("Close / expiry (UTC)", str(market.get("close_time", market.get("expiration_time", "unknown"))))
             st.caption(f"Strike: {market.get('floor_strike', market.get('cap_strike', market.get('strike_price', 'not provided')))}")
             st.markdown("### Live YES / NO quotes")
+            possible_outcome, possible_detail = possible_expiration_outcome(engine)
+            st.caption(f"Lower-confidence expiry view: {possible_outcome} · {possible_detail}")
             yes_col, no_col = st.columns(2)
             with yes_col:
                 st.metric("🟢 Buy YES", show_price(k["yes_ask"]))
@@ -2720,6 +2746,7 @@ def _render_live_dashboard_inner():
     - Candle intelligence, aggressive Coinbase trade flow and Kalshi depth are used as a **small confirmation layer**, not allowed to overpower the strike-distance/statistical models.
     - During the **last 60 seconds**, the bot records the live multi-exchange proxy and estimates the average already observed. It then calculates the average price still required over the remaining seconds for the final 60-second settlement average to finish above the strike.
     - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
+    - **POSSIBLE ABOVE / BELOW** is a separate tentative expiration view using the same model: it needs at least 55% estimated directional probability and 35/100 model confidence. Near 50/50 or with weaker evidence it says **NO CLEAR LEAN**. It does not change the regular expiration call, scalp signals, or learning labels. Model confidence is an evidence score, not a success probability.
 
     **How candle reading is used**
     - Long bodies and closes near an extreme imply stronger one-sided control; long two-sided wicks imply conflict/indecision.
