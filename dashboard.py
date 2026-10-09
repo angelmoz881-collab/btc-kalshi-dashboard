@@ -507,7 +507,7 @@ if selected_page == "📈 LIVE CHART":
         timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#51303b',
           barSpacing:8,minBarSpacing:2,rightOffset:3},
         crosshair:{mode:LC.CrosshairMode.Magnet},
-        handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false},
+        handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:false,vertTouchDrag:false},
         handleScale:{axisPressedMouseMove:false,mouseWheel:false,pinch:true},
         kineticScroll:{touch:true,mouse:false}
       });
@@ -527,14 +527,56 @@ if selected_page == "📈 LIVE CHART":
       }
       requestAnimationFrame(()=>requestAnimationFrame(setInitialView));
       new ResizeObserver(()=>chart.applyOptions({width:root.clientWidth})).observe(root);
-      // Prevent mobile long-press tooltip from interfering with the pinch gesture.
-      // One finger pans; two fingers scale. Tapping still permits crosshair inspection.
+
+      // Mobile controls: custom one-finger horizontal panning + native two-finger pinch.
+      // Android browsers inside Streamlit iframes can swallow Lightweight Charts' built-in
+      // one-finger drag, so we pan the logical time range ourselves.
+      let panStartX=null;
+      let panStartRange=null;
+      let panMoved=false;
+      root.addEventListener('touchstart', e => {
+        if (e.touches.length===1) {
+          panStartX=e.touches[0].clientX;
+          const r=chart.timeScale().getVisibleLogicalRange();
+          panStartRange=r ? {from:r.from,to:r.to} : null;
+          panMoved=false;
+        } else {
+          panStartX=null;
+          panStartRange=null;
+        }
+      }, {passive:true});
+
+      root.addEventListener('touchmove', e => {
+        if (e.touches.length!==1 || panStartX===null || !panStartRange) return;
+        e.preventDefault();
+        const dx=e.touches[0].clientX-panStartX;
+        if (Math.abs(dx)>3) panMoved=true;
+        const barsVisible=Math.max(1, panStartRange.to-panStartRange.from);
+        const pxPerBar=Math.max(2, root.clientWidth/barsVisible);
+        const shift=-dx/pxPerBar;
+        chart.timeScale().setVisibleLogicalRange({
+          from:panStartRange.from+shift,
+          to:panStartRange.to+shift
+        });
+      }, {passive:false});
+
+      root.addEventListener('touchend', e => {
+        if (e.touches.length===0) {
+          panStartX=null;
+          panStartRange=null;
+        }
+      }, {passive:true});
+      root.addEventListener('touchcancel', () => {
+        panStartX=null;
+        panStartRange=null;
+      }, {passive:true});
+
       root.addEventListener('contextmenu',e=>e.preventDefault());
     } catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
     </script></body></html>"""
     chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
     components.html(chart_html, height=448, scrolling=False)
-    st.caption("🤏 Two fingers: pinch to zoom · 👆 One finger: pan · Tap: inspect candle")
+    st.caption("👆 Drag left/right: move through candles · 🤏 Pinch: zoom · Tap: inspect candle")
     with st.expander("Chart data / troubleshooting", expanded=False):
         st.caption(f"Loaded {len(clean_bars)} distinct {timeframe} candles · UTC "
                    f"{datetime.fromtimestamp(clean_bars[0]['time'], timezone.utc):%H:%M}–"
