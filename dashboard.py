@@ -278,11 +278,19 @@ with tab1:
     with c2:
         chart_style = st.selectbox("Chart style", ["Candles", "Line"], label_visibility="collapsed")
     minutes = {"15m": 15, "30m": 30, "1h": 60, "3h": 180, "6h": 360}[window]
-    view = candles.tail(minutes + 1).copy()
+    # Normalize candles before sending them to the browser. Duplicate timestamps can
+    # collapse multiple candles into a single oversized candle on the time axis.
+    view = candles.dropna(subset=["time", "open", "high", "low", "close"]).copy()
+    view = view.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+    view = view.tail(max(minutes, 60)).copy()
     # All timestamps are UTC epoch seconds, as required by Lightweight Charts.
     view["epoch"] = (view["time"].astype("int64") // 1_000_000_000).astype(int)
     bars = [{"time": int(r.epoch), "open": float(r.open), "high": float(r.high),
              "low": float(r.low), "close": float(r.close)} for r in view.itertuples()]
+    # Verify that the chart has distinct one-minute points, not a single timestamp.
+    if len(bars) < 10 or len({b["time"] for b in bars}) < 10:
+        st.error("Chart data has too few distinct candle timestamps. Please retry shortly.")
+        st.stop()
     line = [{"time": b["time"], "value": b["close"]} for b in bars]
     # Calculate EMAs from the entire history, not just the displayed window.
     all_ema5 = candles["close"].ewm(span=5, adjust=False).mean()
@@ -290,6 +298,7 @@ with tab1:
     ema5 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], all_ema5.tail(len(view)))]
     ema15 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], all_ema15.tail(len(view)))]
     payload = json.dumps({"bars": bars, "line": line, "ema5": ema5, "ema15": ema15,
+                          "visibleCount": min(minutes, len(bars)),
                           "showEma": show_ema, "style": chart_style})
     chart_html = r"""
     <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -309,7 +318,7 @@ with tab1:
         layout:{background:{type:'solid',color:'#0c1929'},textColor:'#c6d3e5',fontSize:12},
         grid:{vertLines:{color:'#1b2e44'},horzLines:{color:'#1b2e44'}},
         rightPriceScale:{borderColor:'#34445b',scaleMargins:{top:.08,bottom:.1}},
-        timeScale:{borderColor:'#34445b',timeVisible:true,secondsVisible:false,rightOffset:3,
+        timeScale:{barSpacing:7,minBarSpacing:3,borderColor:'#34445b',timeVisible:true,secondsVisible:false,rightOffset:3,
           fixLeftEdge:false,lockVisibleTimeRangeOnResize:true},
         crosshair:{mode:LightweightCharts.CrosshairMode.Normal,
           vertLine:{color:'#9ca3af',style:2,labelBackgroundColor:'#3b526d'},
@@ -328,7 +337,11 @@ with tab1:
         const e15=chart.addLineSeries({color:'#a78bfa',lineWidth:1,priceLineVisible:false,lastValueVisible:false});
         e5.setData(data.ema5);e15.setData(data.ema15);
       }
-      chart.timeScale().fitContent();
+      // Fit a sensible number of candles. Do not stretch one candle to screen width.
+      // A logical range is based on candle indexes, not milliseconds.
+      const count = data.bars.length;
+      const visible = Math.max(10, Math.min(data.visibleCount || 60, count));
+      chart.timeScale().setVisibleLogicalRange({from: count - visible - 1, to: count + 2});
       chart.subscribeCrosshairMove(param=>{
         const bar=param.seriesData.get(primary);
         if(!bar){document.getElementById('legend').textContent='BTC / USD · 1m';return;}
@@ -342,6 +355,7 @@ with tab1:
     </script></body></html>
     """.replace("__DATA__", payload)
     components.html(chart_html, height=550, scrolling=False)
+    st.caption(f"Loaded {len(bars)} distinct BTC candles · {bars[0]['time']} to {bars[-1]['time']} (UTC epoch seconds).")
     st.caption("Drag sideways to inspect older candles. Pinch to zoom on mobile; scroll to zoom on desktop. Use the time buttons to reset your view.")
     st.markdown('<div class="section-heading">Kalshi live quotes · directly below BTC chart</div>', unsafe_allow_html=True)
     if kalshi_data:
@@ -431,7 +445,7 @@ with tab3:
 **What this version does**
 - Pulls recent BTC-USD 1-minute candles from Coinbase public market data.
 - Calculates short-term returns, EMA trend and a simple momentum heuristic.
-- Pulls a Kalshi market and its visible YES/NO order book when you provide the exact ticker.
+- Automatically discovers open Kalshi BTC 15-minute markets and displays available YES/NO quotes and visible bids.
 - Shows a cautious candidate/no-trade checklist.
 
 **What it does not claim**
