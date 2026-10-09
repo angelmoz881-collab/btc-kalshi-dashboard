@@ -389,47 +389,8 @@ with st.spinner("Checking exchange whale-size trades and Kalshi liquidity..."):
         chain_count, chain_vsize, chain_error = None, None, str(exc)
 engine = research_signals(candles, kalshi_data, whale_trades)
 
-st.markdown('<div class="section-heading">Dual engine · 15-minute outcome + short-term scalps</div>', unsafe_allow_html=True)
-pred_col, scalp_col = st.columns(2)
-with pred_col:
-    st.metric("🎯 Expiration outlook", engine["outcome"])
-    st.caption("Directional lean only; NOT a calibrated probability. Exact settlement depends on Kalshi contract rules and price source.")
-with scalp_col:
-    st.metric("⚡ Scalping setup", engine["scalp"])
-    st.caption(engine["reason"])
-with st.expander("🐋 Whale activity · signal evidence", expanded=False):
-    if whale_error:
-        st.warning(f"Exchange trades unavailable: {whale_error}")
-    else:
-        sizes = [usd for _, usd in whale_trades]
-        large = [(side, usd) for side, usd in whale_trades if usd >= 100000]
-        st.write(f"Recent Coinbase trades sampled: **{len(whale_trades)}** · Trades ≥ $100k: **{len(large)}**")
-        st.write("Aggressive trade pressure: **" + (f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"))
-        st.caption("Large exchange trades are a proxy for whale-size activity, not proof of a specific whale wallet.")
-    if chain_error:
-        st.caption(f"Blockchain activity unavailable: {chain_error}")
-    else:
-        st.write(f"Bitcoin mempool: **{chain_count:,} unconfirmed transactions** · **{chain_vsize / 1e6:.2f} MB vsize**")
-        st.caption("Mempool volume is blockchain activity, NOT identified whale transfers or exchange inflows. Wallet attribution is not provided by this public feed.")
-    st.write("Kalshi top-five bid-depth balance: **" + (f"{engine['bid_balance']:+.1%}" if engine['bid_balance'] is not None else "Unavailable") + "**")
-    st.write("YES spread: **" + (f"{engine['spread']:.1f}¢" if engine['spread'] is not None else "Unavailable") + "**")
-    st.caption("Signals use sampled public data, not full historical Kalshi flow. NO automated orders are placed.")
-
-with st.expander("🧪 Paper signal tracker · session only", expanded=False):
-    if "paper_signals" not in st.session_state:
-        st.session_state.paper_signals = []
-    if st.button("Record current signals", type="secondary"):
-        st.session_state.paper_signals.append({"recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "ticker": market_ticker or "none", "btc": round(price, 2), "outcome_lean": engine["outcome"],
-            "scalp_watch": engine["scalp"], "settled_result": "NOT VERIFIED"})
-        st.session_state.paper_signals = st.session_state.paper_signals[-200:]
-    if st.session_state.paper_signals:
-        st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True)
-        st.download_button("Export paper signals (CSV)", pd.DataFrame(st.session_state.paper_signals).to_csv(index=False),
-                           file_name="btc_kalshi_paper_signals.csv", mime="text/csv")
-    st.caption("Records only signals while this Streamlit session remains active. Outcomes are NOT automatically settled or verified; do not interpret them as backtest accuracy.")
-
-tab1, tab2, tab3 = st.tabs(["🔴 LIVE CHART", "📊 MARKET FLOW", "⚙️ GUIDE"])
+st.caption("Navigate: LIVE CHART for candles and signals · MARKET FLOW for Kalshi liquidity · GUIDE for explanations")
+tab1, tab2, tab3 = st.tabs(["📈 LIVE CHART", "📊 MARKET FLOW", "📖 GUIDE"])
 
 with tab1:
     if market_ticker:
@@ -650,6 +611,48 @@ with tab1:
         st.metric("15m realized volatility", f"{vol15:.3f}%" if pd.notna(vol15) else "—")
         st.dataframe(candles.tail(10).sort_values("time", ascending=False), use_container_width=True, hide_index=True)
 
+    st.markdown("### 🎯 Outcome + ⚡ Scalp intelligence")
+    st.markdown('<div class="section-heading">Dual engine · 15-minute outcome + short-term scalps</div>', unsafe_allow_html=True)
+    pred_col, scalp_col = st.columns(2)
+    with pred_col:
+        st.metric("🎯 Expiration outlook", engine["outcome"])
+        st.caption("Directional lean only; NOT a calibrated probability. Exact settlement depends on Kalshi contract rules and price source.")
+    with scalp_col:
+        st.metric("⚡ Scalping setup", engine["scalp"])
+        st.caption(engine["reason"])
+    with st.expander("🐋 Whale activity · signal evidence", expanded=False):
+        if whale_error:
+            st.warning(f"Exchange trades unavailable: {whale_error}")
+        else:
+            sizes = [usd for _, usd in whale_trades]
+            large = [(side, usd) for side, usd in whale_trades if usd >= 100000]
+            st.write(f"Recent Coinbase trades sampled: **{len(whale_trades)}** · Trades ≥ $100k: **{len(large)}**")
+            st.write("Aggressive trade pressure: **" + (f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"))
+            st.caption("Large exchange trades are a proxy for whale-size activity, not proof of a specific whale wallet.")
+        if chain_error:
+            st.caption(f"Blockchain activity unavailable: {chain_error}")
+        else:
+            st.write(f"Bitcoin mempool: **{chain_count:,} unconfirmed transactions** · **{chain_vsize / 1e6:.2f} MB vsize**")
+            st.caption("Mempool volume is blockchain activity, NOT identified whale transfers or exchange inflows. Wallet attribution is not provided by this public feed.")
+        st.write("Kalshi top-five bid-depth balance: **" + (f"{engine['bid_balance']:+.1%}" if engine['bid_balance'] is not None else "Unavailable") + "**")
+        st.write("YES spread: **" + (f"{engine['spread']:.1f}¢" if engine['spread'] is not None else "Unavailable") + "**")
+        st.caption("Signals use sampled public data, not full historical Kalshi flow. NO automated orders are placed.")
+
+    with st.expander("🧪 Paper signal tracker · session only", expanded=False):
+        if "paper_signals" not in st.session_state:
+            st.session_state.paper_signals = []
+        if st.button("Record current signals", type="secondary"):
+            st.session_state.paper_signals.append({"recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ticker": market_ticker or "none", "btc": round(price, 2), "outcome_lean": engine["outcome"],
+                "scalp_watch": engine["scalp"], "settled_result": "NOT VERIFIED"})
+            st.session_state.paper_signals = st.session_state.paper_signals[-200:]
+        if st.session_state.paper_signals:
+            st.dataframe(pd.DataFrame(st.session_state.paper_signals), hide_index=True, use_container_width=True)
+            st.download_button("Export paper signals (CSV)", pd.DataFrame(st.session_state.paper_signals).to_csv(index=False),
+                               file_name="btc_kalshi_paper_signals.csv", mime="text/csv")
+        st.caption("Records only signals while this Streamlit session remains active. Outcomes are NOT automatically settled or verified; do not interpret them as backtest accuracy.")
+
+
 with tab2:
     if not market_ticker:
         st.warning("No open BTC 15-minute market selected. Check the sidebar.")
@@ -704,6 +707,11 @@ with tab2:
 
 with tab3:
     st.markdown("""
+**How to use this dashboard**
+- **LIVE CHART:** BTC candles, Kalshi quotes, countdown, outcome lean, scalping watch, and whale indicators.
+- **MARKET FLOW:** Kalshi order book, bid depth, and YES/NO spread.
+- **GUIDE:** Explains signals and limitations.
+
 **What this version does**
 - Pulls recent BTC-USD 1-minute candles from Coinbase public market data.
 - Calculates short-term returns, EMA trend and a simple momentum heuristic.
