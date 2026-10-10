@@ -112,11 +112,15 @@ HEADERS = {"User-Agent": "BTC-Kalshi-Scalp-Desk/1.0", "Accept": "application/jso
 # Brier-score improvement.
 LEARNING_COLUMNS = [
     "recorded_utc", "ticker", "checkpoint", "remaining_sec", "strike",
-    "reference_price", "base_prob_above", "adaptive_prob_above",
-    "stat_prob", "analog_prob", "market_prob", "flow_prob", "final60_prob",
-    "momentum", "pressure", "bid_balance", "spread", "candle_outcome_score",
-    "z_distance", "sigma_1m", "venue_count", "dispersion_bps", "disagreement",
-    "outcome_call", "result", "settled_utc", "settlement_value",
+    "reference_price", "base_prob_above", "adaptive_prob_above", "fair_prob_above",
+    "stat_prob", "analog_prob", "market_prob", "flow_prob", "kalshi_flow_prob", "final60_prob",
+    "momentum", "pressure", "flow_pressure_10s", "flow_pressure_30s", "flow_pressure_60s",
+    "flow_persistence", "flow_acceleration", "flow_resilience", "top_trade_pressure", "bid_balance", "spread", "candle_outcome_score",
+    "btc_book_imbalance", "btc_microprice_edge_bps", "btc_book_agreement", "btc_book_impulse",
+    "perp_pressure_30s", "perp_pressure_60s", "perp_oi_change_5m", "perp_basis_bps",
+    "perp_funding_rate", "perp_long_ratio", "kalshi_taker_pressure", "kalshi_price_velocity", "yes_ask", "no_ask",
+    "yes_edge_pp", "no_edge_pp", "z_distance", "sigma_1m", "venue_count",
+    "dispersion_bps", "disagreement", "outcome_call", "result", "settled_utc", "settlement_value",
 ]
 LEARNING_LOCAL_PATH = Path(os.environ.get("KALSHI_LEARNING_PATH", "data/btc_kalshi_learning.csv"))
 LEARNING_GITHUB_PATH = os.environ.get("LEARNING_GITHUB_PATH", "data/btc_kalshi_learning.csv")
@@ -169,9 +173,15 @@ def _normalize_learning_history(df):
     out = out[LEARNING_COLUMNS]
     for col in [
         "remaining_sec", "strike", "reference_price", "base_prob_above", "adaptive_prob_above",
-        "stat_prob", "analog_prob", "market_prob", "flow_prob", "final60_prob", "momentum",
-        "pressure", "bid_balance", "spread", "candle_outcome_score", "z_distance", "sigma_1m",
-        "venue_count", "dispersion_bps", "disagreement", "settlement_value",
+        "fair_prob_above", "stat_prob", "analog_prob", "market_prob", "flow_prob", "kalshi_flow_prob",
+        "final60_prob", "momentum", "pressure", "flow_pressure_10s", "flow_pressure_30s",
+        "flow_pressure_60s", "flow_persistence", "flow_acceleration", "flow_resilience", "top_trade_pressure", "bid_balance", "spread",
+        "candle_outcome_score", "btc_book_imbalance", "btc_microprice_edge_bps", "btc_book_agreement",
+        "btc_book_impulse", "perp_pressure_30s", "perp_pressure_60s", "perp_oi_change_5m",
+        "perp_basis_bps", "perp_funding_rate", "perp_long_ratio", "kalshi_taker_pressure",
+        "kalshi_price_velocity", "yes_ask", "no_ask", "yes_edge_pp",
+        "no_edge_pp", "z_distance", "sigma_1m", "venue_count", "dispersion_bps", "disagreement",
+        "settlement_value",
     ]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     # CSV readers infer all-blank text columns (especially settled_utc) as
@@ -382,13 +392,21 @@ def _atomic_csv(df, path):
 
 MARKET_TAPE_COLUMNS = [
     "recorded_utc", "bucket_5m", "ticker", "remaining_sec", "strike", "reference_price",
-    "coinbase_price", "prob_above", "confidence", "outcome", "market_prob", "flow_prob",
-    "pressure", "bid_balance", "spread", "candle_score", "reversal_score", "reversal_direction",
-    "reversal_status", "reversal_probability", "whale_pressure", "cvd_usd", "cvd_pressure",
-    "venue_agreement", "large_buy_usd", "large_sell_usd", "flow_venues", "brti_venues",
-    "dispersion_bps",
+    "coinbase_price", "prob_above", "fair_prob_above", "confidence", "outcome", "market_prob",
+    "flow_prob", "kalshi_flow_prob", "pressure", "pressure_10s", "pressure_30s", "pressure_60s",
+    "flow_persistence", "flow_acceleration", "flow_resilience", "top_trade_pressure", "bid_balance", "spread", "candle_score",
+    "btc_book_imbalance", "btc_microprice_edge_bps", "btc_book_agreement", "btc_book_impulse",
+    "perp_pressure_30s", "perp_pressure_60s", "perp_oi_change_5m", "perp_basis_bps",
+    "perp_funding_rate", "perp_long_ratio", "kalshi_taker_pressure", "kalshi_price_velocity", "kalshi_trade_count",
+    "yes_ask", "no_ask", "yes_edge_pp", "no_edge_pp", "value_side", "value_signal", "value_score",
+    "reversal_score", "reversal_direction", "reversal_status", "reversal_probability",
+    "whale_pressure", "cvd_usd", "cvd_pressure", "venue_agreement", "large_buy_usd",
+    "large_sell_usd", "flow_venues", "brti_venues", "dispersion_bps",
 ]
-MARKET_TAPE_TEXT = {"recorded_utc", "bucket_5m", "ticker", "outcome", "reversal_direction", "reversal_status"}
+MARKET_TAPE_TEXT = {
+    "recorded_utc", "bucket_5m", "ticker", "outcome", "value_side", "value_signal",
+    "reversal_direction", "reversal_status"
+}
 
 
 def _normalize_market_tape(df):
@@ -442,10 +460,30 @@ def record_market_tape(df, ticker, engine, candle_engine, reversal, flow):
         "recorded_utc": now.isoformat(), "bucket_5m": bucket, "ticker": str(ticker),
         "remaining_sec": engine.get("remaining_sec"), "strike": engine.get("target"),
         "reference_price": engine.get("reference_price"), "coinbase_price": engine.get("coinbase_price"),
-        "prob_above": engine.get("prob_above"), "confidence": engine.get("confidence"), "outcome": engine.get("outcome", ""),
-        "market_prob": engine.get("market_prob"), "flow_prob": engine.get("flow_prob"), "pressure": engine.get("pressure"),
-        "bid_balance": engine.get("bid_balance"), "spread": engine.get("spread"),
-        "candle_score": (candle_engine or {}).get("outcome_score"), "reversal_score": reversal.get("score"),
+        "prob_above": engine.get("prob_above"), "fair_prob_above": engine.get("fair_prob_above"),
+        "confidence": engine.get("confidence"), "outcome": engine.get("outcome", ""),
+        "market_prob": engine.get("market_prob"), "flow_prob": engine.get("flow_prob"),
+        "kalshi_flow_prob": engine.get("kalshi_flow_prob"), "pressure": engine.get("pressure"),
+        "pressure_10s": flow.get("pressure_10s"), "pressure_30s": flow.get("pressure_30s"),
+        "pressure_60s": flow.get("pressure_60s"), "flow_persistence": flow.get("flow_persistence"),
+        "flow_acceleration": flow.get("flow_acceleration"), "flow_resilience": flow.get("flow_resilience"),
+        "top_trade_pressure": flow.get("top_trade_pressure"), "bid_balance": engine.get("bid_balance"),
+        "spread": engine.get("spread"), "candle_score": (candle_engine or {}).get("outcome_score"),
+        "btc_book_imbalance": flow.get("book_imbalance"), "btc_microprice_edge_bps": flow.get("microprice_edge_bps"),
+        "btc_book_agreement": flow.get("book_agreement"), "btc_book_impulse": flow.get("book_impulse"),
+        "perp_pressure_30s": flow.get("perp_pressure_30s"), "perp_pressure_60s": flow.get("perp_pressure_60s"),
+        "perp_oi_change_5m": flow.get("perp_oi_change_5m"), "perp_basis_bps": flow.get("perp_basis_bps"),
+        "perp_funding_rate": flow.get("perp_funding_rate"), "perp_long_ratio": flow.get("perp_long_ratio"),
+        "kalshi_taker_pressure": flow.get("kalshi_taker_pressure"),
+        "kalshi_price_velocity": flow.get("kalshi_price_velocity"), "kalshi_trade_count": flow.get("kalshi_trade_count"),
+        "yes_ask": (engine.get("value_opportunity") or {}).get("yes_ask"),
+        "no_ask": (engine.get("value_opportunity") or {}).get("no_ask"),
+        "yes_edge_pp": (engine.get("value_opportunity") or {}).get("yes_edge_pp"),
+        "no_edge_pp": (engine.get("value_opportunity") or {}).get("no_edge_pp"),
+        "value_side": (engine.get("value_opportunity") or {}).get("side", ""),
+        "value_signal": (engine.get("value_opportunity") or {}).get("signal", ""),
+        "value_score": (engine.get("value_opportunity") or {}).get("score"),
+        "reversal_score": reversal.get("score"),
         "reversal_direction": reversal.get("candidate_direction", reversal.get("direction", "NONE")),
         "reversal_status": reversal.get("status", ""), "reversal_probability": reversal.get("model_probability"),
         "whale_pressure": flow.get("whale_pressure"), "cvd_usd": flow.get("cvd_usd"), "cvd_pressure": flow.get("pressure"),
@@ -462,6 +500,7 @@ REVERSAL_COLUMNS = [
     "recorded_utc", "bucket_2m", "ticker", "direction", "trend", "score", "confirmation_strength",
     "confirmed", "price", "sigma1", "threshold_5m", "historical_prob", "r1", "r2", "r5", "r15",
     "stretch_z", "candle_1m", "candle_5m", "whale_pressure", "cvd_pressure", "venue_agreement",
+    "flow_resilience", "top_trade_pressure", "book_impulse", "perp_pressure", "kalshi_taker_pressure",
     "large_buy_usd", "large_sell_usd", "confirmations", "move_1m", "move_3m", "move_5m", "move_10m",
     "reversed_1m", "reversed_3m", "reversed_5m", "reversed_10m", "labeled_utc",
 ]
@@ -564,6 +603,8 @@ def _reversal_feature_vector(row):
         direction*num("r1"), direction*num("r2"), direction*num("r5"), direction*num("r15"),
         direction*num("candle_1m")/100.0, direction*num("candle_5m")/100.0,
         direction*num("whale_pressure"), direction*num("cvd_pressure"), num("venue_agreement"),
+        direction*num("flow_resilience"), direction*num("top_trade_pressure"),
+        direction*num("book_impulse"), direction*num("perp_pressure"), direction*num("kalshi_taker_pressure"),
         min(np.log1p(num("large_buy_usd")+num("large_sell_usd"))/15.0,1.5),
         num("historical_prob",.5)-.5, abs(num("stretch_z"))/3.0,
     ], dtype=float)
@@ -641,7 +682,10 @@ def record_reversal_snapshot(df, ticker, rev, flow):
         "price":rev.get("price"),"sigma1":sigma,"threshold_5m":threshold,"historical_prob":rev.get("historical_prob"),
         "r1":rev.get("r1"),"r2":rev.get("r2"),"r5":rev.get("r5"),"r15":rev.get("r15"),"stretch_z":rev.get("stretch_z"),
         "candle_1m":rev.get("candle_1m"),"candle_5m":rev.get("candle_5m"),"whale_pressure":flow.get("whale_pressure"),
-        "cvd_pressure":flow.get("pressure"),"venue_agreement":flow.get("venue_agreement"),"large_buy_usd":flow.get("large_buy_usd"),
+        "cvd_pressure":flow.get("pressure"),"venue_agreement":flow.get("venue_agreement"),
+        "flow_resilience":flow.get("flow_resilience"),"top_trade_pressure":flow.get("top_trade_pressure"),
+        "book_impulse":flow.get("book_impulse"),"perp_pressure":rev.get("perp_pressure",flow.get("perp_pressure_30s")),
+        "kalshi_taker_pressure":flow.get("kalshi_taker_pressure"),"large_buy_usd":flow.get("large_buy_usd"),
         "large_sell_usd":flow.get("large_sell_usd"),"confirmations":rev.get("confirmations"),"labeled_utc":"",
     }
     out=pd.concat([out,pd.DataFrame([row])],ignore_index=True)
@@ -665,6 +709,74 @@ def apply_outcome_calibration(prob, remaining_sec, calibration):
     if not info or info.get("n",0)<20: return p,{"active":False,"adjustment_pp":0.0,"n":info.get("n",0) if info else 0,"empirical":info.get("actual") if info else None}
     n=int(info["n"]); empirical=float(info["actual"]); pred=float(info["pred"]); w=min(.35,n/180.0)
     adj=float(np.clip(w*(empirical-pred),-.06,.06)); return float(np.clip(p+adj,.005,.995)),{"active":True,"adjustment_pp":adj*100,"n":n,"empirical":empirical,"bin_pred":pred}
+
+
+def build_fair_value_calibration(history):
+    """Checkpoint-aware calibration for the independent (non-Kalshi) fair probability."""
+    h=_normalize_learning_history(history)
+    r=h[h["result"].isin(["yes","no"]) & h["fair_prob_above"].notna()].copy()
+    if len(r)<20: return {"samples":len(r),"ece":None,"bins":{}}
+    r["y"]=(r["result"]=="yes").astype(float)
+    r["p"]=pd.to_numeric(r["fair_prob_above"],errors="coerce").clip(.001,.999)
+    r=r.dropna(subset=["p"]); r["bin"]=(r["p"]*10).astype(int).clip(0,9)
+    bins={}; total=max(len(r),1); ece=0.0
+    for (cp,b),g in r.groupby(["checkpoint","bin"]):
+        n=len(g); pred=float(g["p"].mean()); actual=float(g["y"].mean())
+        bins[(str(cp),int(b))]={"n":n,"pred":pred,"actual":actual}
+        ece += n/total*abs(pred-actual)
+    return {"samples":len(r),"ece":float(ece),"bins":bins}
+
+
+def apply_fair_value_calibration(prob, remaining_sec, calibration):
+    if prob is None or not calibration:
+        return prob,{"active":False,"adjustment_pp":0.0,"n":0,"empirical":None}
+    p=float(np.clip(prob,.005,.995)); cp=_checkpoint_name(remaining_sec); b=int(np.clip(int(p*10),0,9))
+    info=(calibration.get("bins") or {}).get((cp,b))
+    # Independent fair value is used for mispricing, so demand more evidence than the
+    # display calibration before moving it materially.
+    if not info or info.get("n",0)<25:
+        return p,{"active":False,"adjustment_pp":0.0,"n":info.get("n",0) if info else 0,"empirical":info.get("actual") if info else None}
+    n=int(info["n"]); empirical=float(info["actual"]); pred=float(info["pred"]); w=min(.30,n/220.0)
+    adj=float(np.clip(w*(empirical-pred),-.05,.05))
+    return float(np.clip(p+adj,.005,.995)),{"active":True,"adjustment_pp":adj*100,"n":n,"empirical":empirical,"bin_pred":pred}
+
+
+def cheap_edge_validation(history, ceiling_cents, min_edge_pp):
+    """Out-of-sample-ish scoreboard for first qualifying cheap-edge snapshot per market.
+
+    It does not fit the live model. It answers a practical question: when the independent
+    fair estimate said a low-priced side was underpriced, did that side actually settle?
+    Gross P&L excludes fees/slippage and is reported only as research feedback.
+    """
+    h=_normalize_learning_history(history)
+    r=h[h["result"].isin(["yes","no"]) & h["fair_prob_above"].notna()].copy()
+    if r.empty:
+        return {"markets":0,"hit_rate":None,"avg_pnl_cents":None,"avg_roi_pct":None,"brier":None,"side_counts":{}}
+    rows=[]
+    for _,x in r.iterrows():
+        try:
+            fair=float(x["fair_prob_above"]); ya=float(x["yes_ask"]); na=float(x["no_ask"])
+        except Exception:
+            continue
+        candidates=[]
+        if np.isfinite(ya) and ya <= float(ceiling_cents): candidates.append(("yes",ya,fair,fair*100-ya))
+        if np.isfinite(na) and na <= float(ceiling_cents): candidates.append(("no",na,1-fair,(1-fair)*100-na))
+        if not candidates: continue
+        side,ask,pfair,edge=max(candidates,key=lambda z:z[3])
+        if edge < float(min_edge_pp): continue
+        rows.append({"ticker":str(x["ticker"]),"recorded_utc":str(x["recorded_utc"]),"side":side,"ask":ask,"p":pfair,"result":str(x["result"]).lower()})
+    if not rows:
+        return {"markets":0,"hit_rate":None,"avg_pnl_cents":None,"avg_roi_pct":None,"brier":None,"side_counts":{}}
+    q=pd.DataFrame(rows).sort_values("recorded_utc").drop_duplicates("ticker",keep="first")
+    q["y"]=(q["side"]==q["result"]).astype(float)
+    q["pnl_cents"]=np.where(q["y"]>0,100-q["ask"],-q["ask"])
+    q["roi_pct"]=q["pnl_cents"]/q["ask"].clip(lower=1)*100
+    return {
+        "markets":int(len(q)), "hit_rate":float(q["y"].mean()),
+        "avg_pnl_cents":float(q["pnl_cents"].mean()), "avg_roi_pct":float(q["roi_pct"].mean()),
+        "brier":float(np.mean((q["p"].astype(float)-q["y"].astype(float))**2)),
+        "side_counts":q["side"].value_counts().to_dict(),
+    }
 
 
 def _market_result_payload(ticker):
@@ -783,8 +895,12 @@ def _prob_logit(p):
 
 
 ADAPTIVE_FEATURE_NAMES = [
-    "base_logit", "stat_delta", "analog_delta", "market_delta", "flow_delta", "final_delta",
-    "remaining_frac", "z_distance", "momentum", "pressure", "bid_balance", "candle_score",
+    "base_logit", "stat_delta", "analog_delta", "market_delta", "flow_delta", "kalshi_flow_delta",
+    "final_delta", "remaining_frac", "z_distance", "momentum", "pressure", "flow_10s",
+    "flow_30s", "flow_60s", "flow_persistence", "flow_acceleration", "flow_resilience", "top_trade_pressure", "bid_balance", "candle_score",
+    "btc_book_imbalance", "btc_microprice_edge", "btc_book_agreement", "btc_book_impulse",
+    "perp_pressure_30s", "perp_pressure_60s", "perp_oi_change_5m", "perp_basis",
+    "perp_funding", "perp_long_ratio", "kalshi_taker_pressure", "kalshi_price_velocity",
     "spread_quality", "disagreement", "venue_quality", "dispersion_quality",
 ]
 
@@ -808,12 +924,31 @@ def _adaptive_feature_vector(row):
     disp_q = 0.5 if not np.isfinite(disp) else float(np.clip(1.0-disp/30.0, 0.0, 1.0))
     return np.array([
         _prob_logit(base), delta("stat_prob"), delta("analog_prob"), delta("market_prob"),
-        delta("flow_prob"), delta("final60_prob"), remaining,
+        delta("flow_prob"), delta("kalshi_flow_prob"), delta("final60_prob"), remaining,
         float(np.clip(num("z_distance", 0.0), -4, 4)),
         float(np.clip(num("momentum", 0.0), -4, 4)),
         float(np.clip(num("pressure", 0.0), -1, 1)),
+        float(np.clip(num("flow_pressure_10s", 0.0), -1, 1)),
+        float(np.clip(num("flow_pressure_30s", 0.0), -1, 1)),
+        float(np.clip(num("flow_pressure_60s", 0.0), -1, 1)),
+        float(np.clip(num("flow_persistence", 0.0), -1, 1)),
+        float(np.clip(num("flow_acceleration", 0.0), -2, 2)),
+        float(np.clip(num("flow_resilience", 0.0), -1, 1)),
+        float(np.clip(num("top_trade_pressure", 0.0), -1, 1)),
         float(np.clip(num("bid_balance", 0.0), -1, 1)),
         float(np.clip(num("candle_outcome_score", 0.0)/100.0, -1, 1)),
+        float(np.clip(num("btc_book_imbalance", 0.0), -1, 1)),
+        float(np.clip(num("btc_microprice_edge_bps", 0.0)/8.0, -1.5, 1.5)),
+        float(np.clip(num("btc_book_agreement", 0.0), -1, 1)),
+        float(np.clip(num("btc_book_impulse", 0.0), -2, 2)),
+        float(np.clip(num("perp_pressure_30s", 0.0), -1, 1)),
+        float(np.clip(num("perp_pressure_60s", 0.0), -1, 1)),
+        float(np.clip(num("perp_oi_change_5m", 0.0)/3.0, -1.5, 1.5)),
+        float(np.clip(num("perp_basis_bps", 0.0)/12.0, -1.5, 1.5)),
+        float(np.clip(num("perp_funding_rate", 0.0)*10000.0/5.0, -1.5, 1.5)),
+        float(np.clip((num("perp_long_ratio", .5)-.5)*4.0, -1, 1)),
+        float(np.clip(num("kalshi_taker_pressure", 0.0), -1, 1)),
+        float(np.clip(num("kalshi_price_velocity", 0.0)/12.0, -1.5, 1.5)),
         spread_q, float(np.clip(num("disagreement", .12), 0, .5)),
         float(np.clip(num("venue_count", 0.0)/4.0, 0, 1)), disp_q,
     ], dtype=float)
@@ -965,18 +1100,43 @@ def current_learning_feature_row(engine, candle_engine):
     stat = engine.get("stat") or {}
     proxy = engine.get("brti_proxy") or {}
     final = engine.get("final_minute") or {}
+    flow = engine.get("flow_info") or {}
+    value = engine.get("value_opportunity") or {}
     return {
         "remaining_sec": engine.get("remaining_sec", np.nan),
         "strike": engine.get("target", np.nan),
         "reference_price": engine.get("reference_price", np.nan),
         "base_prob_above": engine.get("base_prob_above", engine.get("prob_above", np.nan)),
         "adaptive_prob_above": engine.get("prob_above", np.nan),
+        "fair_prob_above": engine.get("fair_prob_above", np.nan),
         "stat_prob": cp("statistical"), "analog_prob": cp("historical_analogs"),
         "market_prob": cp("kalshi_market"), "flow_prob": cp("flow_candles"),
+        "kalshi_flow_prob": cp("kalshi_flow"),
         "final60_prob": cp("final_60s_avg") if "final_60s_avg" in comps else final.get("prob", np.nan),
         "momentum": engine.get("momentum", np.nan), "pressure": engine.get("pressure", np.nan),
+        "flow_pressure_10s": flow.get("pressure_10s", np.nan),
+        "flow_pressure_30s": flow.get("pressure_30s", np.nan),
+        "flow_pressure_60s": flow.get("pressure_60s", np.nan),
+        "flow_persistence": flow.get("flow_persistence", np.nan),
+        "flow_acceleration": flow.get("flow_acceleration", np.nan),
+        "flow_resilience": flow.get("flow_resilience", np.nan),
+        "top_trade_pressure": flow.get("top_trade_pressure", np.nan),
         "bid_balance": engine.get("bid_balance", np.nan), "spread": engine.get("spread", np.nan),
         "candle_outcome_score": candle_engine.get("outcome_score", np.nan),
+        "btc_book_imbalance": flow.get("book_imbalance", np.nan),
+        "btc_microprice_edge_bps": flow.get("microprice_edge_bps", np.nan),
+        "btc_book_agreement": flow.get("book_agreement", np.nan),
+        "btc_book_impulse": flow.get("book_impulse", np.nan),
+        "perp_pressure_30s": flow.get("perp_pressure_30s", np.nan),
+        "perp_pressure_60s": flow.get("perp_pressure_60s", np.nan),
+        "perp_oi_change_5m": flow.get("perp_oi_change_5m", np.nan),
+        "perp_basis_bps": flow.get("perp_basis_bps", np.nan),
+        "perp_funding_rate": flow.get("perp_funding_rate", np.nan),
+        "perp_long_ratio": flow.get("perp_long_ratio", np.nan),
+        "kalshi_taker_pressure": flow.get("kalshi_taker_pressure", np.nan),
+        "kalshi_price_velocity": flow.get("kalshi_price_velocity", np.nan),
+        "yes_ask": value.get("yes_ask", np.nan), "no_ask": value.get("no_ask", np.nan),
+        "yes_edge_pp": value.get("yes_edge_pp", np.nan), "no_edge_pp": value.get("no_edge_pp", np.nan),
         "z_distance": stat.get("z_distance", np.nan), "sigma_1m": stat.get("sigma_1m", np.nan),
         "venue_count": proxy.get("count", np.nan), "dispersion_bps": proxy.get("dispersion_bps", np.nan),
         "disagreement": engine.get("disagreement", np.nan),
@@ -1226,7 +1386,14 @@ def empirical_analog_probability(history, current_price, strike, remaining_min):
     feat["ema_gap"] = ema5 / ema15 - 1.0
 
     horizon = int(np.clip(round(float(remaining_min)), 1, 15))
-    future_ret = c.shift(-horizon) / c - 1.0
+    # Kalshi settles on a one-minute average, not an endpoint. Historical 1m Coinbase
+    # bars cannot reproduce 60 BRTI samples, but OHLC4 of the corresponding future
+    # minute is a better settlement proxy than a single future close.
+    o = pd.to_numeric(df["open"], errors="coerce")
+    h = pd.to_numeric(df["high"], errors="coerce")
+    l = pd.to_numeric(df["low"], errors="coerce")
+    settle_proxy = (o + h + l + c) / 4.0
+    future_ret = settle_proxy.shift(-horizon) / c - 1.0
     candidates = feat.iloc[:-horizon].copy()
     candidates["future_ret"] = future_ret.iloc[:-horizon]
     candidates = candidates.dropna()
@@ -1597,12 +1764,15 @@ def parametric_strike_probability(history, current_price, strike, remaining_min)
     # Drift is aggressively shrunk because minute-level BTC drift is noisy.
     ewma_mu = float(lr.ewm(span=20, adjust=False).mean().iloc[-1])
     mu = float(np.clip(ewma_mu * .20, -0.20*sigma, 0.20*sigma))
-    # Kalshi settles on the average BRTI during the final minute. For periods
-    # earlier than that, the average behaves roughly like a price observed near
-    # the midpoint of that final minute rather than the exact expiry tick.
-    h = max(float(remaining_min) - .50, .20)
-    mean = mu * h
-    sigma_h = sigma * math.sqrt(h)
+    # Kalshi settles on the average BRTI during the final minute. Under a diffusion,
+    # the expected average is centered roughly half a minute before expiry, while its
+    # variance is lower than terminal-price variance. Before the final minute, the
+    # Brownian-average variance horizon is approximately T - 2/3 minute.
+    rem = float(remaining_min)
+    mean_h = max(rem - .50, .05)
+    variance_h = max(rem - (2.0/3.0), .08)
+    mean = mu * mean_h
+    sigma_h = sigma * math.sqrt(variance_h)
     threshold = math.log(float(strike) / float(current_price))
     z = (threshold - mean) / max(sigma_h, 1e-9)
     p = 1.0 - _normal_cdf(z)
@@ -2164,11 +2334,19 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Signal controls**")
     min_edge = st.slider("Minimum model edge (percentage points)", 1, 20, 5)
+    cheap_price_ceiling = st.slider(
+        "Cheap-contract ceiling (¢)", 10, 50, 35,
+        help="The early-value detector only calls a side 'cheap' when its buy price is at or below this level.",
+    )
+    cheap_edge_min = st.slider(
+        "Minimum cheap-side fair-value edge (pp)", 5, 30, 10,
+        help="Independent BTC model probability must exceed the contract buy price by at least this many percentage points.",
+    )
     outcome_conf_gate = st.slider(
         "Minimum confidence for ABOVE/BELOW call", 45, 85, 60,
         help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
     )
-    st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
+    st.caption("Low price alone is not a signal. Cheap-side alerts require independent fair-value edge plus flow/structure confirmation. Fees are not included in the displayed gross edge.")
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
 # whole page. This keeps navigation stable and makes frequent refreshes usable on mobile.
@@ -2301,61 +2479,553 @@ def _render_live_dashboard_inner():
 
     @st.cache_data(ttl=2, show_spinner=False)
     def recent_multi_exchange_flow():
-        """Sample public BTC trade tapes from several venues and build a CVD/whale-flow proxy."""
-        cutoff=time.time()-180.0
+        """Cross-venue BTC aggressive trade flow with several event-time horizons.
+
+        The same raw trade tape is summarized over 10/30/60/120 seconds so a sudden
+        burst is not diluted by older prints. Coinbase's documented trade side is
+        the maker side, therefore its aggressor direction is inverted.
+        """
+        now = time.time()
+        cutoff = now - 180.0
+
         def coinbase():
-            r=HTTP.get(f"{COINBASE}/products/BTC-USD/trades",headers=HEADERS,timeout=7); r.raise_for_status(); out=[]
-            for t in r.json() if isinstance(r.json(),list) else []:
+            r = HTTP.get(
+                f"{COINBASE}/products/BTC-USD/trades",
+                params={"limit": 1000}, headers=HEADERS, timeout=7
+            )
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for t in data if isinstance(data, list) else []:
                 try:
-                    ts=pd.to_datetime(t.get("time"),utc=True).timestamp(); usd=float(t["size"])*float(t["price"]); maker=str(t.get("side","")).lower(); side="buy" if maker=="sell" else "sell"
-                    if ts>=cutoff and usd>0: out.append(("Coinbase",side,usd,ts))
-                except Exception: pass
+                    ts = pd.to_datetime(t.get("time"), utc=True).timestamp()
+                    usd = float(t["size"]) * float(t["price"])
+                    maker = str(t.get("side", "")).lower()
+                    side = "buy" if maker == "sell" else "sell"
+                    if ts >= cutoff and usd > 0:
+                        out.append(("Coinbase", side, usd, ts))
+                except Exception:
+                    pass
             return out
+
         def kraken():
-            r=HTTP.get("https://api.kraken.com/0/public/Trades",params={"pair":"XBTUSD"},timeout=7); r.raise_for_status(); body=r.json(); out=[]
-            vals=[v for k,v in (body.get("result") or {}).items() if k!="last"]
+            r = HTTP.get("https://api.kraken.com/0/public/Trades", params={"pair": "XBTUSD"}, timeout=7)
+            r.raise_for_status()
+            body = r.json()
+            out = []
+            vals = [v for k, v in (body.get("result") or {}).items() if k != "last"]
             for t in (vals[0] if vals else []):
                 try:
-                    ts=float(t[2]); usd=float(t[0])*float(t[1]); side="buy" if str(t[3]).lower().startswith("b") else "sell"
-                    if ts>=cutoff and usd>0: out.append(("Kraken",side,usd,ts))
-                except Exception: pass
+                    ts = float(t[2])
+                    usd = float(t[0]) * float(t[1])
+                    side = "buy" if str(t[3]).lower().startswith("b") else "sell"
+                    if ts >= cutoff and usd > 0:
+                        out.append(("Kraken", side, usd, ts))
+                except Exception:
+                    pass
             return out
+
         def bitstamp():
-            r=HTTP.get("https://www.bitstamp.net/api/v2/transactions/btcusd/",params={"time":"minute"},timeout=7); r.raise_for_status(); out=[]
-            for t in r.json() if isinstance(r.json(),list) else []:
+            r = HTTP.get(
+                "https://www.bitstamp.net/api/v2/transactions/btcusd/",
+                params={"time": "minute"}, timeout=7
+            )
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for t in data if isinstance(data, list) else []:
                 try:
-                    ts=float(t.get("date")); usd=float(t.get("price"))*float(t.get("amount")); side="buy" if str(t.get("type"))=="0" else "sell"
-                    if ts>=cutoff and usd>0: out.append(("Bitstamp",side,usd,ts))
-                except Exception: pass
+                    ts = float(t.get("date"))
+                    usd = float(t.get("price")) * float(t.get("amount"))
+                    side = "buy" if str(t.get("type")) == "0" else "sell"
+                    if ts >= cutoff and usd > 0:
+                        out.append(("Bitstamp", side, usd, ts))
+                except Exception:
+                    pass
             return out
+
         def gemini():
-            r=HTTP.get("https://api.gemini.com/v1/trades/btcusd",params={"limit_trades":200},timeout=7); r.raise_for_status(); out=[]
-            for t in r.json() if isinstance(r.json(),list) else []:
+            r = HTTP.get(
+                "https://api.gemini.com/v1/trades/btcusd",
+                params={"limit_trades": 500}, timeout=7
+            )
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for t in data if isinstance(data, list) else []:
                 try:
-                    ts=float(t.get("timestampms",0))/1000.0 if t.get("timestampms") else float(t.get("timestamp",0)); usd=float(t.get("price"))*float(t.get("amount")); side=str(t.get("type","")).lower()
-                    if ts>=cutoff and usd>0 and side in ("buy","sell"): out.append(("Gemini",side,usd,ts))
-                except Exception: pass
+                    ts = float(t.get("timestampms", 0)) / 1000.0 if t.get("timestampms") else float(t.get("timestamp", 0))
+                    usd = float(t.get("price")) * float(t.get("amount"))
+                    side = str(t.get("type", "")).lower()
+                    if ts >= cutoff and usd > 0 and side in ("buy", "sell"):
+                        out.append(("Gemini", side, usd, ts))
+                except Exception:
+                    pass
             return out
-        rows=[]; errors=[]
-        funcs={"Coinbase":coinbase,"Kraken":kraken,"Bitstamp":bitstamp,"Gemini":gemini}
+
+        rows, errors = [], []
+        funcs = {"Coinbase": coinbase, "Kraken": kraken, "Bitstamp": bitstamp, "Gemini": gemini}
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures={pool.submit(fn):name for name,fn in funcs.items()}
-            for fut,name in [(f,n) for f,n in futures.items()]:
-                try: rows.extend(fut.result())
-                except Exception as exc: errors.append(f"{name}:{type(exc).__name__}")
+            futures = {pool.submit(fn): name for name, fn in funcs.items()}
+            for fut, name in futures.items():
+                try:
+                    rows.extend(fut.result())
+                except Exception as exc:
+                    errors.append(f"{name}:{type(exc).__name__}")
+
+        def summarize(window_sec, end_offset=0.0):
+            end_ts = now - float(end_offset)
+            start_ts = end_ts - float(window_sec)
+            rr = [x for x in rows if start_ts <= x[3] <= end_ts]
+            buy = sum(x[2] for x in rr if x[1] == "buy")
+            sell = sum(x[2] for x in rr if x[1] == "sell")
+            total = buy + sell
+            pressure = (buy - sell) / total if total else 0.0
+            large_buy = sum(x[2] for x in rr if x[1] == "buy" and x[2] >= 100000)
+            large_sell = sum(x[2] for x in rr if x[1] == "sell" and x[2] >= 100000)
+            return {
+                "pressure": float(pressure), "buy": float(buy), "sell": float(sell),
+                "total": float(total), "large_buy": float(large_buy), "large_sell": float(large_sell),
+                "count": len(rr), "usd_per_sec": float(total / max(float(window_sec), 1.0)),
+            }
+
         if not rows:
-            return {"trades":[],"legacy_trades":[],"pressure":None,"cvd_usd":0.0,"whale_pressure":None,"large_buy_usd":0.0,"large_sell_usd":0.0,"venue_agreement":0.0,"venue_count":0,"errors":errors}
-        buy=sum(x[2] for x in rows if x[1]=="buy"); sell=sum(x[2] for x in rows if x[1]=="sell"); total=buy+sell; pressure=(buy-sell)/total if total else 0.0
-        lb=sum(x[2] for x in rows if x[1]=="buy" and x[2]>=100000); ls=sum(x[2] for x in rows if x[1]=="sell" and x[2]>=100000); lt=lb+ls
-        whale=(lb-ls)/lt if lt else pressure
-        vp={}
+            return {
+                "trades": [], "legacy_trades": [], "pressure": None, "cvd_usd": 0.0,
+                "whale_pressure": None, "large_buy_usd": 0.0, "large_sell_usd": 0.0,
+                "venue_agreement": 0.0, "venue_count": 0, "venue_pressure": {},
+                "pressure_10s": 0.0, "pressure_30s": 0.0, "pressure_60s": 0.0,
+                "pressure_120s": 0.0, "flow_persistence": 0.0, "flow_acceleration": 0.0,
+                "trade_intensity_accel": 0.0, "toxicity_proxy": 0.0, "top_trade_pressure": 0.0,
+                "dynamic_large_threshold": 100000.0, "whale_cluster_count": 0, "errors": errors,
+            }
+
+        w10, w30, w60, w120 = summarize(10), summarize(30), summarize(60), summarize(120)
+        prev30 = summarize(30, end_offset=30)
+        # Prefer the last minute for directional pressure while retaining enough prints
+        # to reduce single-trade noise.
+        pressure = float(np.clip(.48*w30["pressure"] + .32*w60["pressure"] + .20*w120["pressure"], -1, 1))
+        cvd = float(w120["buy"] - w120["sell"])
+        lb, ls = w120["large_buy"], w120["large_sell"]
+        lt = lb + ls
+        whale = float((lb-ls)/lt) if lt else pressure
+        rows60 = [x for x in rows if x[3] >= now-60]
+        notionals = np.array([x[2] for x in rows60], dtype=float) if rows60 else np.array([], dtype=float)
+        dynamic_large_threshold = float(max(100000.0, np.quantile(notionals, .92))) if len(notionals) >= 12 else 100000.0
+        clusters = [x for x in rows60 if x[2] >= dynamic_large_threshold]
+        cbuy = sum(x[2] for x in clusters if x[1] == "buy")
+        csell = sum(x[2] for x in clusters if x[1] == "sell")
+        top_trade_pressure = float((cbuy-csell)/(cbuy+csell)) if cbuy+csell else 0.0
+
+        venue_pressure = {}
         for venue in {x[0] for x in rows}:
-            b=sum(x[2] for x in rows if x[0]==venue and x[1]=="buy"); ss=sum(x[2] for x in rows if x[0]==venue and x[1]=="sell"); vp[venue]=(b-ss)/(b+ss) if b+ss else 0.0
-        sign=1 if pressure>.04 else -1 if pressure<-.04 else 0
-        active=[v for v in vp.values() if abs(v)>.04]
-        agree=(sum(1 for v in active if (1 if v>0 else -1)==sign)/len(active)) if active and sign else 0.0
-        legacy=[(side,usd) for _,side,usd,_ in rows]
-        return {"trades":rows,"legacy_trades":legacy,"pressure":float(pressure),"cvd_usd":float(buy-sell),"whale_pressure":float(whale),"large_buy_usd":float(lb),"large_sell_usd":float(ls),"venue_agreement":float(agree),"venue_count":len(vp),"venue_pressure":vp,"errors":errors}
+            vr = [x for x in rows if x[0] == venue and x[3] >= now-60]
+            b = sum(x[2] for x in vr if x[1] == "buy")
+            s = sum(x[2] for x in vr if x[1] == "sell")
+            venue_pressure[venue] = (b-s)/(b+s) if b+s else 0.0
+        sign = 1 if pressure > .04 else -1 if pressure < -.04 else 0
+        active = [v for v in venue_pressure.values() if abs(v) > .04]
+        agree = (sum(1 for v in active if (1 if v > 0 else -1) == sign)/len(active)) if active and sign else 0.0
+
+        flow_persistence = float(np.clip(
+            .35*w10["pressure"] + .30*w30["pressure"] + .22*w60["pressure"] + .13*w120["pressure"], -1, 1
+        ))
+        flow_acceleration = float(np.clip(w30["pressure"] - prev30["pressure"], -2, 2))
+        intensity_accel = float(np.clip(
+            math.log((w30["usd_per_sec"] + 1.0)/(prev30["usd_per_sec"] + 1.0)), -3, 3
+        ))
+        # VPIN-style imbalance proxy. It is treated as a risk/intensity feature, not
+        # as a standalone directional predictor because the literature is mixed.
+        toxicity = float(np.clip(
+            .45*abs(w30["pressure"]) + .35*abs(w60["pressure"]) + .20*abs(w120["pressure"]), 0, 1
+        ))
+        legacy = [(side, usd) for _, side, usd, _ in rows]
+        return {
+            "trades": rows, "legacy_trades": legacy,
+            "pressure": pressure, "cvd_usd": cvd, "whale_pressure": whale,
+            "large_buy_usd": float(lb), "large_sell_usd": float(ls),
+            "venue_agreement": float(agree), "venue_count": len(venue_pressure),
+            "venue_pressure": venue_pressure, "pressure_10s": w10["pressure"],
+            "pressure_30s": w30["pressure"], "pressure_60s": w60["pressure"],
+            "pressure_120s": w120["pressure"], "flow_persistence": flow_persistence,
+            "flow_acceleration": flow_acceleration, "trade_intensity_accel": intensity_accel,
+            "toxicity_proxy": toxicity, "top_trade_pressure": top_trade_pressure,
+            "dynamic_large_threshold": dynamic_large_threshold, "whale_cluster_count": len(clusters),
+            "trade_count_60s": w60["count"], "notional_60s": w60["total"], "errors": errors,
+        }
+
+
+    @st.cache_data(ttl=2, show_spinner=False)
+    def multi_exchange_orderbook_context():
+        """Top-of-book / depth imbalance and microprice across major BTC-USD venues."""
+        def stats(name, bids, asks):
+            try:
+                bids = [(float(p), float(q)) for p, q, *rest in bids[:10] if float(p) > 0 and float(q) > 0]
+                asks = [(float(p), float(q)) for p, q, *rest in asks[:10] if float(p) > 0 and float(q) > 0]
+            except Exception:
+                return None
+            if not bids or not asks:
+                return None
+            bid, bq = bids[0]
+            ask, aq = asks[0]
+            if ask <= bid:
+                return None
+            mid = (bid + ask)/2.0
+            bid_usd = sum(p*q for p, q in bids[:5])
+            ask_usd = sum(p*q for p, q in asks[:5])
+            imbalance = (bid_usd-ask_usd)/(bid_usd+ask_usd) if bid_usd+ask_usd else 0.0
+            top_imb = (bid*bq-ask*aq)/(bid*bq+ask*aq) if bid*bq+ask*aq else 0.0
+            micro = (ask*bq + bid*aq)/(bq+aq) if bq+aq else mid
+            edge_bps = (micro/mid-1.0)*10000.0
+            return {
+                "venue": name, "mid": mid, "spread_bps": (ask-bid)/mid*10000.0,
+                "imbalance": float(imbalance), "top_imbalance": float(top_imb),
+                "microprice": float(micro), "microprice_edge_bps": float(edge_bps),
+                "depth_usd": float(bid_usd+ask_usd),
+            }
+
+        def cb():
+            r = HTTP.get(f"{COINBASE}/products/BTC-USD/book", params={"level": 2}, headers=HEADERS, timeout=6)
+            r.raise_for_status()
+            j = r.json()
+            return stats("Coinbase", j.get("bids") or [], j.get("asks") or [])
+
+        def kr():
+            r = HTTP.get("https://api.kraken.com/0/public/Depth", params={"pair": "XBTUSD", "count": 10}, timeout=6)
+            r.raise_for_status()
+            j = r.json()
+            row = next(iter((j.get("result") or {}).values()), {})
+            return stats("Kraken", row.get("bids") or [], row.get("asks") or [])
+
+        def bs():
+            r = HTTP.get("https://www.bitstamp.net/api/v2/order_book/btcusd/", timeout=6)
+            r.raise_for_status()
+            j = r.json()
+            return stats("Bitstamp", j.get("bids") or [], j.get("asks") or [])
+
+        def gm():
+            r = HTTP.get(
+                "https://api.gemini.com/v1/book/btcusd",
+                params={"limit_bids": 10, "limit_asks": 10}, timeout=6
+            )
+            r.raise_for_status()
+            j = r.json()
+            bids = [(x.get("price"), x.get("amount")) for x in j.get("bids", [])]
+            asks = [(x.get("price"), x.get("amount")) for x in j.get("asks", [])]
+            return stats("Gemini", bids, asks)
+
+        rows, errors = [], []
+        funcs = {"Coinbase": cb, "Kraken": kr, "Bitstamp": bs, "Gemini": gm}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fn): name for name, fn in funcs.items()}
+            for fut, name in futures.items():
+                try:
+                    row = fut.result()
+                    if row:
+                        rows.append(row)
+                except Exception as exc:
+                    errors.append(f"{name}:{type(exc).__name__}")
+        if not rows:
+            return {
+                "book_imbalance": 0.0, "microprice_edge_bps": 0.0, "book_agreement": 0.0,
+                "book_venue_count": 0, "book_venues": {}, "book_errors": errors,
+            }
+
+        # Robust medians prevent a single thin/outlier venue from dominating.
+        imb = float(np.median([x["imbalance"] for x in rows]))
+        micro_edge = float(np.median([x["microprice_edge_bps"] for x in rows]))
+        desired_sign = 1 if micro_edge > .10 else -1 if micro_edge < -.10 else 0
+        active = [x for x in rows if abs(x["microprice_edge_bps"]) > .10]
+        agreement = (
+            sum(1 for x in active if (1 if x["microprice_edge_bps"] > 0 else -1) == desired_sign)/len(active)
+            if active and desired_sign else 0.0
+        )
+        return {
+            "book_imbalance": imb, "microprice_edge_bps": micro_edge,
+            "book_agreement": float(agreement), "book_venue_count": len(rows),
+            "book_venues": {x["venue"]: x for x in rows}, "book_errors": errors,
+        }
+
+
+    def update_btc_book_dynamics(book_context):
+        """Track composite BTC book pressure across refreshes.
+
+        This is a snapshot-delta impulse proxy, not true exchange message-by-message OFI.
+        It asks whether depth imbalance, microprice and composite mid are moving together.
+        """
+        neutral = {
+            "book_impulse": 0.0, "book_mid_velocity_bps_10s": 0.0,
+            "book_mid_velocity_bps_30s": 0.0, "book_imbalance_delta_10s": 0.0,
+            "microprice_delta_bps_10s": 0.0, "book_dynamic_samples": 0,
+        }
+        if not isinstance(book_context, dict) or not book_context.get("book_venues"):
+            return neutral
+        venues = book_context.get("book_venues") or {}
+        mids = [float(v.get("mid")) for v in venues.values() if v.get("mid") is not None and np.isfinite(v.get("mid"))]
+        if not mids:
+            return neutral
+        mid = float(np.median(mids))
+        imb = float(book_context.get("book_imbalance", 0.0) or 0.0)
+        micro = float(book_context.get("microprice_edge_bps", 0.0) or 0.0)
+        now = time.time()
+        key = "btc_composite_book_tape"
+        tape = list(st.session_state.get(key, []))
+        tape.append((now, mid, imb, micro))
+        tape = [x for x in tape if now-float(x[0]) <= 120]
+        st.session_state[key] = tape[-100:]
+
+        def anchor_for(sec):
+            old = [x for x in tape if x[0] <= now-sec]
+            return old[-1] if old else tape[0]
+
+        a10, a30 = anchor_for(10), anchor_for(30)
+        dt10, dt30 = max(now-float(a10[0]), 1.0), max(now-float(a30[0]), 1.0)
+        vel10 = ((mid/float(a10[1]))-1.0)*10000.0*(10.0/dt10) if a10[1] else 0.0
+        vel30 = ((mid/float(a30[1]))-1.0)*10000.0*(30.0/dt30) if a30[1] else 0.0
+        imb_delta = imb-float(a10[2])
+        micro_delta = micro-float(a10[3])
+        # Bounded directional impulse: current queues + their change + price response.
+        impulse = (
+            .34*np.tanh(imb*1.7) + .22*np.tanh(imb_delta*2.2) +
+            .22*np.tanh(micro/1.8) + .12*np.tanh(micro_delta/1.8) +
+            .10*np.tanh(vel10/2.5)
+        )
+        return {
+            "book_impulse": float(np.clip(impulse, -1, 1)),
+            "book_mid_velocity_bps_10s": float(np.clip(vel10, -25, 25)),
+            "book_mid_velocity_bps_30s": float(np.clip(vel30, -50, 50)),
+            "book_imbalance_delta_10s": float(np.clip(imb_delta, -2, 2)),
+            "microprice_delta_bps_10s": float(np.clip(micro_delta, -20, 20)),
+            "book_dynamic_samples": len(tape),
+        }
+
+
+    @st.cache_data(ttl=3, show_spinner=False)
+    def derivatives_flow_context():
+        """Optional BTC perpetual-futures context from Bybit public market data.
+
+        Perpetual taker flow is directional. Open interest, basis, funding and long/short
+        positioning are treated as context/crowding features rather than standalone calls.
+        Any failure returns neutral data so derivatives cannot take down the dashboard.
+        """
+        neutral = {
+            "perp_pressure_10s": 0.0, "perp_pressure_30s": 0.0, "perp_pressure_60s": 0.0,
+            "perp_trade_count_60s": 0, "perp_notional_60s": 0.0,
+            "perp_large_buy_usd": 0.0, "perp_large_sell_usd": 0.0,
+            "perp_oi": np.nan, "perp_oi_change_5m": 0.0, "perp_basis_bps": 0.0,
+            "perp_funding_rate": 0.0, "perp_long_ratio": .5, "perp_position_skew": 0.0,
+            "perp_mark": np.nan, "perp_index": np.nan, "derivatives_ok": False,
+            "derivatives_errors": [],
+        }
+        base = "https://api.bybit.com"
+        now = time.time()
+        errors = []
+
+        def get_trades():
+            r = HTTP.get(f"{base}/v5/market/recent-trade", params={
+                "category":"linear", "symbol":"BTCUSDT", "limit":1000
+            }, timeout=7)
+            r.raise_for_status()
+            body = r.json()
+            if int(body.get("retCode", -1)) != 0:
+                raise ValueError(body.get("retMsg", "Bybit trade error"))
+            rows=[]
+            for t in (body.get("result") or {}).get("list", []):
+                try:
+                    ts=float(t.get("time",0))/1000.0
+                    px=float(t.get("price",0)); size=float(t.get("size",0))
+                    side=str(t.get("side","")).lower()
+                    usd=px*size
+                    if ts >= now-120 and usd>0 and side in ("buy","sell"):
+                        rows.append((side,usd,ts))
+                except Exception:
+                    pass
+            return rows
+
+        def get_ticker():
+            r=HTTP.get(f"{base}/v5/market/tickers", params={"category":"linear","symbol":"BTCUSDT"}, timeout=7)
+            r.raise_for_status(); body=r.json()
+            if int(body.get("retCode", -1)) != 0: raise ValueError(body.get("retMsg","Bybit ticker error"))
+            rows=(body.get("result") or {}).get("list", [])
+            return rows[0] if rows else {}
+
+        def get_oi():
+            r=HTTP.get(f"{base}/v5/market/open-interest", params={
+                "category":"linear","symbol":"BTCUSDT","intervalTime":"5min","limit":3
+            }, timeout=7)
+            r.raise_for_status(); body=r.json()
+            if int(body.get("retCode", -1)) != 0: raise ValueError(body.get("retMsg","Bybit OI error"))
+            return (body.get("result") or {}).get("list", [])
+
+        def get_ratio():
+            r=HTTP.get(f"{base}/v5/market/account-ratio", params={
+                "category":"linear","symbol":"BTCUSDT","period":"5min","limit":2
+            }, timeout=7)
+            r.raise_for_status(); body=r.json()
+            if int(body.get("retCode", -1)) != 0: raise ValueError(body.get("retMsg","Bybit ratio error"))
+            return (body.get("result") or {}).get("list", [])
+
+        results={}
+        funcs={"trades":get_trades,"ticker":get_ticker,"oi":get_oi,"ratio":get_ratio}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs={pool.submit(fn):name for name,fn in funcs.items()}
+            for fut,name in futs.items():
+                try: results[name]=fut.result()
+                except Exception as exc: errors.append(f"{name}:{type(exc).__name__}")
+
+        trades=results.get("trades",[])
+        def pressure(sec):
+            rr=[x for x in trades if x[2] >= now-sec]
+            b=sum(x[1] for x in rr if x[0]=="buy"); se=sum(x[1] for x in rr if x[0]=="sell")
+            return ((b-se)/(b+se) if b+se else 0.0), rr
+        p10,_=pressure(10); p30,_=pressure(30); p60,r60=pressure(60)
+        lb=sum(x[1] for x in r60 if x[0]=="buy" and x[1]>=250000)
+        ls=sum(x[1] for x in r60 if x[0]=="sell" and x[1]>=250000)
+
+        ticker=results.get("ticker") or {}
+        def fnum(x, default=np.nan):
+            try:
+                v=float(x); return v if np.isfinite(v) else default
+            except Exception: return default
+        mark=fnum(ticker.get("markPrice")); index=fnum(ticker.get("indexPrice")); oi_now=fnum(ticker.get("openInterest"))
+        funding=fnum(ticker.get("fundingRate"),0.0)
+        basis=((mark/index)-1.0)*10000.0 if np.isfinite(mark) and np.isfinite(index) and index else 0.0
+
+        oi_rows=[]
+        for x in results.get("oi",[]) or []:
+            try: oi_rows.append((int(x.get("timestamp",0)),float(x.get("openInterest",0))))
+            except Exception: pass
+        oi_rows=sorted(oi_rows)
+        oi_change=0.0
+        if len(oi_rows)>=2 and oi_rows[-2][1]>0:
+            oi_change=(oi_rows[-1][1]/oi_rows[-2][1]-1.0)*100.0
+        elif np.isfinite(oi_now) and oi_rows and oi_rows[-1][1]>0:
+            oi_change=(oi_now/oi_rows[-1][1]-1.0)*100.0
+
+        ratio_rows=[]
+        for x in results.get("ratio",[]) or []:
+            try: ratio_rows.append((int(x.get("timestamp",0)),float(x.get("buyRatio",.5)),float(x.get("sellRatio",.5))))
+            except Exception: pass
+        ratio_rows=sorted(ratio_rows)
+        long_ratio=ratio_rows[-1][1] if ratio_rows else .5
+        pos_skew=float(np.clip((long_ratio-.5)*2.0,-1,1))
+
+        out=dict(neutral)
+        out.update({
+            "perp_pressure_10s":float(np.clip(p10,-1,1)), "perp_pressure_30s":float(np.clip(p30,-1,1)),
+            "perp_pressure_60s":float(np.clip(p60,-1,1)), "perp_trade_count_60s":len(r60),
+            "perp_notional_60s":float(sum(x[1] for x in r60)), "perp_large_buy_usd":float(lb),
+            "perp_large_sell_usd":float(ls), "perp_oi":oi_now, "perp_oi_change_5m":float(np.clip(oi_change,-20,20)),
+            "perp_basis_bps":float(np.clip(basis,-100,100)), "perp_funding_rate":float(np.clip(funding,-.01,.01)),
+            "perp_long_ratio":float(np.clip(long_ratio,0,1)), "perp_position_skew":pos_skew,
+            "perp_mark":mark, "perp_index":index, "derivatives_ok":bool(trades or ticker or oi_rows),
+            "derivatives_errors":errors,
+        })
+        return out
+
+
+    @st.cache_data(ttl=2, show_spinner=False)
+    def recent_kalshi_trades(ticker):
+        """Public Kalshi trade flow for the active contract."""
+        if not ticker:
+            return {
+                "kalshi_taker_pressure": 0.0, "kalshi_price_velocity": 0.0,
+                "kalshi_trade_count": 0, "kalshi_block_contracts": 0.0,
+                "kalshi_pressure_30s": 0.0, "kalshi_pressure_60s": 0.0,
+            }
+        now = time.time()
+        r = HTTP.get(
+            f"{KALSHI}/markets/trades",
+            params={"ticker": ticker, "limit": 500, "min_ts": int(now-180)},
+            headers=HEADERS, timeout=8
+        )
+        r.raise_for_status()
+        data = r.json()
+        trades = []
+        for t in data.get("trades", []) if isinstance(data, dict) else []:
+            try:
+                ts = pd.to_datetime(t.get("created_time"), utc=True).timestamp()
+                side = str(t.get("taker_outcome_side") or t.get("taker_side") or "").lower()
+                count = float(t.get("count_fp", t.get("count", 0)))
+                yp = t.get("yes_price_dollars")
+                yes_cents = float(yp)*100 if yp not in (None, "") else np.nan
+                if side in ("yes", "no") and count > 0 and ts >= now-180:
+                    trades.append((side, count, ts, yes_cents, bool(t.get("is_block_trade", False))))
+            except Exception:
+                pass
+
+        def pressure_window(sec):
+            rr = [x for x in trades if x[2] >= now-sec]
+            y = sum(x[1] for x in rr if x[0] == "yes")
+            n = sum(x[1] for x in rr if x[0] == "no")
+            return (y-n)/(y+n) if y+n else 0.0, rr
+
+        p30, rr30 = pressure_window(30)
+        p60, rr60 = pressure_window(60)
+        p180, rr180 = pressure_window(180)
+        taker_pressure = float(np.clip(.55*p30 + .30*p60 + .15*p180, -1, 1))
+
+        valid_prices = sorted([(x[2], x[3]) for x in trades if np.isfinite(x[3])])
+        velocity = 0.0
+        if len(valid_prices) >= 2:
+            latest_t, latest_p = valid_prices[-1]
+            old = [x for x in valid_prices if x[0] <= latest_t-30]
+            anchor_t, anchor_p = old[-1] if old else valid_prices[0]
+            dt = max(latest_t-anchor_t, 1.0)
+            velocity = float(np.clip((latest_p-anchor_p)/dt*60.0, -50, 50))
+
+        block_contracts = sum(x[1] for x in rr180 if x[4])
+        return {
+            "kalshi_taker_pressure": taker_pressure, "kalshi_price_velocity": velocity,
+            "kalshi_trade_count": len(rr180), "kalshi_block_contracts": float(block_contracts),
+            "kalshi_pressure_30s": float(p30), "kalshi_pressure_60s": float(p60),
+        }
+
+
+    def update_kalshi_quote_dynamics(ticker, snapshot):
+        """Track live Kalshi quote/depth changes across Streamlit refreshes."""
+        neutral = {
+            "kalshi_quote_velocity": 0.0, "kalshi_balance_delta": 0.0,
+            "kalshi_spread_delta": 0.0, "kalshi_quote_samples": 0,
+        }
+        if not ticker or not snapshot:
+            return neutral
+        yb, ya = snapshot.get("yes_bid"), snapshot.get("yes_ask")
+        if yb is None and ya is None:
+            return neutral
+        if yb is not None and ya is not None:
+            mid = (float(yb)+float(ya))/2.0
+            spread = float(ya)-float(yb)
+        else:
+            mid = float(ya if ya is not None else yb)
+            spread = np.nan
+        yd = sum(q for _, q in (snapshot.get("yes") or [])[:5])
+        nd = sum(q for _, q in (snapshot.get("no") or [])[:5])
+        bal = (yd-nd)/(yd+nd) if yd+nd else 0.0
+        now = time.time()
+        key = f"kalshi_quote_tape::{ticker}"
+        tape = list(st.session_state.get(key, []))
+        tape.append((now, mid, bal, spread))
+        tape = [x for x in tape if now-float(x[0]) <= 180]
+        st.session_state[key] = tape[-100:]
+
+        anchor = tape[0]
+        candidates = [x for x in tape if x[0] <= now-30]
+        if candidates:
+            anchor = candidates[-1]
+        dt = max(now-float(anchor[0]), 1.0)
+        velocity = (mid-float(anchor[1]))/dt*60.0
+        bal_delta = bal-float(anchor[2])
+        spread_delta = 0.0
+        if np.isfinite(spread) and np.isfinite(float(anchor[3])):
+            spread_delta = spread-float(anchor[3])
+        return {
+            "kalshi_quote_velocity": float(np.clip(velocity, -50, 50)),
+            "kalshi_balance_delta": float(np.clip(bal_delta, -2, 2)),
+            "kalshi_spread_delta": float(np.clip(spread_delta, -20, 20)),
+            "kalshi_quote_samples": len(tape),
+        }
+
 
     @st.cache_data(ttl=15, show_spinner=False)
     def blockchain_activity():
@@ -2365,7 +3035,117 @@ def _render_live_dashboard_inner():
         data = r.json()
         return int(data.get("count", 0)), int(data.get("vsize", 0))
 
-    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples, adaptive_learner, flow_info=None, outcome_calibration=None):
+    def evaluate_cheap_value(snapshot, fair_prob_above, final_prob_above, confidence, flow_info, remaining_sec):
+        """Find low-priced contracts whose independent BTC fair value is materially higher.
+
+        This deliberately does not treat a low Kalshi price as evidence by itself.
+        The edge is computed against an independent BTC model that excludes the
+        Kalshi market-price component, then requires flow/structure confirmation.
+        Displayed edge is gross/pre-fee.
+        """
+        neutral = {
+            "signal": "NO CHEAP EDGE", "side": "NONE", "score": 0.0,
+            "yes_ask": None, "no_ask": None, "yes_edge_pp": None, "no_edge_pp": None,
+            "fair_side_prob": None, "combined_side_prob": None, "buy_price": None,
+            "gross_roi_pct": None, "support_count": 0, "support_score": 0.0,
+            "side_spread": None, "execution_quality": 0.0, "reasons": [], "pre_fee": True,
+        }
+        if not snapshot or fair_prob_above is None or not np.isfinite(fair_prob_above):
+            return neutral
+        ya, na = snapshot.get("yes_ask"), snapshot.get("no_ask")
+        if ya is None or na is None:
+            return neutral
+        ya, na = float(ya), float(na)
+        fair_yes = float(np.clip(fair_prob_above, .001, .999))
+        fair_no = 1.0-fair_yes
+        yes_edge = fair_yes*100.0-ya
+        no_edge = fair_no*100.0-na
+        neutral.update({"yes_ask": ya, "no_ask": na, "yes_edge_pp": yes_edge, "no_edge_pp": no_edge})
+
+        candidates = []
+        if ya <= float(cheap_price_ceiling):
+            candidates.append(("YES", ya, fair_yes, yes_edge))
+        if na <= float(cheap_price_ceiling):
+            candidates.append(("NO", na, fair_no, no_edge))
+        if not candidates:
+            return neutral
+        side, buy_price, fair_side, edge_pp = max(candidates, key=lambda x: x[3])
+        if edge_pp < float(cheap_edge_min):
+            return neutral
+        side_bid = snapshot.get("yes_bid") if side == "YES" else snapshot.get("no_bid")
+        side_spread = float(buy_price-float(side_bid)) if side_bid is not None else np.nan
+        execution_quality = .45 if not np.isfinite(side_spread) else float(np.clip(1.0-side_spread/12.0, .10, 1.0))
+
+        ds = 1.0 if side == "YES" else -1.0
+        fi = flow_info or {}
+        perp_dir = .60*float(fi.get("perp_pressure_30s", 0.0) or 0.0) + .40*float(fi.get("perp_pressure_60s", 0.0) or 0.0)
+        oi_change = float(fi.get("perp_oi_change_5m", 0.0) or 0.0)
+        oi_confirm = np.sign(perp_dir) * min(abs(oi_change)/2.0, 1.0) if abs(perp_dir) > .05 and oi_change > 0 else 0.0
+        evidence = [
+            ("30s BTC taker flow", ds*float(fi.get("pressure_30s", 0.0) or 0.0), .10),
+            ("60s BTC taker flow", ds*float(fi.get("pressure_60s", 0.0) or 0.0), .08),
+            ("flow/price resilience", ds*float(fi.get("flow_resilience", 0.0) or 0.0), .08),
+            ("largest-trade cluster", ds*float(fi.get("top_trade_pressure", 0.0) or 0.0), .10),
+            ("BTC book imbalance", ds*float(fi.get("book_imbalance", 0.0) or 0.0), .08),
+            ("BTC book impulse", ds*float(fi.get("book_impulse", 0.0) or 0.0), .08),
+            ("BTC microprice", ds*float(np.tanh(float(fi.get("microprice_edge_bps", 0.0) or 0.0)/2.0)), .10),
+            ("perpetual taker flow", ds*float(np.clip(perp_dir, -1, 1)), .10),
+            ("perpetual OI buildup", ds*float(oi_confirm), .12),
+            ("Kalshi taker flow", ds*float(fi.get("kalshi_taker_pressure", 0.0) or 0.0), .10),
+            ("Kalshi quote momentum", ds*float(np.tanh(float(fi.get("kalshi_price_velocity", 0.0) or 0.0)/7.0)), .10),
+        ]
+        support = [name for name, val, threshold in evidence if val >= threshold]
+        opposition = [name for name, val, threshold in evidence if val <= -max(threshold, .12)]
+        support_score = float(np.clip(np.mean([max(-1.0, min(1.0, val)) for _, val, _ in evidence]) if evidence else 0.0, -1, 1))
+        support_count = len(support)
+
+        combined_side = None
+        if final_prob_above is not None and np.isfinite(final_prob_above):
+            combined_side = float(final_prob_above if side == "YES" else 1.0-final_prob_above)
+
+        ask_prob = max(buy_price/100.0, .001)
+        gross_roi = ((fair_side-ask_prob)/ask_prob)*100.0
+        # Score rewards genuine probability edge and independent confirmation.
+        edge_strength = float(np.clip(edge_pp/25.0, 0.0, 1.0))
+        prob_strength = float(np.clip((fair_side-.35)/.45, 0.0, 1.0))
+        conf_strength = float(np.clip((float(confidence)-45.0)/40.0, 0.0, 1.0))
+        flow_strength = float(np.clip((support_score+1.0)/2.0, 0.0, 1.0))
+        score = 100.0*(.34*edge_strength + .23*prob_strength + .18*conf_strength + .15*flow_strength + .10*execution_quality)
+
+        signal = f"CHEAP {side} · WATCH"
+        # "EARLY EDGE" is reserved for cases where the independent model itself
+        # thinks the cheap side is more likely than not, not merely positive EV.
+        if fair_side >= .68 and edge_pp >= max(float(cheap_edge_min), 15.0) and confidence >= 65 and support_count >= 3 and len(opposition) <= 1 and execution_quality >= .55:
+            signal = f"EARLY {side} EDGE · STRONG"
+        elif fair_side >= .55 and edge_pp >= max(float(cheap_edge_min), 11.0) and confidence >= 58 and support_count >= 2 and len(opposition) <= 2 and execution_quality >= .45:
+            signal = f"CHEAP {side} · VALUE"
+        elif fair_side < .40 or confidence < 50 or support_count == 0:
+            signal = f"CHEAP {side} · UNCONFIRMED"
+        if np.isfinite(side_spread) and side_spread > 8:
+            signal = f"CHEAP {side} · WIDE SPREAD"
+
+        reasons = [f"fair {fair_side*100:.0f}% vs buy {buy_price:.1f}¢", f"gross edge {edge_pp:+.1f}pp"]
+        if np.isfinite(side_spread): reasons.append(f"{side_spread:.1f}¢ bid/ask spread")
+        if support:
+            reasons.append("supports: " + ", ".join(support[:3]))
+        if opposition:
+            reasons.append("opposes: " + ", ".join(opposition[:2]))
+        if remaining_sec is not None:
+            reasons.append(f"{float(remaining_sec):.0f}s left")
+        neutral.update({
+            "signal": signal, "side": side, "score": float(np.clip(score, 0, 100)),
+            "fair_side_prob": fair_side, "combined_side_prob": combined_side,
+            "buy_price": buy_price, "gross_roi_pct": gross_roi,
+            "support_count": support_count, "support_score": support_score,
+            "side_spread": side_spread if np.isfinite(side_spread) else None,
+            "execution_quality": execution_quality,
+            "reasons": reasons, "yes_ask": ya, "no_ask": na,
+            "yes_edge_pp": yes_edge, "no_edge_pp": no_edge,
+        })
+        return neutral
+
+
+    def research_signals(frame, snapshot, exchange_trades, candle_intel, outcome_history, brti_proxy, proxy_samples, adaptive_learner, flow_info=None, outcome_calibration=None, fair_value_calibration=None):
         closes = frame["close"].astype(float)
         if len(closes) < 40:
             return {"outcome": "UNCERTAIN", "scalp": "WAIT", "reason": "Insufficient BTC history", "momentum": 0.0,
@@ -2418,41 +3198,125 @@ def _render_live_dashboard_inner():
         analog = empirical_analog_probability(outcome_history, reference_price, target, remaining_min)
         market_p = market_implied_probability(snapshot)
 
-        # Flow probability is only a small confirmation component. It cannot overpower
-        # strike distance or the market-implied/statistical estimates.
-        flow_signal = 0.55 * np.tanh(momentum / 1.5)
-        flow_signal += 0.65 * (candle_intel.get("outcome_score", 0.0) / 100.0)
+        # Separate BTC microstructure from Kalshi market microstructure. The BTC layer
+        # remains independent of Kalshi pricing so it can be used to estimate fair value.
+        fi = flow_info or {}
+        p10 = float(fi.get("pressure_10s", 0.0) or 0.0)
+        p30 = float(fi.get("pressure_30s", 0.0) or 0.0)
+        p60 = float(fi.get("pressure_60s", 0.0) or 0.0)
+        persistence = float(fi.get("flow_persistence", 0.0) or 0.0)
+        flow_accel = float(fi.get("flow_acceleration", 0.0) or 0.0)
+        flow_resilience = float(fi.get("flow_resilience", 0.0) or 0.0)
+        top_trade_pressure = float(fi.get("top_trade_pressure", 0.0) or 0.0)
+        intensity_accel = float(fi.get("trade_intensity_accel", 0.0) or 0.0)
+        toxicity = float(fi.get("toxicity_proxy", 0.0) or 0.0)
+        book_imb = float(fi.get("book_imbalance", 0.0) or 0.0)
+        micro_edge = float(fi.get("microprice_edge_bps", 0.0) or 0.0)
+        book_agree = float(fi.get("book_agreement", 0.0) or 0.0)
+        book_impulse = float(fi.get("book_impulse", 0.0) or 0.0)
+        perp30 = float(fi.get("perp_pressure_30s", 0.0) or 0.0)
+        perp60 = float(fi.get("perp_pressure_60s", 0.0) or 0.0)
+        perp_flow = float(np.clip(.62*perp30 + .38*perp60, -1, 1))
+        perp_oi_change = float(fi.get("perp_oi_change_5m", 0.0) or 0.0)
+        perp_basis_bps = float(fi.get("perp_basis_bps", 0.0) or 0.0)
+        perp_funding = float(fi.get("perp_funding_rate", 0.0) or 0.0)
+        perp_long_ratio = float(fi.get("perp_long_ratio", .5) or .5)
+
+        flow_signal = 0.42 * np.tanh(momentum / 1.5)
+        flow_signal += 0.48 * (candle_intel.get("outcome_score", 0.0) / 100.0)
         if pressure is not None:
-            flow_signal += 0.45 * pressure
+            flow_signal += 0.28 * pressure
+        flow_signal += 0.20 * p30 + 0.12 * p10 + 0.12 * p60
+        flow_signal += 0.16 * persistence + 0.08 * np.tanh(flow_accel)
+        flow_signal += 0.12 * flow_resilience + 0.10 * top_trade_pressure
+        if pressure is not None and abs(float(pressure)) > .08:
+            flow_signal += 0.04 * float(pressure) * np.tanh(intensity_accel)
+        flow_signal += 0.18 * book_imb + 0.10 * np.tanh(micro_edge / 2.5) + 0.13*book_impulse
+        if book_agree >= .5:
+            flow_signal += 0.06 * np.sign(micro_edge)
+        # Perpetuals can lead short-horizon spot discovery. Immediate taker pressure is
+        # directional; OI merely amplifies it when positions are being added. Funding
+        # and long/short ratios are left mainly for the learner as crowding context.
+        flow_signal += 0.16 * perp_flow
+        if perp_oi_change > .05 and abs(perp_flow) > .08:
+            flow_signal += 0.05 * np.sign(perp_flow) * min(perp_oi_change/2.0, 1.0)
+        flow_signal += 0.025 * np.tanh(perp_basis_bps/6.0)
+        flow_p = _logistic(1.45 * flow_signal)
+
+        # Kalshi trade/depth dynamics are useful confirmation, but remain separate from
+        # the BTC fair-value estimate to avoid comparing Kalshi prices to themselves.
+        kalshi_taker = float(fi.get("kalshi_taker_pressure", 0.0) or 0.0)
+        kalshi_velocity = float(fi.get("kalshi_price_velocity", fi.get("kalshi_quote_velocity", 0.0)) or 0.0)
+        kalshi_balance_delta = float(fi.get("kalshi_balance_delta", 0.0) or 0.0)
+        kalshi_signal = 0.0
         if balance is not None:
-            flow_signal += 0.35 * balance
-        flow_p = _logistic(1.65 * flow_signal)
+            kalshi_signal += 0.38 * balance
+        kalshi_signal += 0.42 * kalshi_taker
+        kalshi_signal += 0.18 * np.tanh(kalshi_velocity / 7.0)
+        kalshi_signal += 0.12 * np.tanh(kalshi_balance_delta * 2.0)
+        kalshi_flow_p = _logistic(1.35 * kalshi_signal)
 
         final_min = None
         if stat and expiry_ts and target is not None and proxy_samples:
             final_min = final_minute_probability(reference_price, target, expiry_ts, proxy_samples, stat.get("sigma_1m"))
+
+        # First build an *independent* fair-value probability that excludes Kalshi
+        # prices/order flow. This is the number used to decide whether a cheap YES/NO
+        # contract is actually mispriced rather than merely cheap.
+        fair_parts = []
+        def add_fair(prob, weight):
+            if prob is not None and np.isfinite(prob) and weight > 0:
+                fair_parts.append((float(np.clip(prob, .001, .999)), float(weight)))
+        urgency = float(np.clip(1.0 - remaining_min/15.0, 0.0, 1.0))
+        if final_min is not None:
+            add_fair(final_min.get("prob"), .52)
+            add_fair(stat.get("prob") if stat else None, .24)
+            add_fair(flow_p, .14)
+            add_fair(analog.get("prob") if analog else None, .10)
+        else:
+            add_fair(stat.get("prob") if stat else None, .40 + .08*urgency)
+            add_fair(analog.get("prob") if analog else None, .34 - .16*urgency)
+            add_fair(flow_p, .26 + .08*urgency)
+        fair_prob_above = None
+        if fair_parts:
+            fw = sum(w for _, w in fair_parts)
+            fair_prob_above = sum(p*w for p, w in fair_parts)/max(fw, 1e-9)
+            # Mild shrinkage prevents a thin microstructure burst from creating fake 99%s.
+            source_q = .0
+            if stat: source_q += .35
+            if analog and analog.get("effective_n", 0) >= 60: source_q += .25
+            if int(fi.get("venue_count", 0) or 0) >= 2: source_q += .20
+            if int(fi.get("book_venue_count", 0) or 0) >= 2: source_q += .20
+            shrink = .72 + .25*float(np.clip(source_q, 0, 1))
+            fair_prob_above = float(np.clip(.5 + (fair_prob_above-.5)*shrink, .01, .99))
+
+        # Calibrate the independent fair probability separately from the combined
+        # outcome probability. This matters most for low-price mispricing detection.
+        fair_prob_above, fair_calibration_adjustment = apply_fair_value_calibration(
+            fair_prob_above, remaining_sec, fair_value_calibration
+        )
 
         components = {}
         def add_component(name, prob, weight):
             if prob is not None and np.isfinite(prob):
                 components[name] = {"prob": float(np.clip(prob, .001, .999)), "weight": float(max(weight, 0.0))}
 
-        # Dynamic weights: distance/statistics and market consensus dominate late in
-        # the contract; historical analogs matter more earlier. The special final-minute
-        # average model gets the largest weight once Kalshi's 60-second settlement
-        # window has started.
-        urgency = float(np.clip(1.0 - remaining_min/15.0, 0.0, 1.0))
-        w_stat = .25 + .13*urgency
-        w_analog = .34 - .16*urgency
-        w_market = .28 + .08*urgency
-        w_flow = .13 - .05*urgency
+        # Final outcome estimate can use market information because Kalshi itself is an
+        # information source. The market component is kept separate from the fair-value
+        # estimate above so value detection is not circular.
+        w_stat = .30 + .12*urgency
+        w_analog = .30 - .17*urgency
+        w_market = .22 + .08*urgency
+        w_flow = .13 + .02*urgency
+        w_kflow = .05
         if final_min is not None:
-            w_stat, w_analog, w_market, w_flow = .23, .08, .25, .04
-            add_component("final_60s_avg", final_min.get("prob"), .40)
+            w_stat, w_analog, w_market, w_flow, w_kflow = .22, .05, .18, .07, .03
+            add_component("final_60s_avg", final_min.get("prob"), .45)
         add_component("statistical", stat.get("prob") if stat else None, w_stat)
         add_component("historical_analogs", analog.get("prob") if analog else None, w_analog)
         add_component("kalshi_market", market_p, w_market)
         add_component("flow_candles", flow_p, w_flow)
+        add_component("kalshi_flow", kalshi_flow_p, w_kflow)
 
         if target is None or not components:
             prob_above = None
@@ -2462,6 +3326,7 @@ def _render_live_dashboard_inner():
             outcome_score = 0.0
             disagreement = None
             base_prob_above = None
+            value_opportunity = evaluate_cheap_value(snapshot, fair_prob_above, None, 0.0, fi, remaining_sec)
             learning_adjustment = {"active": False, "raw_prob": None, "adjustment_pp": 0.0, "blend": 0.0}
             calibration_adjustment = {"active": False, "adjustment_pp": 0.0, "n": 0, "empirical": None}
         else:
@@ -2481,10 +3346,20 @@ def _render_live_dashboard_inner():
                 "remaining_sec": remaining_sec, "base_prob_above": base_prob_above,
                 "stat_prob": stat.get("prob") if stat else np.nan,
                 "analog_prob": analog.get("prob") if analog else np.nan,
-                "market_prob": market_p, "flow_prob": flow_p,
+                "market_prob": market_p, "flow_prob": flow_p, "kalshi_flow_prob": kalshi_flow_p,
                 "final60_prob": final_min.get("prob") if final_min else np.nan,
-                "momentum": momentum, "pressure": pressure, "bid_balance": balance, "spread": spread,
+                "momentum": momentum, "pressure": pressure,
+                "flow_pressure_10s": p10, "flow_pressure_30s": p30, "flow_pressure_60s": p60,
+                "flow_persistence": persistence, "flow_acceleration": flow_accel,
+                "flow_resilience": flow_resilience, "top_trade_pressure": top_trade_pressure,
+                "bid_balance": balance, "spread": spread,
                 "candle_outcome_score": candle_intel.get("outcome_score", 0.0),
+                "btc_book_imbalance": book_imb, "btc_microprice_edge_bps": micro_edge,
+                "btc_book_agreement": book_agree, "btc_book_impulse": book_impulse,
+                "perp_pressure_30s": perp30, "perp_pressure_60s": perp60,
+                "perp_oi_change_5m": perp_oi_change, "perp_basis_bps": perp_basis_bps,
+                "perp_funding_rate": perp_funding, "perp_long_ratio": perp_long_ratio,
+                "kalshi_taker_pressure": kalshi_taker, "kalshi_price_velocity": kalshi_velocity,
                 "z_distance": stat.get("z_distance", np.nan) if stat else np.nan,
                 "sigma_1m": stat.get("sigma_1m", np.nan) if stat else np.nan,
                 "venue_count": brti_proxy.get("count", 0) if isinstance(brti_proxy, dict) else 0,
@@ -2518,6 +3393,10 @@ def _render_live_dashboard_inner():
                 confidence = min(confidence, 58.0)
             if analog and analog.get("se", 0) > .07:
                 confidence = min(confidence, 65.0)
+            # Extreme one-sided trade imbalance often accompanies jumps/unstable books.
+            # Treat toxicity as uncertainty, not as a directional predictor.
+            if toxicity >= .78 and remaining_sec > 60:
+                confidence = min(confidence, 72.0)
             if outcome_calibration and outcome_calibration.get("ece") is not None and outcome_calibration.get("ece") > .12:
                 confidence = min(confidence, 68.0)
 
@@ -2532,6 +3411,12 @@ def _render_live_dashboard_inner():
             else:
                 outcome = "UNCERTAIN"
             outcome_score = float(np.clip((prob_above-.5)*200.0, -100, 100))
+
+        # The low-price detector compares the contract ask against the independent BTC
+        # fair probability. It is deliberately computed after final confidence is known.
+        value_opportunity = evaluate_cheap_value(
+            snapshot, fair_prob_above, prob_above, confidence, fi, remaining_sec
+        )
 
         # Scalp model reacts faster and now includes model-vs-market edge.
         scalp_score = 28 * np.tanh(momentum / 1.25)
@@ -2555,6 +3440,21 @@ def _render_live_dashboard_inner():
             scalp = "WATCH YES" if scalp_score > 0 else "WATCH NO"
             reason = "Strong short-term flow, but the probability edge is not fully confirmed"
 
+        # A strong low-price fair-value signal can promote WAIT to a watch only when
+        # the spread is tradable and several independent microstructure sources agree.
+        value_side = str((value_opportunity or {}).get("side", "NONE"))
+        value_signal = str((value_opportunity or {}).get("signal", "NO CHEAP EDGE"))
+        value_support = int((value_opportunity or {}).get("support_count", 0) or 0)
+        value_is_strong = ("VALUE" in value_signal or "STRONG" in value_signal) and value_support >= 2
+        if liquid and value_is_strong and candle_intel.get("quality") != "LOW":
+            if value_side == "YES" and scalp == "WAIT" and scalp_score > -10:
+                scalp, reason = "WATCH YES", "Cheap YES trades below independent fair value with multi-source flow confirmation"
+            elif value_side == "NO" and scalp == "WAIT" and scalp_score < 10:
+                scalp, reason = "WATCH NO", "Cheap NO trades below independent fair value with multi-source flow confirmation"
+        # Never chase a scalp directly against a strong cheap-side value signal.
+        if value_is_strong and ((value_side == "YES" and scalp == "WATCH NO") or (value_side == "NO" and scalp == "WATCH YES")):
+            scalp, reason = "WAIT", "Short-term scalp conflicts with the stronger low-price fair-value signal"
+
         return {
             "outcome": outcome, "scalp": scalp, "reason": reason, "momentum": momentum,
             "pressure": pressure, "bid_balance": balance, "spread": spread, "target": target,
@@ -2565,10 +3465,12 @@ def _render_live_dashboard_inner():
             "reference_price": reference_price, "coinbase_price": coinbase_p,
             "remaining_min": remaining_min, "remaining_sec": remaining_sec,
             "analog": analog, "stat": stat, "market_prob": market_p,
-            "flow_prob": flow_p, "final_minute": final_min, "model_edge": model_edge,
+            "fair_prob_above": fair_prob_above, "flow_prob": flow_p, "kalshi_flow_prob": kalshi_flow_p,
+            "final_minute": final_min, "model_edge": model_edge, "value_opportunity": value_opportunity,
             "brti_proxy": brti_proxy, "base_prob_above": base_prob_above,
             "learning_adjustment": learning_adjustment, "learning_model": adaptive_learner,
             "probability_calibration": calibration_adjustment, "calibration_report": outcome_calibration or {},
+            "fair_value_calibration": fair_calibration_adjustment, "fair_calibration_report": fair_value_calibration or {},
             "flow_info": flow_info or {},
         }
 
@@ -2582,23 +3484,57 @@ def _render_live_dashboard_inner():
             whale_trades = recent_exchange_trades(); whale_error = f"Multi-exchange flow fallback: {exc}"
         except Exception as fallback_exc:
             whale_trades, whale_error = [], str(fallback_exc)
+
+    # Enrich the spot trade tape with order-book dynamics, perpetual-futures flow and
+    # Kalshi's own public taker/quote flow. Every source is optional and failure-safe.
+    try:
+        _book_ctx = multi_exchange_orderbook_context()
+        flow_info.update(_book_ctx)
+        flow_info.update(update_btc_book_dynamics(_book_ctx))
+        # Flow resilience/absorption: positive means price is holding stronger than
+        # contemporaneous aggressive flow would suggest (e.g. sellers being absorbed);
+        # negative means buyers are being absorbed. This is directional but bounded.
+        _resp = float(np.tanh(float(flow_info.get("book_mid_velocity_bps_30s",0.0) or 0.0)/3.0))
+        _p30 = float(flow_info.get("pressure_30s",0.0) or 0.0)
+        flow_info["flow_resilience"] = float(np.clip(_resp - .55*_p30, -1, 1))
+    except Exception as exc:
+        flow_info.setdefault("book_errors", []).append(f"book-context:{type(exc).__name__}")
+    try:
+        flow_info.update(derivatives_flow_context())
+    except Exception as exc:
+        flow_info.setdefault("derivatives_errors", []).append(f"derivatives:{type(exc).__name__}")
+    try:
+        flow_info.update(recent_kalshi_trades(active_ticker))
+    except Exception as exc:
+        flow_info["kalshi_trade_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        flow_info.update(update_kalshi_quote_dynamics(active_ticker, kalshi_data))
+        # Public trade velocity is preferable when there are prints; otherwise use
+        # quote-mid movement so a quiet contract still has a microstructure signal.
+        if int(flow_info.get("kalshi_trade_count", 0) or 0) == 0:
+            flow_info["kalshi_price_velocity"] = float(flow_info.get("kalshi_quote_velocity", 0.0) or 0.0)
+    except Exception as exc:
+        flow_info["kalshi_quote_error"] = f"{type(exc).__name__}: {exc}"
+
     try:
         chain_count, chain_vsize = blockchain_activity()
         chain_error = None
     except (requests.RequestException, ValueError, TypeError) as exc:
         chain_count, chain_vsize, chain_error = None, None, str(exc)
     # Outcome Fusion v2 uses a multi-exchange proxy aligned with Kalshi's actual
-    # CME CF BRTI settlement source, plus a deeper cached history for empirical analogs.
+    # CME CF BRTI settlement source, plus a deeper 48-hour cached history for empirical analogs.
     try:
         brti_proxy = get_brti_proxy()
     except Exception:
         brti_proxy = {"price": None, "venues": {}, "count": 0, "dispersion_bps": None}
     try:
-        outcome_history = get_outcome_history(24)
+        outcome_history = get_outcome_history(48)
     except Exception:
         outcome_history = pd.DataFrame()
 
     outcome_calibration = build_outcome_calibration(learning_history)
+    fair_value_calibration = build_fair_value_calibration(learning_history)
+    cheap_validation = cheap_edge_validation(learning_history, cheap_price_ceiling, cheap_edge_min)
     reversal_history = load_reversal_history()
     reversal_history, _reversal_labels_added = refresh_reversal_labels(reversal_history, outcome_history)
     reversal_model = get_reversal_learner(reversal_history)
@@ -2619,7 +3555,26 @@ def _render_live_dashboard_inner():
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
-                              outcome_history, brti_proxy, proxy_samples, learning_model, flow_info, outcome_calibration)
+                              outcome_history, brti_proxy, proxy_samples, learning_model, flow_info, outcome_calibration, fair_value_calibration)
+    engine["cheap_edge_validation"] = cheap_validation
+    # If a setting-specific cheap-edge strategy has accumulated enough resolved
+    # markets and is losing gross P&L, automatically downgrade live VALUE/STRONG
+    # labels until the historical evidence improves. This prevents persistent bias.
+    _cv = cheap_validation or {}
+    _vo = engine.get("value_opportunity") or {}
+    if int(_cv.get("markets",0) or 0) >= 25:
+        _cv_good = (_cv.get("avg_pnl_cents") is not None and float(_cv.get("avg_pnl_cents")) > 0 and
+                    _cv.get("brier") is not None and float(_cv.get("brier")) < .30)
+        _vo["validation_gate"] = "PASS" if _cv_good else "WEAK"
+        if not _cv_good and ("VALUE" in str(_vo.get("signal", "")) or "STRONG" in str(_vo.get("signal", ""))):
+            _side = str(_vo.get("side",""))
+            _vo["signal"] = f"CHEAP {_side} · WATCH · VALIDATION WEAK" if _side else "NO CHEAP EDGE"
+            if str(engine.get("reason","")).startswith("Cheap "):
+                engine["scalp"] = "WAIT"
+                engine["reason"] = "Cheap-side edge exists, but its resolved-market validation is not profitable yet"
+    else:
+        _vo["validation_gate"] = "COLLECTING"
+    engine["value_opportunity"] = _vo
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     # Enrich the reversal signal with multi-exchange CVD/whale agreement before the learned layer.
     reversal["candidate_direction"] = reversal.get("candidate_direction", reversal.get("direction", "NONE"))
@@ -2628,6 +3583,9 @@ def _render_live_dashboard_inner():
         cvd_align = ds * float(flow_info.get("pressure", 0.0) or 0.0)
         whale_align = ds * float(flow_info.get("whale_pressure", 0.0) or 0.0)
         agreement = float(flow_info.get("venue_agreement", 0.0) or 0.0)
+        book_align = ds * float(flow_info.get("book_impulse", 0.0) or 0.0)
+        perp_align = ds * (.62*float(flow_info.get("perp_pressure_30s",0.0) or 0.0) + .38*float(flow_info.get("perp_pressure_60s",0.0) or 0.0))
+        kalshi_align = ds * float(flow_info.get("kalshi_taker_pressure", 0.0) or 0.0)
         if whale_align >= .16 and agreement >= .5:
             reversal["score"] = float(np.clip(float(reversal.get("score",0))+min(10,4+10*whale_align),0,100))
             reversal.setdefault("reasons", []).append(f"multi-exchange whale flow agrees across {int(flow_info.get('venue_count',0))} venues")
@@ -2636,12 +3594,27 @@ def _render_live_dashboard_inner():
         elif cvd_align <= -.22 and agreement >= .5:
             reversal["score"] = float(np.clip(float(reversal.get("score",0))-7,0,100))
             reversal.setdefault("reasons", []).append("multi-exchange CVD still opposes the reversal")
+        micro_support = sum(x >= .14 for x in (book_align, perp_align, kalshi_align))
+        micro_oppose = sum(x <= -.18 for x in (book_align, perp_align, kalshi_align))
+        if micro_support >= 2:
+            reversal["score"] = float(np.clip(float(reversal.get("score",0))+6,0,100))
+            reversal["confirmation_strength"] = float(np.clip(float(reversal.get("confirmation_strength",0))+7,0,100))
+            reversal.setdefault("reasons", []).append("book/perpetual/Kalshi flow confirm the turn")
+            checks=list(reversal.get("confirmation_checks",[])); checks.append("microstructure stack confirms"); reversal["confirmation_checks"]=checks
+        elif micro_oppose >= 2:
+            reversal["score"] = float(np.clip(float(reversal.get("score",0))-6,0,100))
+            reversal.setdefault("reasons", []).append("book/perpetual/Kalshi flow still opposes the turn")
         reversal["whale_pressure"] = flow_info.get("whale_pressure")
         reversal["large_buy_usd"] = flow_info.get("large_buy_usd",0.0)
         reversal["large_sell_usd"] = flow_info.get("large_sell_usd",0.0)
         reversal["cvd_pressure"] = flow_info.get("pressure")
         reversal["cvd_usd"] = flow_info.get("cvd_usd")
         reversal["venue_agreement"] = agreement
+        reversal["book_impulse"] = flow_info.get("book_impulse",0.0)
+        reversal["perp_pressure"] = .62*float(flow_info.get("perp_pressure_30s",0.0) or 0.0)+.38*float(flow_info.get("perp_pressure_60s",0.0) or 0.0)
+        reversal["kalshi_taker_pressure"] = flow_info.get("kalshi_taker_pressure",0.0)
+        reversal["flow_resilience"] = flow_info.get("flow_resilience",0.0)
+        reversal["top_trade_pressure"] = flow_info.get("top_trade_pressure",0.0)
         reversal["flow_venues"] = flow_info.get("venue_count",0)
     reversal = apply_reversal_learning(reversal, reversal_model, reversal_history)
     engine["reversal"] = reversal
@@ -2955,8 +3928,30 @@ def _render_live_dashboard_inner():
             conf_sub = f"{str(engine.get('confidence_label','LOW')).lower()} · {_lm.get('resolved_markets',0)} learned"
         venues = int((engine.get("brti_proxy") or {}).get("count", 0))
         proxy_sub = f"{venues} venue proxy · not official BRTI" if venues else "Coinbase fallback · not BRTI"
-        edge = engine.get("model_edge")
-        edge_text = f"edge {edge:+.1f}pp vs Kalshi" if edge is not None else "market edge unavailable"
+        value = engine.get("value_opportunity") or {}
+        value_signal = str(value.get("signal", "NO CHEAP EDGE"))
+        value_side = str(value.get("side", "NONE"))
+        value_score = float(value.get("score", 0.0) or 0.0)
+        value_buy = value.get("buy_price")
+        value_fair = value.get("fair_side_prob")
+        value_support = int(value.get("support_count", 0) or 0)
+        selected_edge = value.get("yes_edge_pp") if value_side == "YES" else value.get("no_edge_pp") if value_side == "NO" else None
+        if value_side in ("YES", "NO") and value_buy is not None and value_fair is not None:
+            value_sub = f"{value_buy:.1f}¢ → fair {value_fair*100:.0f}% · edge {selected_edge:+.1f}pp · {value_support} confirms"
+        else:
+            value_sub = f"cheap ≤{cheap_price_ceiling}¢ · need ≥{cheap_edge_min}pp independent edge"
+        if value_side == "YES" and ("VALUE" in value_signal or "STRONG" in value_signal):
+            value_color = "#36d7a4"
+        elif value_side == "NO" and ("VALUE" in value_signal or "STRONG" in value_signal):
+            value_color = "#ff6c78"
+        else:
+            value_color = "#ffcf77"
+        yes_edge = value.get("yes_edge_pp"); no_edge = value.get("no_edge_pp")
+        if yes_edge is not None and no_edge is not None:
+            edge_text = f"fair edge Y {yes_edge:+.1f} / N {no_edge:+.1f}pp"
+        else:
+            edge = engine.get("model_edge")
+            edge_text = f"edge {edge:+.1f}pp vs Kalshi" if edge is not None else "market edge unavailable"
         final_min = engine.get("final_minute")
         if final_min:
             settle_note = f"final-60s proxy {final_min.get('observed_sec',0):.0f}s observed"
@@ -3001,6 +3996,7 @@ def _render_live_dashboard_inner():
             "confSub": conf_sub, "proxySub": proxy_sub, "edge": edge_text,
             "settleNote": settle_note, "mood": mood, "moodColor": mood_color,
             "reversal": rev_status, "reversalSub": rev_sub, "reversalColor": rev_color,
+            "valueSignal": value_signal, "valueSub": value_sub, "valueColor": value_color,
             "possibleOutcome": possible_outcome, "possibleDetail": possible_detail,
         }
         intel_json = json.dumps(intel)
@@ -3030,11 +4026,13 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>MODEL CONF</small><strong id="confidence"></strong><em id="confSub"></em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>short-term watch</em></div>
           </div>
+          <div class="rev" id="valueBox"><b id="valueSignal"></b><span id="valueSub"></span></div>
           <div class="rev"><b id="possibleOutcome" style="color:#ffcf77"></b><span id="possibleDetail"></span></div>
           <div class="rev" id="revBox"><b id="reversal"></b><span id="reversalSub"></span></div>
           <div class="foot" id="distance"></div>
         </div><script>
         const d=__INTEL__;
+        const vv=document.getElementById('valueSignal');vv.textContent=d.valueSignal||'NO CHEAP EDGE';vv.style.color=d.valueColor||'#ffcf77';document.getElementById('valueSub').textContent=d.valueSub||'—';document.getElementById('valueBox').style.borderColor=d.valueColor||'#3b3138';
         document.getElementById('possibleOutcome').textContent=d.possibleOutcome||'UNAVAILABLE';document.getElementById('possibleDetail').textContent=d.possibleDetail||'';
         for(const id of ['btc','yes','no','outcome','above','confidence','scalp']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
@@ -3044,7 +4042,7 @@ def _render_live_dashboard_inner():
         const m=document.getElementById('mood');m.textContent=d.mood||'NO HIGH-CONFIDENCE OUTCOME CALL';m.style.color=d.moodColor||'#ffcf77';
         const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
         </script></body></html>""".replace("__INTEL__", intel_json)
-        components.html(intel_html, height=216, scrolling=False)
+        components.html(intel_html, height=242, scrolling=False)
         direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
         if abs(direction_score) < 8:
             context = "NO CLEAR EDGE — wait for confirmation"
@@ -3064,6 +4062,43 @@ def _render_live_dashboard_inner():
                 st.warning(f"Kalshi quotes unavailable: {kalshi_error}")
             else:
                 st.info("No active Kalshi contract selected.")
+
+            st.markdown("**Low-price fair-value detector**")
+            value = engine.get("value_opportunity") or {}
+            vside = str(value.get("side", "NONE"))
+            vsig = str(value.get("signal", "NO CHEAP EDGE"))
+            if vside in ("YES", "NO"):
+                vedge = value.get("yes_edge_pp") if vside == "YES" else value.get("no_edge_pp")
+                st.caption(
+                    f"{vsig} · score {float(value.get('score',0) or 0):.0f}/100 · buy {float(value.get('buy_price',0) or 0):.1f}¢ · "
+                    f"independent fair {float(value.get('fair_side_prob',0) or 0)*100:.1f}% · gross edge {float(vedge or 0):+.1f}pp · "
+                    f"{int(value.get('support_count',0) or 0)} microstructure confirmations"
+                )
+                if value.get("gross_roi_pct") is not None:
+                    st.caption(f"Gross model-implied ROI versus ask ≈ {float(value['gross_roi_pct']):+.0f}% before fees/slippage. This is not an expected guaranteed return.")
+                for why in (value.get("reasons") or [])[:5]:
+                    st.caption(f"• {why}")
+            else:
+                yedge=value.get("yes_edge_pp"); nedge=value.get("no_edge_pp")
+                edge_bits=[]
+                if yedge is not None: edge_bits.append(f"YES {float(yedge):+.1f}pp")
+                if nedge is not None: edge_bits.append(f"NO {float(nedge):+.1f}pp")
+                suffix = " · current independent edges: " + " / ".join(edge_bits) if edge_bits else ""
+                st.caption(f"{vsig} · watches asks ≤{cheap_price_ceiling}¢ and requires ≥{cheap_edge_min}pp independent fair-value edge{suffix}.")
+            _cv = engine.get("cheap_edge_validation") or {}
+            if int(_cv.get("markets",0) or 0) > 0:
+                _hit = _cv.get("hit_rate"); _pnl = _cv.get("avg_pnl_cents"); _roi = _cv.get("avg_roi_pct"); _br = _cv.get("brier")
+                st.caption(
+                    f"Cheap-edge validation at current settings: {int(_cv.get('markets',0))} independent settled markets · "
+                    f"hit {float(_hit or 0)*100:.1f}% · avg gross P&L {float(_pnl or 0):+.1f}¢/contract · "
+                    f"avg gross ROI {float(_roi or 0):+.1f}% · Brier {float(_br or 0):.3f}."
+                )
+            else:
+                st.caption("Cheap-edge validation is collecting resolved markets for these price/edge settings.")
+            st.caption(
+                "Cheap by itself is not a signal. Fair value here excludes Kalshi's own market price/order flow; "
+                "Kalshi flow is only used afterward as confirmation. Displayed edge is pre-fee/pre-slippage."
+            )
 
             st.markdown("**Reversal radar**")
             rev = engine.get("reversal") or {}
@@ -3106,9 +4141,10 @@ def _render_live_dashboard_inner():
                 st.caption(f"BRTI-aware proxy ${engine['reference_price']:,.2f} from {venue_text}{disp_text}. This is not the official BRTI.")
                 comp_names = {
                     "statistical":"realized-vol model",
-                    "historical_analogs":"24h historical analogs",
+                    "historical_analogs":"48h historical analogs",
                     "kalshi_market":"Kalshi market",
-                    "flow_candles":"flow + candles",
+                    "flow_candles":"BTC flow + candles + book/perps",
+                    "kalshi_flow":"Kalshi taker/depth flow",
                     "final_60s_avg":"final-60s average model",
                 }
                 comp_text = []
@@ -3116,6 +4152,11 @@ def _render_live_dashboard_inner():
                     comp_text.append(f"{comp_names.get(name,name)} {row['prob']*100:.0f}%")
                 if comp_text:
                     st.caption("Components: " + " · ".join(comp_text))
+                if engine.get("fair_prob_above") is not None:
+                    st.caption(
+                        f"Independent BTC fair estimate (excludes Kalshi price/flow): ABOVE {engine['fair_prob_above']*100:.1f}% · "
+                        f"BELOW {(1-engine['fair_prob_above'])*100:.1f}%"
+                    )
                 stat_info = engine.get("stat") or {}
                 analog_info = engine.get("analog") or {}
                 if stat_info:
@@ -3148,7 +4189,36 @@ def _render_live_dashboard_inner():
                 pressure_text = f"{engine['pressure']:+.1%}" if engine['pressure'] is not None else "Unavailable"
                 st.caption(f"Multi-exchange trades sampled: {len(whale_trades)} across {int((flow_info or {}).get('venue_count',0))} venues · ≥$100k: {len(large)} · Aggressive pressure: {pressure_text}")
                 if flow_info:
-                    st.caption(f"CVD proxy ${(flow_info.get('cvd_usd',0) or 0)/1e6:+.2f}M · whale pressure {float(flow_info.get('whale_pressure',0) or 0):+.2f} · venue agreement {float(flow_info.get('venue_agreement',0) or 0)*100:.0f}%")
+                    st.caption(
+                        f"Spot CVD ${(flow_info.get('cvd_usd',0) or 0)/1e6:+.2f}M · taker pressure 10s {float(flow_info.get('pressure_10s',0) or 0):+.2f} / "
+                        f"30s {float(flow_info.get('pressure_30s',0) or 0):+.2f} / 60s {float(flow_info.get('pressure_60s',0) or 0):+.2f} · "
+                        f"persistence {float(flow_info.get('flow_persistence',0) or 0):+.2f} · acceleration {float(flow_info.get('flow_acceleration',0) or 0):+.2f} · "
+                        f"resilience {float(flow_info.get('flow_resilience',0) or 0):+.2f}"
+                    )
+                    st.caption(
+                        f"Largest-trade cluster pressure {float(flow_info.get('top_trade_pressure',0) or 0):+.2f} · "
+                        f"dynamic large threshold ${(flow_info.get('dynamic_large_threshold',100000) or 100000)/1000:.0f}k · "
+                        f"cluster prints {int(flow_info.get('whale_cluster_count',0) or 0)} · intensity accel {float(flow_info.get('trade_intensity_accel',0) or 0):+.2f}"
+                    )
+                    st.caption(
+                        f"Whale pressure {float(flow_info.get('whale_pressure',0) or 0):+.2f} · venue agreement {float(flow_info.get('venue_agreement',0) or 0)*100:.0f}% · "
+                        f"book imbalance {float(flow_info.get('book_imbalance',0) or 0):+.2f} · microprice edge {float(flow_info.get('microprice_edge_bps',0) or 0):+.2f} bps · "
+                        f"book impulse {float(flow_info.get('book_impulse',0) or 0):+.2f}"
+                    )
+                    if flow_info.get("derivatives_ok"):
+                        st.caption(
+                            f"BTC perpetuals: taker 30s {float(flow_info.get('perp_pressure_30s',0) or 0):+.2f} / 60s {float(flow_info.get('perp_pressure_60s',0) or 0):+.2f} · "
+                            f"OI Δ5m {float(flow_info.get('perp_oi_change_5m',0) or 0):+.2f}% · basis {float(flow_info.get('perp_basis_bps',0) or 0):+.2f} bps · "
+                            f"funding {float(flow_info.get('perp_funding_rate',0) or 0)*100:.4f}% · long holders {float(flow_info.get('perp_long_ratio',.5) or .5)*100:.1f}%"
+                        )
+                    st.caption(
+                        f"Kalshi taker pressure {float(flow_info.get('kalshi_taker_pressure',0) or 0):+.2f} · "
+                        f"YES-price velocity {float(flow_info.get('kalshi_price_velocity',0) or 0):+.1f}¢/min · "
+                        f"public trades {int(flow_info.get('kalshi_trade_count',0) or 0)}"
+                    )
+                    st.caption(
+                        f"Flow-toxicity proxy {float(flow_info.get('toxicity_proxy',0) or 0):.2f} is used as an intensity/risk flag only, not as a standalone direction signal."
+                    )
             if chain_error:
                 st.caption(f"Blockchain activity unavailable: {chain_error}")
             else:
@@ -3176,6 +4246,12 @@ def _render_live_dashboard_inner():
             ca = engine.get("probability_calibration") or {}
             if cal.get("ece") is not None:
                 st.caption(f"Probability calibration: {cal.get('samples',0)} resolved snapshots · ECE {cal['ece']*100:.1f}pp · current bucket adjustment {ca.get('adjustment_pp',0):+.1f}pp (n={ca.get('n',0)}).")
+            fcal = engine.get("fair_calibration_report") or {}; fadj = engine.get("fair_value_calibration") or {}
+            if fcal.get("ece") is not None:
+                st.caption(
+                    f"Independent-fair calibration: {fcal.get('samples',0)} resolved snapshots · ECE {fcal['ece']*100:.1f}pp · "
+                    f"current fair-value adjustment {fadj.get('adjustment_pp',0):+.1f}pp (n={fadj.get('n',0)})."
+                )
             st.caption(
                 "The learner only changes the live probability after at least 20 independent settled markets AND grouped held-out Brier score improves. "
                 "That prevents a few lucky trades from making the bot overconfident."
@@ -3282,13 +4358,25 @@ def _render_live_dashboard_inner():
                 st.markdown("**NO bids**")
                 st.dataframe(pd.DataFrame(no, columns=["Price (¢)", "Contracts"]).head(15), use_container_width=True, hide_index=True)
             st.subheader("Decision checklist")
-            if engine.get("outcome") == "UNCERTAIN":
+            _v = engine.get("value_opportunity") or {}
+            _vsig = str(_v.get("signal", "NO CHEAP EDGE"))
+            _vside = str(_v.get("side", "NONE"))
+            if _vside in ("YES","NO") and ("VALUE" in _vsig or "STRONG" in _vsig):
+                _vedge = _v.get("yes_edge_pp") if _vside == "YES" else _v.get("no_edge_pp")
+                st.success(
+                    f"{_vsig} · buy {_vside} around {float(_v.get('buy_price',0) or 0):.1f}¢ vs independent fair "
+                    f"{float(_v.get('fair_side_prob',0) or 0)*100:.1f}% · gross edge {float(_vedge or 0):+.1f}pp · "
+                    f"{int(_v.get('support_count',0) or 0)} confirming flow/structure signals."
+                )
+            elif _vside in ("YES","NO"):
+                st.warning(f"{_vsig}: the {_vside} contract is cheap and has model edge, but confirmation is not strong enough yet.")
+            elif engine.get("outcome") == "UNCERTAIN":
                 st.warning(f"No high-confidence expiry call. Model confidence {engine.get('confidence',0):.0f}/100; avoid forcing a direction.")
             elif engine.get("model_edge") is not None and abs(engine["model_edge"]) >= min_edge and engine.get("confidence",0) >= outcome_conf_gate:
-                st.success(f"{engine['outcome']} · estimated ABOVE {engine['prob_above']*100:.1f}% · model confidence {engine['confidence']:.0f}/100 · edge {engine['model_edge']:+.1f}pp vs Kalshi.")
+                st.info(f"{engine['outcome']} · estimated ABOVE {engine['prob_above']*100:.1f}% · model confidence {engine['confidence']:.0f}/100 · combined-model edge {engine['model_edge']:+.1f}pp vs Kalshi.")
             else:
                 st.info(f"Expiry model leans {engine.get('outcome','UNCERTAIN')}, but the price edge/confidence gate is not strong enough for a high-conviction setup.")
-            st.caption("Order-book depth is not a forecast. Quotes can change and may not be executable at the displayed size. The official settlement source is CME CF BRTI, not Coinbase.")
+            st.caption("A cheap contract is not automatically a good trade. The low-price detector compares the ask with independent BTC fair value; all edge/ROI figures are gross before fees and slippage. Official settlement is CME CF BRTI, not Coinbase.")
 
     if selected_page == "📖 GUIDE":
         st.markdown("""
@@ -3300,10 +4388,14 @@ def _render_live_dashboard_inner():
     **What Outcome Fusion v2 adds**
     - Kalshi's BTC 15-minute contracts settle from the **simple average of 60 official CME CF BRTI values during the final minute**, not from a Coinbase close.
     - The dashboard therefore builds a **BRTI-aware proxy** from public prices on several BRTI constituent exchanges (Coinbase, Kraken, Bitstamp and Gemini) and uses the median to reduce single-exchange basis noise. It is still only a proxy, not the licensed official BRTI.
-    - A cached **24-hour 1-minute history** is used to find prior BTC regimes with similar 5m/15m momentum, volatility and EMA structure. The bot checks what happened over the same remaining horizon and produces an empirical historical-analog probability.
+    - A cached **48-hour 1-minute history** is used to find prior BTC regimes with similar 5m/15m momentum, volatility and EMA structure. The bot checks what happened over the same remaining horizon and produces an empirical historical-analog probability.
     - A separate **realized-volatility probability model** estimates how difficult it is for BTC to finish on the other side of the strike given the remaining time and current volatility.
-    - **Kalshi's live YES price** is treated as another independent market-implied estimate instead of being ignored.
-    - Candle intelligence, aggressive Coinbase trade flow and Kalshi depth are used as a **small confirmation layer**, not allowed to overpower the strike-distance/statistical models.
+    - **Kalshi's live YES price** is treated as a separate market-implied estimate instead of being ignored. The bot also builds an **independent BTC fair probability that excludes Kalshi price and Kalshi flow**, so it can test whether a low-priced YES or NO is actually mispriced rather than merely cheap.
+    - Spot order flow now uses **10s / 30s / 60s / 120s aggressive-flow windows** across Coinbase, Kraken, Bitstamp and Gemini, plus CVD, whale-sized trades, persistence, acceleration and cross-venue agreement. Coinbase's reported maker side is inverted to infer aggressor direction.
+    - BTC order books are sampled across those venues for **depth imbalance, microprice, cross-venue agreement and snapshot-to-snapshot book impulse**. The dynamic book signal is only an approximation of message-level order-flow imbalance because public REST polling does not see every add/cancel event.
+    - Public **BTC perpetual-futures context** adds taker flow, 5-minute open-interest change, mark/index basis, funding and long/short positioning. Immediate perp taker flow can confirm direction; OI/funding/positioning are treated mostly as context/crowding features rather than deterministic signals.
+    - Public **Kalshi trade flow** tracks YES/NO taker pressure, YES price velocity, visible depth change and quote momentum. This is a confirmation layer and is excluded from the independent fair-value estimate to avoid circular reasoning.
+    - The **LOW-PRICE FAIR-VALUE detector** only triggers when a contract is under the sidebar price ceiling, the independent BTC probability exceeds the ask by the required edge, and multiple flow/structure sources support the same side. The displayed edge and ROI are gross, before fees and slippage.
     - During the **last 60 seconds**, the bot records the live multi-exchange proxy and estimates the average already observed. It then calculates the average price still required over the remaining seconds for the final 60-second settlement average to finish above the strike.
     - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
     - **POSSIBLE ABOVE / BELOW** is a separate tentative expiration view using the same model: it needs at least 55% estimated directional probability and 35/100 model confidence. Near 50/50 or with weaker evidence it says **NO CLEAR LEAN**. It does not change the regular expiration call, scalp signals, or learning labels. Model confidence is an evidence score, not a success probability.
@@ -3316,13 +4408,16 @@ def _render_live_dashboard_inner():
     - The still-forming candle is down-weighted because it can reverse before close.
 
     **What MODEL CONFIDENCE means**
-    - It combines probability separation from 50/50, agreement between the statistical model, historical analogs, Kalshi market and flow/candle model, strike distance measured in volatility units, cross-exchange reference quality, spread and analog sample size.
+    - It combines probability separation from 50/50, agreement between the statistical model, historical analogs, Kalshi market, BTC flow/book/perpetuals and Kalshi flow, strike distance measured in volatility units, cross-exchange reference quality, spread and analog sample size.
+    - A low YES/NO ask does **not** raise confidence by itself. Low price only creates an opportunity when independent fair value and microstructure support materially higher probability than the ask implies.
     - It is an **evidence-strength score**, not a guaranteed chance that the prediction is correct. Raising the sidebar confidence gate makes the bot produce fewer directional calls.
 
     **Important limitations**
     - The official BRTI is licensed benchmark data. The dashboard's multi-exchange reference is an approximation and can differ by several dollars, which matters when BTC is extremely close to the strike.
     - The displayed ABOVE/BELOW percentages are model estimates and have **not yet been calibrated against a large archive of actual KXBTC15M settlements**.
-    - Hidden liquidity, exchange outages, sudden news and second-by-second volatility can still flip a 15-minute result.
+    - Hidden liquidity, exchange outages, derivatives liquidations, sudden news and second-by-second volatility can still flip a 15-minute result.
+    - Public REST trade/order-book polling is not equivalent to a co-located full-depth event feed; some microstructure events can occur between refreshes.
+    - Low-price edge and gross ROI do not include Kalshi fees, slippage, queue position, partial fills or the possibility that the model is wrong.
     - The bot does not place orders and cannot guarantee a settlement outcome.
 
     **Adaptive learning from previous contracts**
