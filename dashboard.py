@@ -1758,6 +1758,257 @@ def multi_timeframe_candle_intelligence(frame, strike=None):
             "outcome_score": float(np.clip(outcome_score, -100, 100)),
             "agreement": agreement, "timeframes": results, "patterns": pats[:8]}
 
+
+def _rsi(series, period=14):
+    c = pd.to_numeric(series, errors="coerce").astype(float)
+    d = c.diff()
+    gain = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50.0)
+
+
+def _candle_forecast_analogs(history, horizon=15):
+    """Find similar historical candle/momentum regimes and inspect the next 15m return.
+
+    This model intentionally uses BTC OHLCV only. No Kalshi price, order book, whale
+    trades, blockchain flow or settlement target is allowed into these features.
+    """
+    if history is None or len(history) < 300:
+        return None
+    df = history.copy().sort_values("time").drop_duplicates("time", keep="last")
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    if len(df) < 300:
+        return None
+
+    c = df["close"].astype(float)
+    o = df["open"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    v = df["volume"].fillna(0).astype(float)
+    r1 = c.pct_change()
+    rng = (h-l).clip(lower=1e-9)
+    body = (c-o) / rng
+    upper = (h-pd.concat([o,c],axis=1).max(axis=1))/rng
+    lower = (pd.concat([o,c],axis=1).min(axis=1)-l)/rng
+    ema5 = c.ewm(span=5, adjust=False).mean()
+    ema15 = c.ewm(span=15, adjust=False).mean()
+    ema30 = c.ewm(span=30, adjust=False).mean()
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
+    rsi = _rsi(c)
+    vol_med = v.rolling(30, min_periods=10).median().replace(0, np.nan)
+
+    feat = pd.DataFrame(index=df.index)
+    feat["r3"] = c.pct_change(3)
+    feat["r5"] = c.pct_change(5)
+    feat["r15"] = c.pct_change(15)
+    feat["vol15"] = r1.rolling(15).std()
+    feat["vol45"] = r1.rolling(45).std()
+    feat["ema_gap"] = ema5/ema15 - 1
+    feat["ema_slope"] = ema15.pct_change(3)
+    feat["macd_gap"] = (macd-signal) / c
+    feat["rsi"] = (rsi-50)/50
+    feat["body"] = body.rolling(3).mean()
+    feat["upper"] = upper.rolling(3).mean()
+    feat["lower"] = lower.rolling(3).mean()
+    feat["vol_ratio"] = (v/vol_med).clip(0, 5)/5
+    feat["trend30"] = ema15/ema30 - 1
+
+    horizon = int(np.clip(horizon, 5, 30))
+    future_ret = c.shift(-horizon)/c - 1
+    pool = feat.iloc[:-horizon].copy()
+    pool["future_ret"] = future_ret.iloc[:-horizon]
+    pool = pool.dropna()
+    current = feat.iloc[-1]
+    if pool.empty or current.isna().any():
+        return None
+
+    cols = ["r3","r5","r15","vol15","vol45","ema_gap","ema_slope","macd_gap","rsi",
+            "body","upper","lower","vol_ratio","trend30"]
+    X = pool[cols].astype(float)
+    cur = current[cols].astype(float)
+    scale = ((X.quantile(.75)-X.quantile(.25))/1.349).replace(0,np.nan)
+    scale = scale.fillna(X.std().replace(0,np.nan)).fillna(1e-6).clip(lower=1e-6)
+    fw = pd.Series({"r3":1.35,"r5":1.45,"r15":1.25,"vol15":.75,"vol45":.55,
+                    "ema_gap":1.15,"ema_slope":1.0,"macd_gap":1.05,"rsi":.75,
+                    "body":.75,"upper":.45,"lower":.45,"vol_ratio":.45,"trend30":.8})
+    dist = np.sqrt((((X-cur)/scale)**2 * fw).sum(axis=1))
+    k = int(np.clip(len(dist)*.12, 80, 260))
+    idx = dist.nsmallest(min(k,len(dist))).index
+    d = dist.loc[idx].to_numpy(float)
+    y = pool.loc[idx,"future_ret"].to_numpy(float)
+    bandwidth = max(float(np.nanmedian(d)), .35)
+    w = np.exp(-.5*(d/bandwidth)**2)
+    if not np.isfinite(w).any() or w.sum() <= 0:
+        return None
+    p_up = float(np.sum(w*(y>0))/np.sum(w))
+    eff_n = float((w.sum()**2)/max(np.sum(w*w),1e-9))
+    return {
+        "p_up": float(np.clip(p_up,.02,.98)),
+        "effective_n": eff_n,
+        "q10": _weighted_quantile(y,w,.10),
+        "q25": _weighted_quantile(y,w,.25),
+        "q50": _weighted_quantile(y,w,.50),
+        "q75": _weighted_quantile(y,w,.75),
+        "q90": _weighted_quantile(y,w,.90),
+        "mean": float(np.average(y,weights=w)),
+    }
+
+
+def candle_only_15m_forecast(frame, history=None, candle_intel=None):
+    """15-minute BTC direction/range forecast using only candles, volume and price indicators.
+
+    Whale trades, Kalshi order flow/prices and blockchain data are deliberately excluded.
+    The output is probabilistic; confidence measures evidence agreement, not certainty.
+    """
+    df = resample_ohlcv(frame, 1)
+    if len(df) < 45:
+        return {"direction":"UNCERTAIN","p_up":.5,"p_down":.5,"confidence":0.0,
+                "confidence_label":"LOW","reason":"Not enough candle history","horizon_min":15}
+    c = df["close"].astype(float)
+    o = df["open"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    v = df["volume"].fillna(0).astype(float)
+    price = float(c.iloc[-1])
+    r1 = c.pct_change()
+    tr = pd.concat([(h-l),(h-c.shift(1)).abs(),(l-c.shift(1)).abs()],axis=1).max(axis=1)
+    atr = float(tr.tail(14).mean())
+    atr_pct = atr/price if price else 0.0
+    ema5 = c.ewm(span=5,adjust=False).mean()
+    ema15 = c.ewm(span=15,adjust=False).mean()
+    ema30 = c.ewm(span=30,adjust=False).mean()
+    macd = c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean()
+    macd_sig = macd.ewm(span=9,adjust=False).mean()
+    rsi = _rsi(c)
+
+    # Feature score: each piece is bounded so no single indicator can dominate.
+    score = 0.0
+    reasons = []
+    r5 = float(c.iloc[-1]/c.iloc[-6]-1) if len(c)>=6 else 0.0
+    r15 = float(c.iloc[-1]/c.iloc[-16]-1) if len(c)>=16 else 0.0
+    mom_scale = max(float(r1.tail(30).std())*math.sqrt(15), .0006)
+    momentum_unit = float(np.tanh((.60*r5+.40*r15)/mom_scale))
+    score += 1.05*momentum_unit
+    if abs(momentum_unit)>.18:
+        reasons.append("short-term momentum rising" if momentum_unit>0 else "short-term momentum falling")
+
+    ema_gap = float((ema5.iloc[-1]-ema15.iloc[-1])/max(atr,1e-9))
+    ema_slope = float((ema15.iloc[-1]-ema15.iloc[-4])/max(atr,1e-9))
+    trend_unit = float(np.tanh(.9*ema_gap+.8*ema_slope))
+    score += 1.0*trend_unit
+    if abs(trend_unit)>.18:
+        reasons.append("EMA structure bullish" if trend_unit>0 else "EMA structure bearish")
+
+    macd_gap = float((macd.iloc[-1]-macd_sig.iloc[-1])/max(atr,1e-9))
+    macd_slope = float(((macd-macd_sig).iloc[-1]-(macd-macd_sig).iloc[-4])/max(atr,1e-9))
+    macd_unit = float(np.tanh(1.1*macd_gap+.75*macd_slope))
+    score += .70*macd_unit
+
+    rsi_now = float(rsi.iloc[-1])
+    rsi_slope = float(rsi.iloc[-1]-rsi.iloc[-4])
+    rsi_unit = float(np.tanh((rsi_now-50)/18 + rsi_slope/16))
+    score += .60*rsi_unit
+    if rsi_now >= 72 and momentum_unit>0:
+        score -= .20
+        reasons.append("RSI stretched; upside exhaustion risk")
+    elif rsi_now <= 28 and momentum_unit<0:
+        score += .20
+        reasons.append("RSI stretched; downside exhaustion risk")
+
+    # Structure from recent local ranges.
+    recent = df.tail(20)
+    first = recent.iloc[:10]
+    second = recent.iloc[10:]
+    hh = float(second["high"].max()-first["high"].max())/max(atr,1e-9)
+    hl = float(second["low"].min()-first["low"].min())/max(atr,1e-9)
+    structure_unit = float(np.tanh(.55*hh+.55*hl))
+    score += .75*structure_unit
+    if structure_unit>.2: reasons.append("higher-high / higher-low structure")
+    elif structure_unit<-.2: reasons.append("lower-high / lower-low structure")
+
+    # Volume confirmation, not a direction source on its own.
+    vol_med = float(v.tail(30).median()) if float(v.tail(30).median())>0 else 0.0
+    vol_ratio = float(v.tail(3).mean()/vol_med) if vol_med else 1.0
+    if vol_ratio>1.15:
+        score *= min(1.14,1.0+.07*(vol_ratio-1.0))
+        reasons.append("recent volume confirms the move")
+    elif vol_ratio<.60:
+        score *= .90
+        reasons.append("recent volume is weak")
+
+    candle_score = float((candle_intel or {}).get("outcome_score",0.0))/100.0
+    tf_agree = float((candle_intel or {}).get("agreement",0.0))
+    score += 1.15*candle_score
+
+    # Convert bounded evidence to a probability, then blend with historical analogs.
+    heuristic_p = _logistic(1.15*score)
+    analog_source = history if history is not None and len(history)>=300 else df
+    analog = _candle_forecast_analogs(analog_source,15)
+    if analog:
+        analog_w = float(np.clip(.28 + .20*(analog["effective_n"]/150), .28, .48))
+        p_up = (1-analog_w)*heuristic_p + analog_w*analog["p_up"]
+    else:
+        analog_w = 0.0
+        p_up = heuristic_p
+    p_up = float(np.clip(p_up,.05,.95))
+
+    # Expected 15m return distribution. Prefer empirical analog quantiles; fall back to realized vol.
+    sigma15 = max(float(r1.tail(45).std())*math.sqrt(15), atr_pct*math.sqrt(15/14), .0005)
+    if analog and all(np.isfinite(analog[k]) for k in ("q10","q50","q90")):
+        q10,q50,q90 = float(analog["q10"]),float(analog["q50"]),float(analog["q90"])
+        expected_ret = float(.60*analog["q50"]+.40*((p_up-.5)*2*sigma15*.70))
+    else:
+        expected_ret = float((p_up-.5)*2*sigma15*.70)
+        q10,q50,q90 = expected_ret-1.28*sigma15,expected_ret,expected_ret+1.28*sigma15
+    range_low = price*(1+q10)
+    range_high = price*(1+q90)
+    expected_price = price*(1+expected_ret)
+
+    # Invalidation = nearby opposing swing plus ATR buffer.
+    swing_low = float(l.tail(12).min())
+    swing_high = float(h.tail(12).max())
+    invalidation = max(swing_low, price-1.35*atr) if p_up>=.5 else min(swing_high, price+1.35*atr)
+
+    # Reversal risk from exhaustion + wick rejection + indicator disagreement.
+    last5 = df.tail(5)
+    rng = (last5["high"]-last5["low"]).clip(lower=1e-9)
+    upper = (last5["high"]-pd.concat([last5["open"],last5["close"]],axis=1).max(axis=1))/rng
+    lower = (pd.concat([last5["open"],last5["close"]],axis=1).min(axis=1)-last5["low"])/rng
+    opp_wick = float(upper.tail(3).mean()) if p_up>=.5 else float(lower.tail(3).mean())
+    component_signs = [np.sign(x) for x in (momentum_unit,trend_unit,macd_unit,rsi_unit,structure_unit,candle_score) if abs(x)>.12]
+    agreement = abs(sum(component_signs))/len(component_signs) if component_signs else 0.0
+    reversal_score = 35*(1-agreement) + 35*np.clip((opp_wick-.25)/.45,0,1)
+    if (p_up>=.5 and rsi_now>72) or (p_up<.5 and rsi_now<28): reversal_score += 20
+    reversal_score = float(np.clip(reversal_score,0,100))
+    reversal_risk = "HIGH" if reversal_score>=65 else "MODERATE" if reversal_score>=38 else "LOW"
+
+    separation = abs(p_up-.5)*2
+    sample_quality = float(np.clip((analog.get("effective_n",0) if analog else 0)/130,0,1))
+    confidence = 100*(.46*separation+.24*agreement+.18*tf_agree+.12*sample_quality)
+    confidence = float(np.clip(confidence,0,92))
+    if reversal_risk=="HIGH": confidence=min(confidence,64.0)
+    confidence_label = "HIGH" if confidence>=70 else "MEDIUM" if confidence>=50 else "LOW"
+    if confidence>=58 and p_up>=.61: direction="UP"
+    elif confidence>=58 and p_up<=.39: direction="DOWN"
+    else: direction="UNCERTAIN"
+
+    return {
+        "direction":direction,"p_up":p_up,"p_down":1-p_up,"confidence":confidence,
+        "confidence_label":confidence_label,"horizon_min":15,"price":price,
+        "expected_price":float(expected_price),"expected_return":float(expected_ret),
+        "range_low":float(min(range_low,range_high)),"range_high":float(max(range_low,range_high)),
+        "invalidation":float(invalidation),"reversal_risk":reversal_risk,
+        "reversal_score":reversal_score,"rsi":rsi_now,"atr":atr,"volume_ratio":vol_ratio,
+        "heuristic_p_up":float(heuristic_p),"analog":analog,"analog_weight":analog_w,
+        "agreement":float(agreement),"reasons":reasons[:5],
+        "note":"Candles/volume only — excludes whales, Kalshi order flow and blockchain activity.",
+    }
+
 with st.sidebar:
     st.header("Settings")
     st.caption("Automatically searches Kalshi for open BTC 15-minute markets; refreshes discovery about every 5 seconds.")
@@ -2171,8 +2422,10 @@ def _render_live_dashboard_inner():
 
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
+    candle_forecast = candle_only_15m_forecast(candles, outcome_history, candle_engine)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
                               outcome_history, brti_proxy, proxy_samples, learning_model)
+    engine["candle_only_15m"] = candle_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     engine["reversal"] = reversal
     # A strong reversal warning acts as a scalp safety brake: do not keep telling the
@@ -2209,6 +2462,31 @@ def _render_live_dashboard_inner():
         if kalshi_stale:
             age = max(0, int(time.time() - float(st.session_state.get(f"_last_good_kalshi_ts::{active_ticker}", time.time()))))
             st.caption(f"⚠️ Kalshi feed reconnecting — showing last good quotes ({age}s old).")
+
+        # Independent candle-only 15-minute forecast. It deliberately excludes whales,
+        # Kalshi prices/order flow and blockchain activity so the user can compare pure
+        # price-action evidence with the broader expiration model.
+        cf = engine.get("candle_only_15m", {})
+        cf_dir = cf.get("direction", "UNCERTAIN")
+        cf_up = float(cf.get("p_up", .5))*100
+        cf_conf = float(cf.get("confidence", 0.0))
+        cf_expected = cf.get("expected_price")
+        cf_low, cf_high = cf.get("range_low"), cf.get("range_high")
+        cf_inv = cf.get("invalidation")
+        st.markdown("**15-minute candle-only forecast · no whale data**")
+        f1,f2,f3,f4 = st.columns(4)
+        f1.metric("Direction", cf_dir)
+        f2.metric("UP / DOWN", f"{cf_up:.0f}% / {100-cf_up:.0f}%")
+        f3.metric("Confidence", f"{cf_conf:.0f}%")
+        f4.metric("Reversal risk", cf.get("reversal_risk", "—"))
+        if cf_expected is not None and cf_low is not None and cf_high is not None:
+            st.caption(f"Expected ~${cf_expected:,.0f} · likely 15m range ${cf_low:,.0f}–${cf_high:,.0f}" +
+                       (f" · invalidation ${cf_inv:,.0f}" if cf_inv is not None else ""))
+        reasons = [str(x) for x in cf.get("reasons", []) if x]
+        if reasons:
+            st.caption("Candle read: " + " · ".join(reasons[:4]))
+        st.caption("This is a probabilistic BTC price-action forecast, not a guaranteed future price or trade instruction. It uses candles, volume, momentum, volatility and historical analogs only.")
+
         timeframe = st.radio("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True, label_visibility="collapsed", key="candle_size_compact")
         with st.expander("⚙️ Chart options", expanded=False):
             window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
@@ -2297,9 +2575,10 @@ def _render_live_dashboard_inner():
         #chart{width:100%;height:300px;touch-action:none;overscroll-behavior:contain}
         #status{position:absolute;top:9px;left:12px;pointer-events:none;background:#120e16d9;
           border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
+        #reset-view{position:absolute;top:9px;right:70px;z-index:3;background:#211925;color:#d9e3f1;border:1px solid #56303a;border-radius:6px;padding:5px 8px;cursor:pointer}
         #error{color:#ff9eaa;padding:15px;display:none}
         </style></head><body>
-        <div id="frame"><div id="status">COINBASE BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
+        <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">COINBASE BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
         <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
         <script>
         const data=__PAYLOAD__;
@@ -2314,7 +2593,7 @@ def _render_live_dashboard_inner():
             grid:{vertLines:{color:'#251c27'},horzLines:{color:'#251c27'}},
             rightPriceScale:{borderColor:'#51303b',scaleMargins:{top:.08,bottom:.12}},
             timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#51303b',
-              barSpacing:8,minBarSpacing:2,rightOffset:3},
+              barSpacing:8,minBarSpacing:2,rightOffset:3,lockVisibleTimeRangeOnResize:true},
             crosshair:{mode:LC.CrosshairMode.Magnet},
             handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:false,vertTouchDrag:false},
             handleScale:{axisPressedMouseMove:false,mouseWheel:false,pinch:true},
@@ -2354,30 +2633,55 @@ def _render_live_dashboard_inner():
               lastValueVisible:false,priceLineVisible:false});series.setData(o.points);
           });
           const viewKey='btc-kalshi-view-'+data.timeframe;
-          function setInitialView(){
+          // Read before chart layout/resize events can overwrite the previous view.
+          let savedView=null;
+          try { savedView=JSON.parse(localStorage.getItem(viewKey)||'null'); } catch(_) {}
+          let viewReady=false;
+          const validView=v=>v && Number.isFinite(v.span) && v.span>0 && Number.isFinite(v.rightOffset);
+          function defaultView(){
             const n=data.bars.length;
-            let restored=false;
+            const visible=Math.min(n,Math.max(3,data.visible));
+            chart.timeScale().setVisibleLogicalRange({from:n-visible-1,to:n+2});
+          }
+          function saveView(r){
+            if(!viewReady || !r || !Number.isFinite(r.from) || !Number.isFinite(r.to) || r.to<=r.from) return;
+            const anchorIndex=Math.max(0,Math.min(data.bars.length-1,Math.floor(r.to)));
             try {
-              const saved=JSON.parse(localStorage.getItem(viewKey)||'null');
-              if(saved && Number.isFinite(saved.span) && Number.isFinite(saved.rightOffset) && saved.span>1){
-                const to=(n-1)-saved.rightOffset;
-                chart.timeScale().setVisibleLogicalRange({from:to-saved.span,to:to});
-                restored=true;
-              }
+              localStorage.setItem(viewKey,JSON.stringify({
+                span:r.to-r.from,rightOffset:(data.bars.length-1)-r.to,
+                anchorTime:data.bars[anchorIndex].time,anchorOffset:r.to-anchorIndex,
+                followLatest:r.to>=data.bars.length-1
+              }));
             } catch(_) {}
-            if(!restored){
-              const visible=Math.min(n,Math.max(3,data.visible));
-              chart.timeScale().setVisibleLogicalRange({from:n-visible-1,to:n+2});
+          }
+          function setInitialView(){
+            if(validView(savedView)){
+              let to=(data.bars.length-1)-savedView.rightOffset;
+              // Keep historical candles in place when the rolling data window moves.
+              if(savedView.followLatest===false && Number.isFinite(savedView.anchorTime) && Number.isFinite(savedView.anchorOffset)){
+                const index=data.bars.findIndex(b=>b.time===savedView.anchorTime);
+                if(index>=0) to=index+savedView.anchorOffset;
+              }
+              chart.timeScale().setVisibleLogicalRange({from:to-savedView.span,to});
+            } else {
+              defaultView();
             }
+            // Subscribe only after restoration: initial layout must never save defaults.
+            requestAnimationFrame(()=>{
+              viewReady=true;
+              chart.timeScale().subscribeVisibleLogicalRangeChange(saveView);
+            });
           }
           requestAnimationFrame(()=>requestAnimationFrame(setInitialView));
-          chart.timeScale().subscribeVisibleLogicalRangeChange(r=>{
-            if(!r) return;
-            try {
-              localStorage.setItem(viewKey,JSON.stringify({span:r.to-r.from,rightOffset:(data.bars.length-1)-r.to}));
-            } catch(_) {}
+          document.getElementById('reset-view').addEventListener('click',()=>{
+            if(!viewReady) return;
+            defaultView();
+            saveView(chart.timeScale().getVisibleLogicalRange());
           });
-          new ResizeObserver(()=>chart.applyOptions({width:root.clientWidth})).observe(root);
+          window.addEventListener('pagehide',()=>saveView(chart.timeScale().getVisibleLogicalRange()));
+          new ResizeObserver(()=>{
+            if(root.clientWidth>0) chart.applyOptions({width:root.clientWidth});
+          }).observe(root);
 
           // Mobile controls: custom one-finger horizontal panning + native two-finger pinch.
           // Android browsers inside Streamlit iframes can swallow Lightweight Charts' built-in
