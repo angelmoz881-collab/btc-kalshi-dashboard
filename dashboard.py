@@ -2009,6 +2009,164 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
         "note":"Candles/volume only — excludes whales, Kalshi order flow and blockchain activity.",
     }
 
+
+def hourly_price_forecast(frame, history=None, hours=6):
+    """Forecast BTC price at each upcoming hourly horizon from candle/history analogs.
+
+    This is deliberately price-action only. Kalshi quotes, whale-flow and blockchain
+    activity are excluded because they are tied to much shorter-lived market states.
+    The output is a center estimate plus a wide empirical range, not an exact-price call.
+    """
+    hours = int(np.clip(hours, 1, 6))
+    live = resample_ohlcv(frame, 1)
+    hist = resample_ohlcv(history, 1) if isinstance(history, pd.DataFrame) and len(history) else pd.DataFrame()
+    if len(hist):
+        df = pd.concat([hist, live], ignore_index=True)
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df = df.dropna(subset=["time", "open", "high", "low", "close"])
+        df = df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+    else:
+        df = live.copy()
+    if len(df) < 720:
+        return {"price": float(live["close"].iloc[-1]) if len(live) else None,
+                "rows": [], "reason": "Not enough one-minute history for hourly analogs"}
+
+    c = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    h = pd.to_numeric(df["high"], errors="coerce").astype(float)
+    l = pd.to_numeric(df["low"], errors="coerce").astype(float)
+    v = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0).astype(float)
+    price = float(live["close"].iloc[-1]) if len(live) else float(c.iloc[-1])
+    # Keep the history's final close synchronized with the current live spot.
+    c = c.copy()
+    c.iloc[-1] = price
+    r1 = c.pct_change()
+    ema15 = c.ewm(span=15, adjust=False).mean()
+    ema60 = c.ewm(span=60, adjust=False).mean()
+    ema180 = c.ewm(span=180, adjust=False).mean()
+    rsi = _rsi(c)
+    tr = pd.concat([(h-l), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(30, min_periods=15).mean()
+    vol_med = v.rolling(120, min_periods=30).median().replace(0, np.nan)
+
+    feat = pd.DataFrame(index=df.index)
+    feat["r5"] = c.pct_change(5)
+    feat["r15"] = c.pct_change(15)
+    feat["r60"] = c.pct_change(60)
+    feat["r180"] = c.pct_change(180)
+    feat["ema15_gap"] = c/ema15 - 1
+    feat["ema60_gap"] = c/ema60 - 1
+    feat["ema180_gap"] = c/ema180 - 1
+    feat["ema60_slope"] = ema60.pct_change(15)
+    feat["vol30"] = r1.rolling(30).std()
+    feat["vol120"] = r1.rolling(120).std()
+    feat["rsi"] = (rsi-50)/50
+    feat["atr_pct"] = atr/c
+    feat["vol_ratio"] = (v/vol_med).clip(0, 5)/5
+
+    cols = ["r5","r15","r60","r180","ema15_gap","ema60_gap","ema180_gap",
+            "ema60_slope","vol30","vol120","rsi","atr_pct","vol_ratio"]
+    cur = feat.iloc[-1][cols].astype(float)
+    if cur.isna().any():
+        return {"price": price, "rows": [], "reason": "Hourly feature set is still warming up"}
+
+    feature_weights = pd.Series({
+        "r5": .65, "r15": 1.00, "r60": 1.45, "r180": 1.10,
+        "ema15_gap": .80, "ema60_gap": 1.15, "ema180_gap": .85,
+        "ema60_slope": .95, "vol30": .70, "vol120": .75, "rsi": .55,
+        "atr_pct": .70, "vol_ratio": .35,
+    })
+    recent_sigma_1m = max(float(r1.tail(180).std()), 1e-5)
+    r15_now = float(c.iloc[-1]/c.iloc[-16]-1) if len(c) >= 16 else 0.0
+    r60_now = float(c.iloc[-1]/c.iloc[-61]-1) if len(c) >= 61 else 0.0
+    r180_now = float(c.iloc[-1]/c.iloc[-181]-1) if len(c) >= 181 else r60_now
+    one_hour_trend = .58*r60_now + .27*(r180_now/3.0) + .15*(r15_now*4.0)
+
+    rows = []
+    now_utc = pd.Timestamp.now(tz="UTC")
+    for hour in range(1, hours+1):
+        horizon = hour*60
+        future_ret = c.shift(-horizon)/c - 1
+        pool = feat[cols].copy()
+        pool["future_ret"] = future_ret
+        pool = pool.dropna()
+        # Thin neighboring one-minute observations so a single old regime does not
+        # masquerade as hundreds of independent examples.
+        pool = pool.iloc[::3].copy()
+        if len(pool) < 80:
+            continue
+
+        X = pool[cols].astype(float)
+        scale = ((X.quantile(.75)-X.quantile(.25))/1.349).replace(0, np.nan)
+        scale = scale.fillna(X.std().replace(0, np.nan)).fillna(1e-6).clip(lower=1e-6)
+        dist = np.sqrt((((X-cur)/scale)**2 * feature_weights).sum(axis=1))
+        k = int(np.clip(len(dist)*.22, 55, 180))
+        idx = dist.nsmallest(min(k, len(dist))).index
+        d = dist.loc[idx].to_numpy(float)
+        y = pool.loc[idx, "future_ret"].to_numpy(float)
+        bandwidth = max(float(np.nanmedian(d)), .40)
+        w = np.exp(-.5*(d/bandwidth)**2)
+        if not np.isfinite(w).any() or float(np.sum(w)) <= 0:
+            continue
+
+        p_analog = float(np.sum(w*(y > 0))/np.sum(w))
+        eff_n = float((w.sum()**2)/max(np.sum(w*w), 1e-9))
+        q10 = float(_weighted_quantile(y, w, .10))
+        q50 = float(_weighted_quantile(y, w, .50))
+        q90 = float(_weighted_quantile(y, w, .90))
+        sigma_h = max(recent_sigma_1m*math.sqrt(horizon), .0009*math.sqrt(hour))
+
+        # Momentum is intentionally damped with sqrt(time); linear extrapolation of a
+        # 15- or 60-minute move becomes unrealistic very quickly in BTC.
+        trend_projection = float(np.clip(one_hour_trend*math.sqrt(hour), -1.35*sigma_h, 1.35*sigma_h))
+        expected_ret = float(.74*q50 + .26*trend_projection)
+        heuristic_p = _logistic(1.15*trend_projection/max(sigma_h, 1e-6))
+        p_up = float(np.clip(.76*p_analog + .24*heuristic_p, .05, .95))
+
+        normal_low = expected_ret - 1.28*sigma_h
+        normal_high = expected_ret + 1.28*sigma_h
+        low_ret = float(.72*q10 + .28*normal_low)
+        high_ret = float(.72*q90 + .28*normal_high)
+        if low_ret > high_ret:
+            low_ret, high_ret = high_ret, low_ret
+        # Never allow the displayed center estimate to sit outside its own range.
+        low_ret = min(low_ret, expected_ret)
+        high_ret = max(high_ret, expected_ret)
+
+        spread = max(high_ret-low_ret, 1e-6)
+        sample_quality = float(np.clip(eff_n/85.0, 0, 1))
+        directional_strength = float(abs(p_up-.5)*2)
+        range_quality = float(np.clip((3.2*sigma_h)/spread, 0, 1))
+        horizon_decay = float(max(.62, 1.0-.065*(hour-1)))
+        confidence = 100*(.58*directional_strength + .20*sample_quality + .22*range_quality)*horizon_decay
+        confidence = float(np.clip(confidence, 15, 74))
+
+        if p_up >= .58 and expected_ret > 0:
+            direction = "UP"
+        elif p_up <= .42 and expected_ret < 0:
+            direction = "DOWN"
+        else:
+            direction = "UNCERTAIN"
+
+        rows.append({
+            "hour": hour,
+            "target_utc": now_utc + pd.Timedelta(hours=hour),
+            "direction": direction,
+            "p_up": p_up,
+            "confidence": confidence,
+            "expected_price": float(price*(1+expected_ret)),
+            "range_low": float(price*(1+low_ret)),
+            "range_high": float(price*(1+high_ret)),
+            "expected_return": expected_ret,
+            "effective_n": eff_n,
+        })
+
+    return {
+        "price": price,
+        "rows": rows,
+        "history_minutes": int(len(df)),
+        "note": "Candle/history forecast only — excludes Kalshi, whale-flow and blockchain data.",
+    }
+
 with st.sidebar:
     st.header("Settings")
     st.caption("Automatically searches Kalshi for open BTC 15-minute markets; refreshes discovery about every 5 seconds.")
@@ -2423,9 +2581,11 @@ def _render_live_dashboard_inner():
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
     candle_forecast = candle_only_15m_forecast(candles, outcome_history, candle_engine)
+    hourly_forecast = hourly_price_forecast(candles, outcome_history, hours=6)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
                               outcome_history, brti_proxy, proxy_samples, learning_model)
     engine["candle_only_15m"] = candle_forecast
+    engine["hourly_price_forecast"] = hourly_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     engine["reversal"] = reversal
     # A strong reversal warning acts as a scalp safety brake: do not keep telling the
@@ -2443,10 +2603,11 @@ def _render_live_dashboard_inner():
     # label and the next model fit can learn from the mistake or correct call.
     learning_history, _learning_added = record_learning_snapshot(learning_history, active_ticker, engine, candle_engine)
 
-    # Compact mobile navigation. Short labels keep all three choices on one row.
+    # Compact mobile navigation. Hourly price forecasting is isolated from the
+    # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -3036,6 +3197,54 @@ def _render_live_dashboard_inner():
                 st.download_button("Export paper signals (CSV)", pd.DataFrame(st.session_state.paper_signals).to_csv(index=False),
                                    file_name="btc_kalshi_paper_signals.csv", mime="text/csv")
             st.caption("Manual paper signals remain session-only. The adaptive journal above is separate: it records fixed checkpoints automatically and verifies settled YES/NO outcomes through Kalshi.")
+
+
+    if selected_page == "🕐 HOURLY":
+        hf = engine.get("hourly_price_forecast") or {}
+        rows = hf.get("rows") or []
+        st.markdown("### 🕐 BTC hourly price forecast")
+        st.caption("Possible BTC price at each upcoming hour from recent candles, momentum, volatility and similar historical setups. This view does not use Kalshi or whale-flow signals.")
+        if not rows:
+            st.warning(hf.get("reason", "Hourly forecast is warming up. More BTC history is needed."))
+        else:
+            first = rows[0]
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("BTC now", f"${float(hf.get('price', price)):,.0f}")
+            h2.metric("+1h estimate", f"${first['expected_price']:,.0f}")
+            h3.metric("+1h likely range", f"${first['range_low']:,.0f}–${first['range_high']:,.0f}")
+            h4.metric("+1h confidence", f"{first['confidence']:.0f}%")
+
+            forecast_chart = pd.DataFrame({
+                "Hour": [f"+{r['hour']}h" for r in rows],
+                "Center estimate": [r["expected_price"] for r in rows],
+                "Likely low": [r["range_low"] for r in rows],
+                "Likely high": [r["range_high"] for r in rows],
+            }).set_index("Hour")
+            st.markdown("**Forecast path and uncertainty band**")
+            st.line_chart(forecast_chart, height=300, use_container_width=True)
+
+            display_rows = []
+            for r in rows:
+                target = pd.Timestamp(r["target_utc"])
+                display_rows.append({
+                    "Horizon": f"+{r['hour']} hour" if r["hour"] == 1 else f"+{r['hour']} hours",
+                    "Target (CT)": target.tz_convert("America/Chicago").strftime("%I:%M %p"),
+                    "Possible price": f"${r['expected_price']:,.0f}",
+                    "Likely range": f"${r['range_low']:,.0f} – ${r['range_high']:,.0f}",
+                    "Bias": r["direction"],
+                    "Chance higher": f"{r['p_up']*100:.0f}%",
+                    "Confidence": f"{r['confidence']:.0f}%",
+                })
+            st.dataframe(pd.DataFrame(display_rows), hide_index=True, use_container_width=True)
+            st.caption("The center estimate is not a guaranteed target. 'Likely range' is the more important number, and it intentionally widens farther into the future. Confidence measures agreement/analog quality, not the probability that the exact price will occur.")
+            with st.expander("How the hourly forecast is calculated", expanded=False):
+                st.markdown("""
+- Compares the current BTC setup with similar one-minute historical setups using 5m, 15m, 1h and 3h returns, EMA structure, RSI, volatility, ATR and volume.
+- Measures the actual forward return after 1, 2, 3, 4, 5 and 6 hours for the closest historical analogs.
+- Blends the analog median with damped current momentum; it does **not** project the latest move linearly.
+- Uses empirical 10th–90th percentile outcomes plus realized volatility to create the displayed likely range.
+- Confidence is capped and decays with horizon because farther hourly forecasts are inherently less certain.
+                """)
 
 
     if selected_page == "📊 FLOW":
