@@ -1,0 +1,151 @@
+one or ask_cents <= 0:
+        return 0, None
+    cost = float(ask_cents) / 100.0
+    affordable = int(math.floor(float(max_cost) / max(cost, 1e-9)))
+    count = max(0, min(int(max_contracts), affordable))
+    return count, cost
+
+
+def _client_order_id(mode, ticker, side):
+    # Stable per market+direction, so a Streamlit rerun cannot create another order for the same signal.
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"kalshi-gold-auto:{mode}:{ticker}:{side}"))
+
+
+def place_order(mode, ticker, side, count, snapshot):
+    if side == "YES":
+        yes_book_price = Decimal(str(snapshot["yes_ask"] / 100.0))
+        book_side = "bid"
+    else:
+        # V2 uses a single YES-price book: an ask at p gives NO exposure costing 1-p.
+        no_cost = Decimal(str(snapshot["no_ask"] / 100.0))
+        yes_book_price = Decimal("1.0") - no_cost
+        book_side = "ask"
+
+    price = yes_book_price.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    price = min(Decimal("0.9900"), max(Decimal("0.0100"), price))
+    payload = {
+        "ticker": ticker,
+        "side": book_side,
+        "count": f"{Decimal(count):.2f}",
+        "price": f"{price:.4f}",
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "client_order_id": _client_order_id(mode, ticker, side),
+        "post_only": False,
+        "cancel_order_on_pause": True,
+        "reduce_only": False,
+    }
+    result = authenticated_request(mode, "POST", f"{TRADE_PREFIX}/portfolio/events/orders", json_body=payload)
+    return payload, result
+
+
+def _paper_fill(ticker, side, count, snapshot, model):
+    ask = snapshot.get("yes_ask") if side == "YES" else snapshot.get("no_ask")
+    row = {
+        "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ticker": ticker,
+        "side": side,
+        "count": count,
+        "ask_cents": ask,
+        "model_prob_yes": model.get("prob_yes"),
+        "confidence": model.get("confidence"),
+        "yes_ev": model.get("yes_ev"),
+        "no_ev": model.get("no_ev"),
+        "client_order_id": _client_order_id("PAPER", ticker, side),
+    }
+    st.session_state.setdefault("gold_paper_fills", []).append(row)
+    return row
+
+
+def cents(x):
+    return "—" if x is None else f"{x:.1f}¢"
+
+
+def money(x):
+    return "—" if x is None else f"${x:,.2f}"
+
+
+def pct(x):
+    return "—" if x is None else f"{x * 100:.1f}%"
+
+
+with st.sidebar:
+    st.markdown("### Auto-trading controls")
+    execution_mode = st.selectbox(
+        "Execution mode",
+        ["PAPER", "DEMO", "LIVE"],
+        index=0,
+        help="PAPER simulates fills using live production gold data. DEMO sends real API orders to Kalshi's demo environment. LIVE can place real-money production orders.",
+    )
+    auto_enabled = st.toggle("Enable automatic entries", value=False)
+    min_conf = st.slider("Minimum model confidence", 50, 90, 68)
+    min_edge = st.slider("Minimum net edge (¢/contract)", 1.0, 25.0, 8.0, 0.5)
+    max_spread = st.slider("Maximum YES spread (¢)", 1.0, 15.0, 5.0, 0.5)
+    extra_buffer = st.slider("Extra slippage/model buffer (¢)", 0.0, 8.0, 1.0, 0.5)
+    min_seconds = st.slider("Do not enter with less than (sec)", 30, 300, 75, 15)
+    max_seconds = st.slider("Do not enter with more than (sec)", 180, 900, 600, 30)
+    max_quote_age = st.slider("Maximum Pyth settlement quote age (sec)", 5, 120, 30, 5)
+    max_contracts = st.number_input("Max contracts per market", min_value=1, max_value=50, value=1, step=1)
+    max_trade_cost = st.number_input("Max entry cost per market ($)", min_value=0.50, max_value=100.0, value=2.00, step=0.50)
+    st.caption("The bot only enters once per market/direction. IOC orders prevent stale unfilled orders from resting.")
+
+    live_phrase = ""
+    if execution_mode == "LIVE":
+        st.warning("LIVE mode can place real-money orders.")
+        live_phrase = st.text_input("Type LIVE GOLD to arm live trading", value="", type="default")
+        if not _bool_secret("KALSHI_ALLOW_LIVE_TRADING", False):
+            st.error("KALSHI_ALLOW_LIVE_TRADING is not enabled in secrets.")
+
+settings = {
+    "min_conf": int(min_conf),
+    "min_edge": float(min_edge),
+    "max_spread": float(max_spread),
+    "extra_buffer": float(extra_buffer),
+    "min_seconds": int(min_seconds),
+    "max_seconds": int(max_seconds),
+    "max_quote_age": int(max_quote_age),
+    "max_contracts": int(max_contracts),
+    "max_trade_cost": float(max_trade_cost),
+}
+
+
+def render_gold_auto():
+    data_mode = execution_mode if execution_mode == "DEMO" else "PAPER"
+    try:
+        markets = fetch_open_gold_markets(data_mode)
+    except Exception as exc:
+        st.error(f"Gold market discovery failed: {exc}")
+        return
+    if not markets:
+        st.warning(f"No open {GOLD_SERIES} market is available in {data_mode} right now.")
+        return
+
+    options = {f"{m.get('title') or m.get('subtitle') or m['ticker']} · {m['ticker']}": m["ticker"] for m in markets}
+    selected = st.selectbox("Gold 15-minute market", list(options.keys()), key="gold_auto_market")
+    ticker = options[selected]
+
+    try:
+        candles = fetch_gold_proxy_history()
+        pyth = gold_reference_with_fallback(candles)
+        snapshot = market_snapshot(ticker, data_mode)
+    except Exception as exc:
+        st.error(f"Live gold inputs unavailable: {exc}")
+        return
+
+    if not pyth.get("is_settlement_reference", False):
+        fallback_age = pyth.get("age_sec")
+        age_note = f" Current fallback age: {fallback_age:.0f}s." if fallback_age is not None else ""
+        st.warning(
+            "Pyth settlement feed is not authenticated, so the page is using the GC=F futures proxy for PAPER analysis only."
+            + age_note
+            + " DEMO/LIVE auto-orders remain blocked until PYTH_API_KEY is added to Streamlit Secrets."
+        )
+
+    model = build_gold_model(candles, pyth, snapshot, extra_buffer_cents=settings["extra_buffer"])
+    market = snapshot["market"]
+    strike = model.get("strike")
+    remaining = model.get("remaining_sec", 0)
+    mins, secs = divmod(max(0, int(remaining)), 60)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(pyth.get("source", "Gold reference"), mone
