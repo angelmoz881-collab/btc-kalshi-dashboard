@@ -1,0 +1,144 @@
+, 0.45 * sigma_h))
+    threshold = math.log(float(strike) / pyth_price)
+    z = (threshold - drift_h) / max(sigma_h, 1e-9)
+    stat_p = float(np.clip(1.0 - _normal_cdf(z), 0.01, 0.99))
+
+    yes_bid, yes_ask = snapshot.get("yes_bid"), snapshot.get("yes_ask")
+    no_bid, no_ask = snapshot.get("no_bid"), snapshot.get("no_ask")
+    market_p = None
+    if yes_bid is not None and yes_ask is not None:
+        market_p = float(np.clip((yes_bid + yes_ask) / 200.0, 0.01, 0.99))
+    elif yes_ask is not None:
+        market_p = float(np.clip(yes_ask / 100.0, 0.01, 0.99))
+    elif yes_bid is not None:
+        market_p = float(np.clip(yes_bid / 100.0, 0.01, 0.99))
+
+    momentum_z = (0.70 * r3 + 0.30 * r10) / max(sigma1 * math.sqrt(5), 1e-8)
+    momentum_p = _logistic(momentum_z)
+    components = [(stat_p, 0.62), (momentum_p, 0.12)]
+    if market_p is not None:
+        components.append((market_p, 0.26))
+    total_w = sum(w for _, w in components)
+    p = float(sum(v * w for v, w in components) / total_w)
+
+    probs = np.array([v for v, _ in components])
+    weights = np.array([w for _, w in components], dtype=float)
+    weights /= weights.sum()
+    disagreement = float(math.sqrt(np.sum(weights * (probs - p) ** 2))) if len(probs) > 1 else 0.0
+    separation = abs(p - 0.5) * 2.0
+    agreement = float(np.clip(1.0 - disagreement / 0.22, 0, 1))
+    z_strength = min(abs(z) / 2.25, 1.0)
+    confidence = float(np.clip(100 * (0.52 * separation + 0.28 * agreement + 0.20 * z_strength), 0, 92))
+
+    rsi_now = float(_rsi(close).iloc[-1])
+    last5 = aligned.tail(5)
+    rng = (last5["high"] - last5["low"]).clip(lower=1e-9)
+    upper = (last5["high"] - pd.concat([last5["open"], last5["close"]], axis=1).max(axis=1)) / rng
+    lower = (pd.concat([last5["open"], last5["close"]], axis=1).min(axis=1) - last5["low"]) / rng
+    bullish = p >= 0.5
+    opp_wick = float(upper.tail(3).mean()) if bullish else float(lower.tail(3).mean())
+    reversal_score = 55 * np.clip((opp_wick - 0.28) / 0.45, 0, 1)
+    if bullish and rsi_now >= 72:
+        reversal_score += 35
+    if (not bullish) and rsi_now <= 28:
+        reversal_score += 35
+    reversal_score = float(np.clip(reversal_score, 0, 100))
+    reversal_risk = "HIGH" if reversal_score >= 65 else "MODERATE" if reversal_score >= 38 else "LOW"
+    if reversal_risk == "HIGH":
+        confidence = min(confidence, 60.0)
+
+    yes_ev = no_ev = yes_fee = no_fee = None
+    buffer = float(extra_buffer_cents) / 100.0
+    if yes_ask is not None and 0 < yes_ask < 100:
+        yes_cost = yes_ask / 100.0
+        yes_fee = _fee_estimate(yes_cost)
+        yes_ev = p - yes_cost - yes_fee - buffer
+    if no_ask is not None and 0 < no_ask < 100:
+        no_cost = no_ask / 100.0
+        no_fee = _fee_estimate(no_cost)
+        no_ev = (1.0 - p) - no_cost - no_fee - buffer
+
+    spread = (yes_ask - yes_bid) if yes_ask is not None and yes_bid is not None else None
+    call = "YES" if p >= 0.64 and confidence >= 60 else "NO" if p <= 0.36 and confidence >= 60 else "UNCERTAIN"
+
+    out.update({
+        "prob_yes": p,
+        "confidence": confidence,
+        "call": call,
+        "reversal_risk": reversal_risk,
+        "yes_ev": yes_ev,
+        "no_ev": no_ev,
+        "yes_fee": yes_fee,
+        "no_fee": no_fee,
+        "spread": spread,
+        "market_p": market_p,
+        "stat_p": stat_p,
+        "momentum_p": momentum_p,
+        "sigma_1m": sigma1,
+        "z_distance": -z,
+        "rsi": rsi_now,
+        "r3": r3,
+        "r10": r10,
+        "basis": basis,
+        "distance": pyth_price - float(strike),
+    })
+    return out
+
+
+def _format_balance(payload):
+    if not payload:
+        return "—"
+    value = payload.get("balance")
+    if value is None:
+        return "connected"
+    try:
+        # Current event-contract balance responses commonly return integer cents.
+        x = float(value)
+        if float(x).is_integer():
+            return f"${x / 100:,.2f}"
+        return f"${x:,.2f}"
+    except Exception:
+        return str(value)
+
+
+def _execution_candidate(model, snapshot, settings, reference):
+    reasons = []
+    yes_ev = model.get("yes_ev")
+    no_ev = model.get("no_ev")
+    candidates = [("YES", yes_ev), ("NO", no_ev)]
+    candidates = [(side, ev) for side, ev in candidates if ev is not None]
+    if not candidates:
+        return None, None, ["No executable YES/NO ask"]
+    side, ev = max(candidates, key=lambda item: item[1])
+
+    if ev < settings["min_edge"] / 100.0:
+        reasons.append(f"edge {ev * 100:+.1f}¢ < {settings['min_edge']:.1f}¢")
+    if model.get("confidence", 0) < settings["min_conf"]:
+        reasons.append(f"confidence {model.get('confidence', 0):.0f}% < {settings['min_conf']}%")
+    spread = model.get("spread")
+    if spread is None or spread > settings["max_spread"]:
+        reasons.append("spread too wide/unavailable")
+    remaining = model.get("remaining_sec", 0)
+    if remaining < settings["min_seconds"] or remaining > settings["max_seconds"]:
+        reasons.append("outside allowed time-to-expiry window")
+    reference_age = reference.get("age_sec") if isinstance(reference, dict) else None
+    source_name = reference.get("source", "Gold reference") if isinstance(reference, dict) else "Gold reference"
+    is_settlement = bool(reference.get("is_settlement_reference", False)) if isinstance(reference, dict) else False
+    age_limit = settings["max_quote_age"] if is_settlement else max(180, settings["max_quote_age"])
+    if reference_age is None or reference_age > age_limit:
+        if reference_age is None:
+            reasons.append(f"{source_name} quote age unavailable")
+        else:
+            reasons.append(f"{source_name} quote is stale ({reference_age:.0f}s old)")
+    if model.get("reversal_risk") == "HIGH":
+        reasons.append("reversal risk is HIGH")
+    if side == "YES" and snapshot.get("yes_ask") is None:
+        reasons.append("YES ask unavailable")
+    if side == "NO" and snapshot.get("no_ask") is None:
+        reasons.append("NO ask unavailable")
+    return side, ev, reasons
+
+
+def _contracts_for_trade(side, snapshot, max_contracts, max_cost):
+    ask_cents = snapshot.get("yes_ask") if side == "YES" else snapshot.get("no_ask")
+    if ask_cents is N
