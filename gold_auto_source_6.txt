@@ -1,0 +1,110 @@
+y(model.get("current")), f"{pyth.get('age_sec', 0):.1f}s old")
+    m2.metric("Kalshi target", money(strike), f"{model.get('distance', 0):+.2f}" if model.get("distance") is not None else None)
+    m3.metric("Est. YES", pct(model.get("prob_yes")), f"NO {(1-model['prob_yes'])*100:.1f}%" if model.get("prob_yes") is not None else None)
+    m4.metric("Model confidence", f"{model.get('confidence', 0):.0f}%", model.get("call", "UNCERTAIN"))
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Buy YES", cents(snapshot.get("yes_ask")))
+    q2.metric("Buy NO", cents(snapshot.get("no_ask")))
+    q3.metric("YES spread", cents(model.get("spread")))
+    q4.metric("Time left", f"{mins:02d}:{secs:02d}")
+
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("YES net edge", "—" if model.get("yes_ev") is None else f"{model['yes_ev']*100:+.1f}¢")
+    e2.metric("NO net edge", "—" if model.get("no_ev") is None else f"{model['no_ev']*100:+.1f}¢")
+    e3.metric("Reversal risk", model.get("reversal_risk", "—"))
+    e4.metric("RSI", "—" if model.get("rsi") is None else f"{model['rsi']:.1f}")
+
+    side, edge, blockers = _execution_candidate(model, snapshot, settings, pyth)
+    if execution_mode in {"DEMO", "LIVE"} and not pyth.get("is_settlement_reference", False):
+        blockers = list(blockers) + ["Pyth settlement reference unavailable"]
+    st.markdown("### Auto-entry decision")
+    if blockers:
+        st.warning("NO AUTO TRADE · " + " · ".join(blockers))
+    else:
+        st.success(f"QUALIFIED {side} · estimated net edge {edge*100:+.1f}¢/contract")
+
+    mode_ready = True
+    if execution_mode in {"DEMO", "LIVE"}:
+        key_id, private_pem = _trade_credentials(execution_mode)
+        if not key_id or not private_pem:
+            mode_ready = False
+            st.error(f"{execution_mode} credentials are missing from Streamlit secrets.")
+        else:
+            try:
+                bal = fetch_balance(execution_mode)
+                st.caption(f"{execution_mode} API connected · balance {_format_balance(bal)}")
+            except Exception as exc:
+                mode_ready = False
+                st.error(f"{execution_mode} API authentication failed: {exc}")
+
+    if execution_mode == "LIVE":
+        if not _bool_secret("KALSHI_ALLOW_LIVE_TRADING", False) or live_phrase.strip().upper() != "LIVE GOLD":
+            mode_ready = False
+
+    traded_key = f"gold_auto_traded:{execution_mode}:{ticker}:{side or 'NONE'}"
+    already_traded = bool(st.session_state.get(traded_key))
+    if already_traded:
+        st.info("This app session already submitted/recorded this market + direction. Duplicate entry is blocked.")
+
+    if auto_enabled and not blockers and side and mode_ready and not already_traded:
+        count, unit_cost = _contracts_for_trade(side, snapshot, settings["max_contracts"], settings["max_trade_cost"])
+        if count < 1:
+            st.warning("Qualified signal, but the max entry cost is too small for one contract at the current ask.")
+        else:
+            try:
+                if execution_mode == "PAPER":
+                    fill = _paper_fill(ticker, side, count, snapshot, model)
+                    st.session_state[traded_key] = True
+                    st.success(f"PAPER AUTO ENTRY · {count} {side} @ ~{fill['ask_cents']:.1f}¢")
+                else:
+                    payload, result = place_order(execution_mode, ticker, side, count, snapshot)
+                    st.session_state[traded_key] = True
+                    filled = result.get("fill_count", result.get("filled_count", "?"))
+                    remaining_count = result.get("remaining_count", "?")
+                    st.success(f"{execution_mode} ORDER SENT · {count} {side} · fill {filled} · remaining {remaining_count}")
+                    with st.expander("Order response", expanded=False):
+                        st.json({"request": payload, "response": result})
+            except Exception as exc:
+                st.error(f"Auto-order failed: {exc}")
+
+    if not auto_enabled:
+        st.caption("Automatic entries are OFF. Turn them on in the sidebar after checking the gates.")
+
+    chart = candles.tail(180).copy()
+    chart["time"] = pd.to_datetime(chart["time"], utc=True)
+    chart = chart.set_index("time")
+    st.markdown("### Gold momentum proxy")
+    st.line_chart(pd.DataFrame({
+        "GC=F close": chart["close"],
+        "EMA 5": chart["close"].ewm(span=5, adjust=False).mean(),
+        "EMA 15": chart["close"].ewm(span=15, adjust=False).mean(),
+    }), height=280, use_container_width=True)
+    st.caption("Pyth XAU/USD is used for current strike distance when authenticated. If unavailable, GC=F is shown only as a temporary research proxy; DEMO/LIVE auto-orders remain blocked.")
+
+    with st.expander("Model / risk details", expanded=False):
+        st.write({
+            "ticker": ticker,
+            "series": GOLD_SERIES,
+            "gold_reference_source": pyth.get("source"),
+            "pyth_authenticated": pyth.get("is_settlement_reference", False),
+            "reference_quote_age_sec": pyth.get("age_sec"),
+            "statistical_yes": model.get("stat_p"),
+            "market_implied_yes": model.get("market_p"),
+            "momentum_yes": model.get("momentum_p"),
+            "one_minute_vol": model.get("sigma_1m"),
+            "strike_distance_sigma": model.get("z_distance"),
+            "yes_fee_estimate": model.get("yes_fee"),
+            "no_fee_estimate": model.get("no_fee"),
+            "extra_buffer_cents": settings["extra_buffer"],
+        })
+        st.caption("Fee estimates are conservative approximations and can differ from the fee actually shown by Kalshi. No model probability or reversal flag is a guarantee.")
+
+    if st.session_state.get("gold_paper_fills"):
+        with st.expander("Paper auto-trade log", expanded=False):
+            st.dataframe(pd.DataFrame(st.session_state["gold_paper_fills"]), hide_index=True, use_container_width=True)
+
+    st.caption(f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} · Auto trading only runs while this Streamlit session is active unless you deploy a separate always-on worker.")
+
+
+_fragment = getattr(st, "fragment", None) or getattr(st, "exper
