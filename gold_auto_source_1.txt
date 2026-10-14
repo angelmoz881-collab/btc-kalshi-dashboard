@@ -1,0 +1,172 @@
+import base64
+import math
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+st.set_page_config(page_title="Gold × Kalshi Auto | 15m", page_icon="🥇", layout="wide", initial_sidebar_state="collapsed")
+
+GOLD_SERIES = "KXGOLD15M"
+PROD_HOST = "https://external-api.kalshi.com"
+DEMO_HOST = "https://external-api.demo.kalshi.co"
+TRADE_PREFIX = "/trade-api/v2"
+YAHOO_GOLD = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
+PYTH_HERMES = "https://pyth.dourolabs.app/hermes/v2/updates/price/latest"
+PYTH_XAU_FEED_ID = "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
+
+_retry = Retry(
+    total=2,
+    connect=2,
+    read=2,
+    status=2,
+    backoff_factor=0.25,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    raise_on_status=False,
+)
+HTTP = requests.Session()
+HTTP.mount("https://", HTTPAdapter(max_retries=_retry, pool_connections=8, pool_maxsize=16))
+HTTP.headers.update({"User-Agent": "Gold-Kalshi-Auto-Trader/1.0", "Accept": "application/json"})
+
+st.markdown(
+    """
+<style>
+:root{color-scheme:dark}
+.stApp{background:radial-gradient(ellipse at 88% -12%,rgba(184,134,11,.18),transparent 42%),linear-gradient(180deg,#090a0e 0%,#0c0e14 60%,#0c0e14 100%);color:#edf2f8}
+.block-container{max-width:1420px;padding-top:1rem;padding-bottom:2.5rem}
+.gold-hero{padding:18px 22px;border:1px solid rgba(212,175,55,.42);border-radius:18px;background:linear-gradient(120deg,rgba(68,49,8,.72),rgba(17,18,24,.96) 65%);margin-bottom:14px}
+.gold-kicker{font-size:.72rem;font-weight:800;letter-spacing:.14em;color:#e7c95d;text-transform:uppercase}
+.gold-title{font-size:clamp(1.45rem,3vw,2.2rem);font-weight:800;letter-spacing:-.04em;margin-top:5px;color:#fff8dc}
+.gold-sub{font-size:.84rem;color:#c8c1a6;margin-top:5px}
+[data-testid="stMetric"]{background:linear-gradient(145deg,rgba(31,34,44,.95),rgba(17,19,27,.97));border:1px solid rgba(212,175,55,.2);border-radius:14px;padding:14px 15px}
+[data-testid="stMetricLabel"]{color:#aeb8ca!important}
+[data-testid="stMetricValue"]{font-weight:800}
+@media(max-width:650px){.block-container{padding:.45rem .55rem 1.2rem}.gold-hero{padding:11px 13px;border-radius:12px}.gold-title{font-size:1.2rem}.gold-sub{font-size:.72rem}[data-testid="stMetric"]{padding:8px 9px}}
+</style>
+<div class="gold-hero">
+  <div class="gold-kicker">GOLD × KALSHI · 15 MINUTE AUTO TRADER</div>
+  <div class="gold-title">🥇 Gold 15m Auto Trader</div>
+  <div class="gold-sub">Pyth settlement reference · fee-adjusted edge · risk gates · PAPER / DEMO / LIVE execution</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def _secret(name, default=None):
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = os.environ.get(name, default)
+    return value
+
+
+def _bool_secret(name, default=False):
+    value = _secret(name, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_float(value):
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_utc(value):
+    if not value:
+        return None
+    try:
+        return pd.to_datetime(value, utc=True)
+    except Exception:
+        return None
+
+
+def _normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _logistic(x):
+    return 1.0 / (1.0 + math.exp(-float(np.clip(x, -12, 12))))
+
+
+def _mode_host(mode):
+    return DEMO_HOST if mode == "DEMO" else PROD_HOST
+
+
+def _api_base(mode):
+    return _mode_host(mode) + TRADE_PREFIX
+
+
+def _trade_credentials(mode):
+    if mode == "DEMO":
+        key_id = _secret("KALSHI_DEMO_API_KEY_ID") or _secret("KALSHI_API_KEY_ID")
+        private_pem = _secret("KALSHI_DEMO_PRIVATE_KEY") or _secret("KALSHI_PRIVATE_KEY")
+    else:
+        key_id = _secret("KALSHI_API_KEY_ID")
+        private_pem = _secret("KALSHI_PRIVATE_KEY")
+    if isinstance(private_pem, str) and "\\n" in private_pem:
+        private_pem = private_pem.replace("\\n", "\n")
+    return key_id, private_pem
+
+
+def _load_private_key(private_pem):
+    if not private_pem:
+        raise ValueError("Missing Kalshi private key")
+    try:
+        from cryptography.hazmat.primitives import serialization
+    except ImportError as exc:
+        raise RuntimeError("Install cryptography to enable authenticated Kalshi trading") from exc
+    return serialization.load_pem_private_key(str(private_pem).encode("utf-8"), password=None)
+
+
+def _sign_request(private_key, timestamp_ms, method, path):
+    message = f"{timestamp_ms}{method.upper()}{path.split('?')[0]}".encode("utf-8")
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError as exc:
+        raise RuntimeError("Install cryptography to enable authenticated Kalshi trading") from exc
+
+    if isinstance(private_key, Ed25519PrivateKey):
+        signature = private_key.sign(message)
+    else:
+        signature = private_key.sign(
+            message,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
+    return base64.b64encode(signature).decode("utf-8")
+
+
+def _auth_headers(mode, method, path):
+    key_id, private_pem = _trade_credentials(mode)
+    if not key_id or not private_pem:
+        raise ValueError("Kalshi API credentials are not configured")
+    private_key = _load_private_key(private_pem)
+    ts = str(int(time.time() * 1000))
+    signature = _sign_request(private_key, ts, method, path)
+    return {
+        "KALSHI-ACCESS-KEY": str(key_id),
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Gold-Kalshi-Auto-Trader/1.0",
+    }
+
+
+def a
