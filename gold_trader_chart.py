@@ -55,7 +55,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None):
     )
 
     st.markdown("### Gold trader chart")
-    st.caption("1-minute GC=F candles · EMA 5/15 · momentum · heuristic trend/reversal markers")
+    st.caption("1-minute GC=F candles · EMA 5/15 · Kalshi strike · momentum · heuristic trend/reversal markers")
 
     fig = make_subplots(
         rows=2,
@@ -187,23 +187,37 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None):
 
     strike_value = _safe_float(strike)
     current_value = _safe_float(current_ref)
-    if strike_value is not None and y_min <= strike_value <= y_max:
+
+    # Always keep the Kalshi strike visible. This was previously only drawn when
+    # the strike already happened to fall inside the candle auto-range.
+    if strike_value is not None:
+        range_pad = max(price_span * 0.10, abs(strike_value) * 0.00015, 0.25)
+        y_min = min(y_min, strike_value - range_pad)
+        y_max = max(y_max, strike_value + range_pad)
         fig.add_hline(
             y=strike_value,
-            line_dash="dot",
-            line_color="#eab308",
-            annotation_text=f"Kalshi target {strike_value:,.2f}",
+            line_width=2.4,
+            line_dash="dashdot",
+            line_color="#f59e0b",
+            annotation_text=f"KALSHI STRIKE  {strike_value:,.2f}",
             annotation_position="top left",
+            annotation_font_color="#fbbf24",
             row=1,
             col=1,
         )
-    if current_value is not None and y_min <= current_value <= y_max:
+
+    if current_value is not None:
+        ref_pad = max(price_span * 0.08, abs(current_value) * 0.0001, 0.20)
+        y_min = min(y_min, current_value - ref_pad)
+        y_max = max(y_max, current_value + ref_pad)
         fig.add_hline(
             y=current_value,
+            line_width=1.5,
             line_dash="dash",
             line_color="#c084fc",
             annotation_text=f"Gold ref {current_value:,.2f}",
             annotation_position="bottom left",
+            annotation_font_color="#d8b4fe",
             row=1,
             col=1,
         )
@@ -218,7 +232,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None):
         dragmode="pan",
         margin=dict(l=8, r=8, t=14, b=8),
         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-        uirevision="gold-trader-chart-v1",
+        uirevision="gold-trader-chart-v2-strike",
     )
 
     st.plotly_chart(
@@ -229,20 +243,22 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None):
 
     last_mom = _safe_float(chart["mom3"].iloc[-1])
     last_rsi = _safe_float(chart["rsi14"].iloc[-1])
-    c1, c2, c3 = st.columns(3)
+    strike_distance = None
+    if strike_value is not None:
+        strike_reference = current_value if current_value is not None else latest_close
+        strike_distance = strike_reference - strike_value
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("3m momentum", "—" if last_mom is None else f"{last_mom:+.3f}%")
     c2.metric("Chart RSI", "—" if last_rsi is None else f"{last_rsi:.1f}")
     c3.metric("EMA bias", "BULL" if chart["ema5"].iloc[-1] > chart["ema15"].iloc[-1] else "BEAR")
+    c4.metric("To Kalshi strike", "—" if strike_distance is None else f"{strike_distance:+.2f}")
 
-    offscreen = []
-    if strike_value is not None and not (y_min <= strike_value <= y_max):
-        offscreen.append(f"Kalshi target {strike_value:,.2f}")
-    if current_value is not None and not (y_min <= current_value <= y_max):
-        offscreen.append(f"Gold ref {current_value:,.2f}")
-    if offscreen:
-        st.caption("Off-chart reference: " + " · ".join(offscreen))
+    if strike_value is None:
+        st.caption("Kalshi strike is unavailable for the currently selected market.")
 
     st.caption(
+        "Orange dash-dot = Kalshi strike. Purple dashed = current Gold reference. "
         "Markers are heuristic trend/reversal flags, not guaranteed trade signals. "
         "Pyth XAU/USD is used for settlement-reference distance when authenticated; "
         "GC=F remains the chart proxy."
