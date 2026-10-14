@@ -1,0 +1,163 @@
+uthenticated_request(mode, method, path, *, params=None, json_body=None, timeout=12):
+    url = _mode_host(mode) + path
+    headers = _auth_headers(mode, method, path)
+    response = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
+    if response.status_code >= 400:
+        detail = response.text[:600]
+        raise RuntimeError(f"Kalshi {response.status_code}: {detail}")
+    if not response.text:
+        return {}
+    return response.json()
+
+
+def fetch_balance(mode):
+    if mode not in {"DEMO", "LIVE"}:
+        return None
+    return authenticated_request(mode, "GET", f"{TRADE_PREFIX}/portfolio/balance")
+
+
+@st.cache_data(ttl=4, show_spinner=False)
+def fetch_open_gold_markets(mode="PAPER"):
+    base = _api_base(mode)
+    found = []
+    cursor = None
+    for _ in range(5):
+        params = {"limit": 200, "status": "open", "series_ticker": GOLD_SERIES}
+        if cursor:
+            params["cursor"] = cursor
+        r = HTTP.get(f"{base}/markets", params=params, timeout=15)
+        r.raise_for_status()
+        body = r.json()
+        found.extend(body.get("markets", []))
+        cursor = body.get("cursor")
+        if not cursor:
+            break
+    now = pd.Timestamp.now(tz="UTC")
+    out = []
+    for market in found:
+        expiry = _to_utc(market.get("close_time") or market.get("expiration_time"))
+        if market.get("ticker") and (expiry is None or expiry >= now):
+            out.append(market)
+    return sorted(out, key=lambda m: _to_utc(m.get("close_time") or m.get("expiration_time")) or pd.Timestamp.max.tz_localize("UTC"))
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_pyth_gold():
+    # Pyth Core Hermes requires an API key after the August 2026 upgrade.
+    # Keep the key server-side in Streamlit Secrets as PYTH_API_KEY.
+    api_key = str(_secret("PYTH_API_KEY", "") or "").strip()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    r = HTTP.get(
+        PYTH_HERMES,
+        params=[("ids[]", "0x" + PYTH_XAU_FEED_ID), ("parsed", "true")],
+        headers=headers,
+        timeout=8,
+    )
+    if r.status_code in (401, 403):
+        raise PermissionError("Pyth Hermes requires PYTH_API_KEY in Streamlit Secrets")
+    r.raise_for_status()
+    parsed = r.json().get("parsed") or []
+    if not parsed:
+        raise ValueError("Pyth returned no XAU/USD quote")
+    row = parsed[0].get("price") or {}
+    price = float(row["price"]) * (10.0 ** int(row.get("expo", 0)))
+    publish_time = int(row.get("publish_time") or 0)
+    age_sec = max(0.0, time.time() - publish_time) if publish_time else None
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("Invalid Pyth XAU/USD price")
+    return {
+        "price": float(price),
+        "publish_time": publish_time,
+        "age_sec": age_sec,
+        "source": "Pyth XAU/USD",
+        "is_settlement_reference": True,
+        "warning": None,
+    }
+
+
+def gold_reference_with_fallback(candles):
+    try:
+        return fetch_pyth_gold()
+    except Exception as exc:
+        if candles is None or candles.empty:
+            raise
+        last = candles.iloc[-1]
+        price = float(last["close"])
+        ts = pd.Timestamp(last["time"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        age_sec = max(0.0, time.time() - ts.timestamp())
+        return {
+            "price": price,
+            "publish_time": int(ts.timestamp()),
+            "age_sec": age_sec,
+            "source": "GC=F proxy",
+            "is_settlement_reference": False,
+            "warning": str(exc),
+        }
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_gold_proxy_history():
+    r = HTTP.get(
+        YAHOO_GOLD,
+        params={"interval": "1m", "range": "1d", "includePrePost": "true"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    result = ((r.json().get("chart") or {}).get("result") or [])
+    if not result:
+        raise ValueError("Gold futures proxy returned no data")
+    result = result[0]
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    rows = []
+    n = min(len(ts), *(len(quote.get(k) or []) for k in ("open", "high", "low", "close")))
+    volume = quote.get("volume") or []
+    for i in range(n):
+        try:
+            o, h, l, c = (float(quote[k][i]) for k in ("open", "high", "low", "close"))
+            v = float(volume[i]) if i < len(volume) and volume[i] is not None else 0.0
+            if all(math.isfinite(x) and x > 0 for x in (o, h, l, c)):
+                rows.append({
+                    "time": pd.to_datetime(int(ts[i]), unit="s", utc=True),
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+                })
+        except Exception:
+            continue
+    # Yahoo's chart candles can lag the current quote by several minutes.
+    # If metadata carries a newer regular-market quote/timestamp, append a
+    # synthetic one-point candle so fallback freshness is measured correctly.
+    meta = result.get("meta") or {}
+    try:
+        meta_price = float(meta.get("regularMarketPrice"))
+        meta_time = int(meta.get("regularMarketTime") or 0)
+        if math.isfinite(meta_price) and meta_price > 0 and meta_time > 0:
+            latest_row_ts = int(rows[-1]["time"].timestamp()) if rows else 0
+            if meta_time > latest_row_ts:
+                rows.append({
+                    "time": pd.to_datetime(meta_time, unit="s", utc=True),
+                    "open": meta_price,
+                    "high": meta_price,
+                    "low": meta_price,
+                    "close": meta_price,
+                    "volume": 0.0,
+                })
+    except Exception:
+        pass
+
+    df = pd.DataFrame(rows)
+    if len(df) < 35:
+        raise ValueError(f"Only {len(df)} valid one-minute gold proxy candles")
+    return df.sort_values("time").drop_duplicates("time", keep="last").tail(720).reset_index(drop=True)
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def fetc
