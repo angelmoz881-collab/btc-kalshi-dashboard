@@ -1,5 +1,5 @@
 # Gold Auto Trader — generated from the validated source bundle.
-# Keep Kalshi private keys in Streamlit Secrets, never in this repository.
+# Keep Kalshi and Pyth API keys in Streamlit Secrets, never in this repository.
 import base64 as _b64, zlib as _z
 from pathlib import Path as _Path
 _root = _Path(__file__).resolve().parent.parent
