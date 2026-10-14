@@ -1,0 +1,175 @@
+h_market(ticker, mode="PAPER"):
+    r = HTTP.get(f"{_api_base(mode)}/markets/{ticker}", timeout=12)
+    r.raise_for_status()
+    return r.json().get("market", r.json())
+
+
+@st.cache_data(ttl=1, show_spinner=False)
+def fetch_orderbook(ticker, mode="PAPER"):
+    r = HTTP.get(f"{_api_base(mode)}/markets/{ticker}/orderbook", params={"depth": 20}, timeout=12)
+    r.raise_for_status()
+    body = r.json()
+    return body.get("orderbook_fp") or body.get("orderbook") or body
+
+
+def _quote_cents(market, side, kind):
+    for key in (f"{side}_{kind}_dollars", f"{side}_{kind}"):
+        value = market.get(key) if market else None
+        if value is None or value == "":
+            continue
+        try:
+            x = float(value)
+            return x * 100 if key.endswith("_dollars") else x
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _book_levels(book, side):
+    if not isinstance(book, dict):
+        return []
+    book = book.get("orderbook_fp") or book
+    dollar_key = f"{side}_dollars"
+    if dollar_key in book:
+        rows, dollar_prices = book.get(dollar_key) or [], True
+    else:
+        rows, dollar_prices = book.get(side) or [], False
+    out = []
+    for row in rows:
+        try:
+            if isinstance(row, dict):
+                p = row.get("price_dollars", row.get("price"))
+                q = row.get("count_fp", row.get("count", row.get("quantity", row.get("size", 0))))
+                is_dollars = dollar_prices or row.get("price_dollars") is not None
+            else:
+                p, q = row[:2]
+                is_dollars = dollar_prices
+            price = float(p) * (100 if is_dollars else 1)
+            qty = float(q)
+            if 0 <= price <= 100 and qty > 0:
+                out.append((price, qty))
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: x[0], reverse=True)
+
+
+def market_snapshot(ticker, mode="PAPER"):
+    market = fetch_market(ticker, mode)
+    book = fetch_orderbook(ticker, mode)
+    yes = _book_levels(book, "yes")
+    no = _book_levels(book, "no")
+    yes_bid = _quote_cents(market, "yes", "bid")
+    no_bid = _quote_cents(market, "no", "bid")
+    if yes_bid is None and yes:
+        yes_bid = yes[0][0]
+    if no_bid is None and no:
+        no_bid = no[0][0]
+    yes_ask = _quote_cents(market, "yes", "ask")
+    no_ask = _quote_cents(market, "no", "ask")
+    if yes_ask is None and no_bid is not None:
+        yes_ask = 100 - no_bid
+    if no_ask is None and yes_bid is not None:
+        no_ask = 100 - yes_bid
+    return {
+        "market": market,
+        "yes": yes,
+        "no": no,
+        "yes_bid": yes_bid,
+        "no_bid": no_bid,
+        "yes_ask": yes_ask,
+        "no_ask": no_ask,
+    }
+
+
+def extract_strike(market):
+    if not market:
+        return None
+    for key in ("floor_strike", "cap_strike", "strike_price"):
+        value = _safe_float(market.get(key))
+        if value is not None and 100 < value < 100000:
+            return value
+    import re
+    text = " ".join(str(market.get(k, "")) for k in ("title", "subtitle", "rules_primary", "rules_secondary"))
+    matches = re.findall(r"\$?([0-9][0-9,]*\.?[0-9]*)", text)
+    for token in reversed(matches):
+        try:
+            value = float(token.replace(",", ""))
+            if 100 < value < 100000:
+                return value
+        except ValueError:
+            pass
+    return None
+
+
+def _rsi(close, period=14):
+    c = pd.Series(close, dtype="float64")
+    d = c.diff()
+    gain = d.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-d.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(50.0)
+
+
+def _fee_estimate(price_dollars):
+    """Conservative per-contract taker fee approximation; verify actual Kalshi fee schedule/order ticket."""
+    p = float(np.clip(price_dollars, 0.001, 0.999))
+    raw = 0.07 * p * (1.0 - p)
+    return math.ceil(raw * 100.0 - 1e-12) / 100.0
+
+
+def build_gold_model(candles, pyth, snapshot, extra_buffer_cents=1.0):
+    market = snapshot.get("market") or {}
+    strike = extract_strike(market)
+    pyth_price = float(pyth["price"])
+    expiry = _to_utc(market.get("close_time") or market.get("expiration_time"))
+    now = pd.Timestamp.now(tz="UTC")
+    remaining_sec = max(0.0, (expiry - now).total_seconds()) if expiry is not None else 900.0
+    remaining_min = max(remaining_sec / 60.0, 0.25)
+
+    out = {
+        "strike": strike,
+        "current": pyth_price,
+        "remaining_sec": remaining_sec,
+        "prob_yes": None,
+        "confidence": 0.0,
+        "call": "UNCERTAIN",
+        "reversal_risk": "—",
+        "yes_ev": None,
+        "no_ev": None,
+        "yes_fee": None,
+        "no_fee": None,
+        "spread": None,
+        "market_p": None,
+        "stat_p": None,
+        "momentum_p": None,
+        "sigma_1m": None,
+        "z_distance": None,
+        "rsi": None,
+    }
+    if strike is None or candles is None or len(candles) < 35:
+        return out
+
+    df = candles.copy()
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(df) < 35:
+        return out
+
+    gc_last = float(df["close"].iloc[-1])
+    basis = pyth_price / gc_last
+    aligned = df.copy()
+    for col in ("open", "high", "low", "close"):
+        aligned[col] = aligned[col].astype(float) * basis
+    close = aligned["close"].astype(float)
+    lr = np.log(close / close.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+    sigma1 = float(max(lr.tail(60).std(ddof=1), 0.00005))
+    r3 = float(close.iloc[-1] / close.iloc[-4] - 1) if len(close) >= 4 else 0.0
+    r10 = float(close.iloc[-1] / close.iloc[-11] - 1) if len(close) >= 11 else r3
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ema15 = close.ewm(span=15, adjust=False).mean()
+    ema_gap = float(ema5.iloc[-1] / ema15.iloc[-1] - 1.0)
+
+    trend_return = 0.50 * r3 + 0.30 * r10 + 0.20 * ema_gap
+    sigma_h = sigma1 * math.sqrt(max(remaining_min, 0.25))
+    drift_h = float(np.clip(trend_return * 0.25, -0.45 * sigma_h
