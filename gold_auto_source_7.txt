@@ -1,0 +1,8 @@
+imental_fragment", None)
+if _fragment is not None:
+    @_fragment(run_every=5)
+    def _live_gold_auto_fragment():
+        render_gold_auto()
+    _live_gold_auto_fragment()
+else:
+    render_gold_auto()
