@@ -54,6 +54,15 @@ _replace_once(
     "st.caption(f\"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} · Live refresh: {refresh_mode} · Auto trading only runs while this Streamlit session is active unless you deploy a separate always-on worker.\")",
 )
 
+# The expiration countdown is browser-clocked from Kalshi's absolute expiry.
+# Streamlit can rerun every 2–5 seconds without resetting the countdown.
+_replace_once(
+    '    q4.metric("Time left", f"{mins:02d}:{secs:02d}")\n',
+    '    with q4:\n'
+    '        from gold_trader_chart import render_gold_expiry_timer\n'
+    '        render_gold_expiry_timer(market.get("close_time") or market.get("expiration_time"), ticker=ticker)\n',
+)
+
 _replace_once(
 '''    chart = candles.tail(180).copy()
     chart["time"] = pd.to_datetime(chart["time"], utc=True)
@@ -71,6 +80,8 @@ _replace_once(
         candles,
         strike=strike,
         current_ref=model.get("current"),
+        ticker=ticker,
+        refresh_label=refresh_mode,
     )
 ''',
 )
