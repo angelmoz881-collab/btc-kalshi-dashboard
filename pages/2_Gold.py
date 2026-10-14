@@ -54,4 +54,25 @@ _replace_once(
     "st.caption(f\"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} · Live refresh: {refresh_mode} · Auto trading only runs while this Streamlit session is active unless you deploy a separate always-on worker.\")",
 )
 
+_replace_once(
+'''    chart = candles.tail(180).copy()
+    chart["time"] = pd.to_datetime(chart["time"], utc=True)
+    chart = chart.set_index("time")
+    st.markdown("### Gold momentum proxy")
+    st.line_chart(pd.DataFrame({
+        "GC=F close": chart["close"],
+        "EMA 5": chart["close"].ewm(span=5, adjust=False).mean(),
+        "EMA 15": chart["close"].ewm(span=15, adjust=False).mean(),
+    }), height=280, use_container_width=True)
+    st.caption("Pyth XAU/USD is used for current strike distance when authenticated. If unavailable, GC=F is shown only as a temporary research proxy; DEMO/LIVE auto-orders remain blocked.")
+''',
+'''    from gold_trader_chart import render_gold_trader_chart
+    render_gold_trader_chart(
+        candles,
+        strike=strike,
+        current_ref=model.get("current"),
+    )
+''',
+)
+
 exec(compile(_source, "2_Gold.py", "exec"), globals(), globals())
