@@ -8,6 +8,7 @@ from urllib3.util.retry import Retry
 import pandas as pd
 import numpy as np
 import streamlit as st
+from arena_core import analyze_arena
 import json
 import html
 import os
@@ -84,7 +85,7 @@ hr {border-color:#3b222b!important}
   [data-testid="stMetricValue"]{font-size:.9rem!important}
   [data-testid="stMetricDelta"]{font-size:.61rem!important}
   [data-testid="stRadio"] label{padding:2px 5px!important;border-radius:7px!important;font-size:.68rem!important}
-  [data-testid="stRadio"] div[role="radiogroup"]{gap:3px!important;flex-wrap:nowrap!important}
+  [data-testid="stRadio"] div[role="radiogroup"]{gap:3px!important;flex-wrap:wrap!important}
   [data-testid="stSelectbox"] label{font-size:.66rem!important;margin-bottom:0!important}
   [data-testid="stSelectbox"] div[data-baseweb="select"]>div{min-height:36px!important;height:36px!important}
   [data-testid="stExpander"] summary{min-height:34px!important;padding-top:4px!important;padding-bottom:4px!important;font-size:.72rem!important}
@@ -2588,6 +2589,14 @@ def _render_live_dashboard_inner():
     engine["hourly_price_forecast"] = hourly_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     engine["reversal"] = reversal
+    # Evaluate independent experts against past settled markets, without placing orders.
+    arena = analyze_arena(
+        learning_history, engine, kalshi_data,
+        min_edge_cents=max(10.0, float(min_edge)),
+        candle_stale=candle_feed_stale, market_stale=kalshi_stale,
+        volatility_15m_pct=vol15,
+    )
+    engine["arena"] = arena
     # A strong reversal warning acts as a scalp safety brake: do not keep telling the
     # user to chase a direction that multiple independent reversal clues oppose.
     if reversal.get("score", 0) >= 60:
@@ -2607,7 +2616,7 @@ def _render_live_dashboard_inner():
     # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -2615,6 +2624,11 @@ def _render_live_dashboard_inner():
 
 
     if selected_page == "📈 CHART":
+        val = (engine.get("arena") or {}).get("validation") or {}
+        if val.get("active"):
+            st.caption("🏆 Arena blend passed historical validation · paper research only")
+        else:
+            st.caption(f"🏆 Arena training: {int(val.get('n', 0))}/120 comparable settled BTC markets")
         if active_ticker:
             market_status = kalshi_data['market'].get('status', 'unknown') if kalshi_data else 'quotes unavailable'
             st.markdown(f'<div class="compact-status">🎯 {html.escape(str(active_ticker))} · {html.escape(str(market_status))}</div>', unsafe_allow_html=True)
@@ -3303,7 +3317,7 @@ def _render_live_dashboard_inner():
         st.markdown("""
     **How to use this dashboard**
     - **CHART:** Coinbase BTC candles plus the Kalshi strike, a blue BRTI-proxy line, countdown, estimated ABOVE/BELOW probability, model confidence, scalping watch and live quotes.
-    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
+    - **ARENA:** Competing model Brier scores, settlement validation, and independent paper-only EV.\n    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
     - **GUIDE:** Explains how the outcome model is built and where uncertainty remains.
 
     **What Outcome Fusion v2 adds**
