@@ -8,6 +8,7 @@ from urllib3.util.retry import Retry
 import pandas as pd
 import numpy as np
 import streamlit as st
+from arena_core import analyze_arena
 import json
 import html
 import os
@@ -84,7 +85,7 @@ hr {border-color:#3b222b!important}
   [data-testid="stMetricValue"]{font-size:.9rem!important}
   [data-testid="stMetricDelta"]{font-size:.61rem!important}
   [data-testid="stRadio"] label{padding:2px 5px!important;border-radius:7px!important;font-size:.68rem!important}
-  [data-testid="stRadio"] div[role="radiogroup"]{gap:3px!important;flex-wrap:nowrap!important}
+  [data-testid="stRadio"] div[role="radiogroup"]{gap:3px!important;flex-wrap:wrap!important}
   [data-testid="stSelectbox"] label{font-size:.66rem!important;margin-bottom:0!important}
   [data-testid="stSelectbox"] div[data-baseweb="select"]>div{min-height:36px!important;height:36px!important}
   [data-testid="stExpander"] summary{min-height:34px!important;padding-top:4px!important;padding-bottom:4px!important;font-size:.72rem!important}
@@ -2256,6 +2257,7 @@ def _render_live_dashboard_inner():
 
     # Pull the ticker separately so the displayed price/current candle can move every
     # live refresh instead of waiting on the candle endpoint alone.
+    spot_feed_stale = False
     try:
         _spot = get_spot_price()
         _now_minute = pd.Timestamp.now(tz="UTC").floor("min")
@@ -2275,7 +2277,7 @@ def _render_live_dashboard_inner():
             }])
             candles = pd.concat([candles, _new], ignore_index=True).tail(300).reset_index(drop=True)
     except (requests.RequestException, KeyError, ValueError, TypeError):
-        pass
+        spot_feed_stale = True
 
     last = candles.iloc[-1]
     prev = candles.iloc[-2]
@@ -2588,6 +2590,14 @@ def _render_live_dashboard_inner():
     engine["hourly_price_forecast"] = hourly_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     engine["reversal"] = reversal
+    # Evaluate independent experts against past settled markets, without placing orders.
+    arena = analyze_arena(
+        learning_history, engine, kalshi_data,
+        min_edge_cents=max(10.0, float(min_edge)),
+        candle_stale=(candle_feed_stale or spot_feed_stale), market_stale=kalshi_stale,
+        volatility_15m_pct=vol15,
+    )
+    engine["arena"] = arena
     # A strong reversal warning acts as a scalp safety brake: do not keep telling the
     # user to chase a direction that multiple independent reversal clues oppose.
     if reversal.get("score", 0) >= 60:
@@ -2607,7 +2617,7 @@ def _render_live_dashboard_inner():
     # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -2615,6 +2625,11 @@ def _render_live_dashboard_inner():
 
 
     if selected_page == "📈 CHART":
+        val = (engine.get("arena") or {}).get("validation") or {}
+        if val.get("active"):
+            st.caption("🏆 Arena blend passed historical validation · paper research only")
+        else:
+            st.caption(f"🏆 Arena training: {int(val.get('n', 0))}/120 comparable settled BTC markets")
         if active_ticker:
             market_status = kalshi_data['market'].get('status', 'unknown') if kalshi_data else 'quotes unavailable'
             st.markdown(f'<div class="compact-status">🎯 {html.escape(str(active_ticker))} · {html.escape(str(market_status))}</div>', unsafe_allow_html=True)
@@ -3199,6 +3214,55 @@ def _render_live_dashboard_inner():
             st.caption("Manual paper signals remain session-only. The adaptive journal above is separate: it records fixed checkpoints automatically and verifies settled YES/NO outcomes through Kalshi.")
 
 
+
+    if selected_page == "🏆 ARENA":
+        arena = engine.get("arena") or {}
+        review = arena.get("paper") or {}
+        validation = arena.get("validation") or {}
+        st.markdown("### 🏆 Battle of the Bots · Model Arena")
+        st.caption("Score models against officially settled BTC contracts. Lower Brier score means better historical probability estimates, not higher trading profits.")
+        a1, a2, a3 = st.columns(3)
+        base, independent, blended = arena.get("baseline_p"), arena.get("independent_p"), arena.get("blend_p")
+        a1.metric("Current YES", f"{base:.1%}" if base is not None else "—")
+        a2.metric("Independent YES", f"{independent:.1%}" if independent is not None else "—")
+        a3.metric("Validated blend", f"{blended:.1%}" if validation.get("active") and blended is not None else "LOCKED")
+        n = int(validation.get("n", 0))
+        st.progress(min(1.0, n / 120.0), text=f"Settled markets for validation · {n}/120")
+        st.caption(validation.get("status", "Collecting independent results"))
+        st.caption("Independent model: strike/volatility 65%, similar historical setups 25%, flow/candles 10%. Kalshi's market price is excluded to prevent circular edge estimates.")
+        if validation.get("recent_base_brier") is not None:
+            v1, v2 = st.columns(2)
+            v1.metric("Old model Brier · 120 markets", f"{validation['recent_base_brier']:.4f}")
+            v2.metric("Arena blend Brier · 120 markets", f"{validation['recent_blend_brier']:.4f}")
+        st.markdown("**Model leaderboard · official settlements**")
+        board = arena.get("scoreboard") or []
+        if board:
+            visible = [{k: row[k] for k in ("Model", "Markets", "Brier ↓", "Hit rate", "95% hit CI", "Status")} for row in board]
+            st.dataframe(pd.DataFrame(visible), hide_index=True, use_container_width=True, height=min(340, 45 * (len(visible)+1)))
+            st.caption("Only one historical checkpoint is counted per market. Under 100 results are provisional. These are prediction scores, not backtested order fills.")
+        else:
+            st.info("No independently verified model outcomes yet. Keep collecting and reconciling Kalshi settlements.")
+        st.markdown("**Conservative paper-entry research · one contract**")
+        if review.get("status") == "PAPER CANDIDATE":
+            st.success(f"PAPER ONLY · {review.get('side')} · hypothetical net EV {review.get('net_ev_cents'):+.1f}¢")
+        else:
+            st.warning("NO TRADE · Research watch")
+        st.caption(review.get("reason", "Waiting for live market inputs"))
+        if review.get("entry_cents") is not None:
+            st.caption(f"Estimated 1-contract entry {review['entry_cents']:.1f}¢ · 3¢ assumed fee + 2¢ slippage allowance, not a verified Kalshi fee.")
+        st.caption("Blocked for stale prices, wide spread, thin orderbook, <60s until expiry, volatile regimes, weak multi-exchange agreement or insufficient validated settlements.")
+        with st.expander("How each model competes"):
+            st.markdown("""
+            - **Volatility / strike:** Prices settlement against the Kalshi strike using observed BTC volatility.
+            - **Historical analogs:** Compares similar previously observed BTC setups.
+            - **Flow / candles:** Looks at recent directional BTC behavior and aggressive trade flow.
+            - **Kalshi consensus:** Uses observed market quotes as a benchmark, not a free edge.
+            - **Existing fusion / learner:** Your prior combined and adaptive predictions.
+            - **Arena blend:** A fixed 70% existing + 30% independent forecast. Unlocks only after at least 120 distinct settled contracts and improvement in BOTH chronological halves.
+            """)
+        st.caption("Paper research only · no live trading orders · the official BRTI settlement index can differ from public price proxies.")
+
+
     if selected_page == "🕐 HOURLY":
         hf = engine.get("hourly_price_forecast") or {}
         rows = hf.get("rows") or []
@@ -3303,7 +3367,7 @@ def _render_live_dashboard_inner():
         st.markdown("""
     **How to use this dashboard**
     - **CHART:** Coinbase BTC candles plus the Kalshi strike, a blue BRTI-proxy line, countdown, estimated ABOVE/BELOW probability, model confidence, scalping watch and live quotes.
-    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
+    - **ARENA:** Competing model Brier scores, settlement validation, and independent paper-only EV.\n    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
     - **GUIDE:** Explains how the outcome model is built and where uncertainty remains.
 
     **What Outcome Fusion v2 adds**
