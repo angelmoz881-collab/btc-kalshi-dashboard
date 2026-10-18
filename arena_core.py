@@ -221,7 +221,8 @@ def paper_edge_review(independent, snapshot, validated, *,
     remain = number(remaining_sec)
     if remain is None or remain <= 60 or remain > 900:
         reasons.append("Too close to expiry or missing expiry timestamp")
-    if number(venues, 0) < 3 or (number(dispersion_bps) is None or dispersion_bps > 12):
+    dispersion = number(dispersion_bps)
+    if number(venues, 0) < 3 or dispersion is None or dispersion > 12:
         reasons.append("Reference-exchange consensus is insufficient")
     if number(volatility_15m_pct) is None or volatility_15m_pct > 1.0:
         reasons.append("Volatility shock or unavailable 15-minute volatility")
