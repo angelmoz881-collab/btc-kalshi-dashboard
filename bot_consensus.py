@@ -74,7 +74,8 @@ def _vote(source, ticker, side, confidence, time_value, *, now, max_age=MAX_AGE_
     if age is None or not side or conf is None or conf < 0.55:
         return None
     return {"Source": source, "Ticker": ticker, "Vote": side,
-            "Confidence": round(conf*100, 1), "Age (s)": age}
+            "Confidence": round(conf*100, 1), "Age (s)": age,
+            "Timestamp UTC": _utc(time_value).isoformat()}
 
 
 def parse_cotes(payload, ticker, *, now=None, max_age=MAX_AGE_SECONDS):
@@ -199,7 +200,7 @@ def fetch_external_votes(ticker, config, *, now=None, session=None):
 
 
 def vote_consensus(votes, *, ticker, model_probability=None,
-                   min_voters=MIN_DISTINCT_PROVIDERS, local_veto=True):
+                   min_voters=MIN_DISTINCT_PROVIDERS, local_veto=True, now=None):
     """ONLY external provider votes decide side; local estimate can VETO, not vote.
 
     A contradictory bot blocks trading. Missing provider is not counted as approval.
@@ -207,6 +208,7 @@ def vote_consensus(votes, *, ticker, model_probability=None,
     """
     valid = []
     seen = set()
+    now = _now(now)
     for item in votes or []:
         if not isinstance(item, dict) or item.get("Ticker") != ticker:
             continue
@@ -214,14 +216,16 @@ def vote_consensus(votes, *, ticker, model_probability=None,
         if not isinstance(source, str) or not source or source in seen or side not in ("YES", "NO"):
             continue
         try:
-            age = float(item.get("Age (s)", float("inf")))
             conf = float(item.get("Confidence", 0))
         except (TypeError, ValueError, OverflowError):
             continue
-        if not 0 <= age <= MAX_AGE_SECONDS or not 55 <= conf <= 100:
+        age = _valid_time(item.get("Timestamp UTC"), now, MAX_AGE_SECONDS)
+        if age is None or not 55 <= conf <= 100:
             continue
         seen.add(source)
-        valid.append(item)
+        fresh = dict(item)
+        fresh["Age (s)"] = age
+        valid.append(fresh)
     yes = sum(v["Vote"] == "YES" for v in valid)
     no = sum(v["Vote"] == "NO" for v in valid)
     vote_count = len(valid)
