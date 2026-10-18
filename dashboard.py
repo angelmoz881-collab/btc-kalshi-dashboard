@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from kalshi_connection import check_connection, credentials_from_secrets, KalshiConnectionError
+from bot_consensus import fetch_external_votes, vote_consensus, apply_consensus_to_engine
 from arena_core import analyze_arena
 import json
 import html
@@ -188,6 +189,12 @@ def _normalize_learning_history(df):
 
 def possible_expiration_outcome(engine):
     """A tentative view of the same expiry estimate, independent of the regular call."""
+    external = engine.get("external_consensus")
+    if isinstance(external, dict):
+        if external.get("status") != "AGREE":
+            return "NO EXTERNAL AGREEMENT", str(external.get("reason", "Waiting for external bot signals"))
+        aligned_side = "ABOVE" if external.get("side") == "YES" else "BELOW"
+        return f"BOTS AGREE {aligned_side}", str(external.get("reason", "Confirmed external bot consensus"))
     try:
         p = float(engine.get("prob_above"))
         confidence = float(engine.get("confidence", 0))
@@ -2212,6 +2219,11 @@ with st.sidebar:
         help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
     )
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
+    with st.expander("🤝 External bot signal feeds", expanded=False):
+        st.caption("External-vote mode: the displayed YES/NO outcome requires TWO independently operated, fresh feeds for the same exact ticker. Your existing local models never count as other bots.")
+        st.caption("Supported: SpectralEdge/Cotes AI (COTES_API_KEY), plus optional independent HTTPS JSON feeds BOT_SIGNAL_URL_2/BOT_SIGNAL_TOKEN_2 and BOT_SIGNAL_URL_3/BOT_SIGNAL_TOKEN_3.")
+        st.caption("Configure credentials in Streamlit Cloud Secrets; never paste keys into GitHub. An unconnected provider never counts as an agreeing vote.")
+
     with st.expander("🔑 Kalshi account connection", expanded=False):
         st.caption("Check your Kalshi account securely. Read-only authentication; this Bitcoin bot does not place real orders.")
         connection_env = st.selectbox("Kalshi environment", ["DEMO", "LIVE"],
@@ -2236,6 +2248,16 @@ with st.sidebar:
             st.info("No API key found for this environment. Add the Key ID and private key in Streamlit Cloud → App settings → Secrets.")
             st.code(("KALSHI_DEMO_API_KEY_ID" if connection_env == "DEMO" else "KALSHI_API_KEY_ID")
                     + " and " + ("KALSHI_DEMO_PRIVATE_KEY" if connection_env == "DEMO" else "KALSHI_PRIVATE_KEY"))
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def cached_external_bot_votes(ticker, cotes_key, partner2_url, partner2_token, partner3_url, partner3_token):
+    config = {
+        "COTES_API_KEY": cotes_key,
+        "BOT_SIGNAL_URL_2": partner2_url, "BOT_SIGNAL_TOKEN_2": partner2_token,
+        "BOT_SIGNAL_URL_3": partner3_url, "BOT_SIGNAL_TOKEN_3": partner3_token,
+    }
+    return fetch_external_votes(ticker, config)
 
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
@@ -2616,6 +2638,24 @@ def _render_live_dashboard_inner():
     engine["hourly_price_forecast"] = hourly_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     engine["reversal"] = reversal
+    # Direction displayed to users comes from independent third-party bot
+    # providers, not from a locally synthesized YES/NO estimate. Missing,
+    # stale or conflicting external signals mean WAIT.
+    try:
+        live_external_votes, external_feed_health = cached_external_bot_votes(
+            active_ticker,
+            _secret("COTES_API_KEY"),
+            _secret("BOT_SIGNAL_URL_2"), _secret("BOT_SIGNAL_TOKEN_2"),
+            _secret("BOT_SIGNAL_URL_3"), _secret("BOT_SIGNAL_TOKEN_3"),
+        )
+    except Exception:
+        live_external_votes, external_feed_health = [], ["External bot feeds temporarily unavailable"]
+    external_verdict = vote_consensus(
+        live_external_votes, ticker=active_ticker,
+        model_probability=engine.get("prob_above"),
+    )
+    engine = apply_consensus_to_engine(engine, external_verdict)
+    engine["external_feed_health"] = external_feed_health
     # Evaluate independent experts against past settled markets, without placing orders.
     arena = analyze_arena(
         learning_history, engine, kalshi_data,
@@ -2643,7 +2683,7 @@ def _render_live_dashboard_inner():
     # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "🤝 BOTS", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -2651,6 +2691,11 @@ def _render_live_dashboard_inner():
 
 
     if selected_page == "📈 CHART":
+        c = engine.get("external_consensus") or {}
+        if c.get("status") == "AGREE":
+            st.success(f"🤝 {c['total']} EXTERNAL BOTS AGREE: {'ABOVE / YES' if c['side'] == 'YES' else 'BELOW / NO'} · early exit research only")
+        else:
+            st.warning(f"🤝 WAIT · NO EXTERNAL BOT AGREEMENT · {c.get('reason','Insufficient live bot data')}")
         val = (engine.get("arena") or {}).get("validation") or {}
         if val.get("active"):
             st.caption("🏆 Arena blend passed historical validation · paper research only")
@@ -3056,8 +3101,8 @@ def _render_live_dashboard_inner():
           </div>
           <div class="grid4b">
             <div class="tile"><small>EXPIRATION OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
-            <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
-            <div class="tile"><small>EVIDENCE SCORE</small><strong id="confidence"></strong><em id="confSub"></em></div>
+            <div class="tile"><small>LOCAL EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
+            <div class="tile"><small>LOCAL EVIDENCE</small><strong id="confidence"></strong><em id="confSub"></em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>scalp model unvalidated</em></div>
           </div>
           <div class="rev"><b id="possibleOutcome" style="color:#ffcf77"></b><span id="possibleDetail"></span></div>
@@ -3241,6 +3286,34 @@ def _render_live_dashboard_inner():
 
 
 
+    if selected_page == "🤝 BOTS":
+        c = engine.get("external_consensus") or {}
+        st.markdown("### 🤝 Real external bot agreement")
+        st.caption("These are actual signal-feed votes for this exact active KXBTC15M ticker, not a vote fabricated from the dashboard's own indicators.")
+        left, middle, right = st.columns(3)
+        left.metric("Outside feeds online", f"{c.get('total', 0)}/{c.get('required', 2)}")
+        middle.metric("YES votes", str(c.get("yes", 0)))
+        right.metric("NO votes", str(c.get("no", 0)))
+        if c.get("status") == "AGREE":
+            st.success(f"EXTERNAL BOTS AGREE · {c['side']} · {c.get('reason', '')}")
+        else:
+            st.warning("WAIT · " + c.get("reason", "No confirmed outside-bot votes"))
+        votes_table = c.get("votes") or []
+        if votes_table:
+            st.dataframe(pd.DataFrame(votes_table), hide_index=True, use_container_width=True)
+        else:
+            st.info("No current, verified third-party bot predictions for this market. The app intentionally refuses to invent them.")
+        with st.expander("Signal provider availability", expanded=True):
+            for message in engine.get("external_feed_health") or []:
+                st.caption("• " + message)
+        st.markdown("**Connect other independent bots**")
+        st.caption("Provider 1: SpectralEdge/Cotes AI live KXBTC15M signals. Get a subscription/API key directly from their service, then save COTES_API_KEY in Streamlit Secrets.")
+        st.caption("Providers 2 and 3: independently operated HTTPS endpoints in BOT_SIGNAL_URL_2 and BOT_SIGNAL_URL_3, plus optional matching bearer tokens. Their JSON must include ticker, side, confidence and UTC timestamp; identical provider hosts cannot count twice.")
+        st.code('{"ticker":"KXBTC15M-EXACT-TICKER","side":"YES","confidence":0.78,"timestamp":"2026-10-18T21:00:00Z","status":"live"}', language="json")
+        st.caption("Above JSON is a schema example only, not an actual prediction or live contract.")
+        st.caption("Agreement is about the predicted SETTLEMENT direction. It does not guarantee a short-term scalp exit or profit. Live order execution remains disabled.")
+
+
     if selected_page == "🏆 ARENA":
         arena = engine.get("arena") or {}
         review = arena.get("paper") or {}
@@ -3393,7 +3466,7 @@ def _render_live_dashboard_inner():
         st.markdown("""
     **How to use this dashboard**
     - **CHART:** Coinbase BTC candles plus the Kalshi strike, a blue BRTI-proxy line, countdown, estimated ABOVE/BELOW probability, model confidence, scalping watch and live quotes.
-    - **ARENA:** Competing model Brier scores, settlement validation, and independent paper-only EV.\n    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
+    - **BOTS:** Fresh, exact-market live signals from independently operated third-party bot feeds; require at least two agreeing before displaying a directional outcome.\n    - **ARENA:** Historical internal-model diagnostics and independent paper-only EV, not outside-bot votes.\n    - **FLOW:** Kalshi order book, bid depth, YES/NO spread, and whether the expiry model clears the confidence/edge gates.
     - **GUIDE:** Explains how the outcome model is built and where uncertainty remains.
 
     **What Outcome Fusion v2 adds**
@@ -3405,7 +3478,7 @@ def _render_live_dashboard_inner():
     - Candle intelligence, aggressive Coinbase trade flow and Kalshi depth are used as a **small confirmation layer**, not allowed to overpower the strike-distance/statistical models.
     - During the **last 60 seconds**, the bot records the live multi-exchange proxy and estimates the average already observed. It then calculates the average price still required over the remaining seconds for the final 60-second settlement average to finish above the strike.
     - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
-    - **POSSIBLE ABOVE / BELOW** is a separate tentative expiration view using the same model: it needs at least 55% estimated directional probability; its evidence score stays visible. Near 50/50 or with weaker evidence it says **NO CLEAR LEAN**. It does not change the regular expiration call, scalp signals, or learning labels. Model confidence is an evidence score, not a success probability.
+    - **POSSIBLE ABOVE / BELOW** (local research view, superseded by external-bot consensus) is a separate tentative expiration view using the same model: it needs at least 55% estimated directional probability; its evidence score stays visible. Near 50/50 or with weaker evidence it says **NO CLEAR LEAN**. It does not change the regular expiration call, scalp signals, or learning labels. Model confidence is an evidence score, not a success probability.
 
     **How candle reading is used**
     - Long bodies and closes near an extreme imply stronger one-sided control; long two-sided wicks imply conflict/indecision.
