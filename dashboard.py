@@ -8,6 +8,7 @@ from urllib3.util.retry import Retry
 import pandas as pd
 import numpy as np
 import streamlit as st
+from kalshi_connection import check_connection, credentials_from_secrets, KalshiConnectionError
 from arena_core import analyze_arena
 import json
 import html
@@ -2211,6 +2212,26 @@ with st.sidebar:
         help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
     )
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
+    with st.expander("🔑 Kalshi account connection", expanded=False):
+        st.caption("Check your Kalshi account securely. Read-only authentication; this Bitcoin bot does not place real orders.")
+        connection_env = st.selectbox("Kalshi environment", ["DEMO", "LIVE"],
+                                     key="btc_connection_environment",
+                                     help="Demo and live accounts use different keys.")
+        api_id, pem = credentials_from_secrets(st.secrets, connection_env)
+        if api_id and pem:
+            st.caption("Credentials detected in private Streamlit Secrets. Key contents are never displayed.")
+            if st.button("Test secure connection", key="btc_test_connection", use_container_width=True):
+                try:
+                    status = check_connection(connection_env, api_id, pem)
+                    if status.get("connected"):
+                        st.success(f"{connection_env} API connection verified · BTC live trading disabled")
+                except KalshiConnectionError as exc:
+                    st.error(str(exc))
+        else:
+            st.info("No API key found for this environment. Add the Key ID and private key in Streamlit Cloud → App settings → Secrets.")
+            st.code(("KALSHI_DEMO_API_KEY_ID" if connection_env == "DEMO" else "KALSHI_API_KEY_ID")
+                    + " and " + ("KALSHI_DEMO_PRIVATE_KEY" if connection_env == "DEMO" else "KALSHI_PRIVATE_KEY"))
+
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
 # whole page. This keeps navigation stable and makes frequent refreshes usable on mobile.
