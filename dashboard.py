@@ -2257,6 +2257,7 @@ def _render_live_dashboard_inner():
 
     # Pull the ticker separately so the displayed price/current candle can move every
     # live refresh instead of waiting on the candle endpoint alone.
+    spot_feed_stale = False
     try:
         _spot = get_spot_price()
         _now_minute = pd.Timestamp.now(tz="UTC").floor("min")
@@ -2276,7 +2277,7 @@ def _render_live_dashboard_inner():
             }])
             candles = pd.concat([candles, _new], ignore_index=True).tail(300).reset_index(drop=True)
     except (requests.RequestException, KeyError, ValueError, TypeError):
-        pass
+        spot_feed_stale = True
 
     last = candles.iloc[-1]
     prev = candles.iloc[-2]
@@ -2593,7 +2594,7 @@ def _render_live_dashboard_inner():
     arena = analyze_arena(
         learning_history, engine, kalshi_data,
         min_edge_cents=max(10.0, float(min_edge)),
-        candle_stale=candle_feed_stale, market_stale=kalshi_stale,
+        candle_stale=(candle_feed_stale or spot_feed_stale), market_stale=kalshi_stale,
         volatility_15m_pct=vol15,
     )
     engine["arena"] = arena
