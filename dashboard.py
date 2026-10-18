@@ -2217,7 +2217,12 @@ with st.sidebar:
         connection_env = st.selectbox("Kalshi environment", ["DEMO", "LIVE"],
                                      key="btc_connection_environment",
                                      help="Demo and live accounts use different keys.")
-        api_id, pem = credentials_from_secrets(st.secrets, connection_env)
+        api_id, pem = credentials_from_secrets(
+            {name: _secret(name) for name in (
+                "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY",
+                "KALSHI_DEMO_API_KEY_ID", "KALSHI_DEMO_PRIVATE_KEY",
+            )}, connection_env,
+        )
         if api_id and pem:
             st.caption("Credentials detected in private Streamlit Secrets. Key contents are never displayed.")
             if st.button("Test secure connection", key="btc_test_connection", use_container_width=True):
