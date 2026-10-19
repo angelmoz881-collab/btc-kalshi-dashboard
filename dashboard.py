@@ -2624,15 +2624,30 @@ def _render_live_dashboard_inner():
         volatility_15m_pct=vol15,
     )
     engine["arena"] = arena
-    # A strong reversal warning acts as a scalp safety brake: do not keep telling the
-    # user to chase a direction that multiple independent reversal clues oppose.
-    if reversal.get("score", 0) >= 60:
-        if reversal.get("direction") == "UP" and engine.get("scalp") == "WATCH NO":
-            engine["scalp"] = "WAIT"
-            engine["reason"] = "Possible upside reversal conflicts with the downside scalp signal"
-        elif reversal.get("direction") == "DOWN" and engine.get("scalp") == "WATCH YES":
-            engine["scalp"] = "WAIT"
-            engine["reason"] = "Possible downside reversal conflicts with the upside scalp signal"
+    # Entry watches are gated by Kalshi bid movement, depth, spread and reversal
+    # clues. They are NOT BUY orders or validated short-horizon predictions.
+    scalp_watch = entry_watch(
+        kalshi_data, engine.get("scalp_score"), candle_engine.get("agreement"),
+        reversal, engine.get("remaining_sec"), history=quote_history,
+        stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
+    )
+    scalp_position = st.session_state.get("scalp_position")
+    scalp_exit = None
+    if isinstance(scalp_position, dict) and scalp_position.get("ticker") == active_ticker:
+        scalp_exit = review_open_position(
+            scalp_position, kalshi_data, engine.get("scalp_score"), reversal,
+            engine.get("remaining_sec"), history=quote_history,
+            stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
+            slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
+            trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
+            max_hold_sec=scalp_max_hold,
+        )
+        if scalp_exit.get("actionable"):
+            scalp_position["peak_net_cents"] = scalp_exit["peak_net_cents"]
+            st.session_state["scalp_position"] = scalp_position
+    engine["scalp"] = scalp_exit["status"] if scalp_exit else scalp_watch["status"]
+    engine["scalp_watch"] = scalp_watch
+    engine["scalp_exit"] = scalp_exit
 
     # Automatically journal one snapshot in each time bucket (max six per market).
     # Once the market settles, refresh_learning_outcomes supplies the official YES/NO
