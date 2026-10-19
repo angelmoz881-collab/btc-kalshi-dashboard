@@ -1,5 +1,6 @@
 import time
 import math
+import hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import requests
@@ -10,6 +11,8 @@ import numpy as np
 import streamlit as st
 from arena_core import analyze_arena
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
+from auto_scalp import paper_step, marketable_entry
+from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
 import json
 import html
 import os
@@ -2211,13 +2214,34 @@ with st.sidebar:
         "Minimum confidence for ABOVE/BELOW call", 45, 85, 60,
         help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
     )
-    st.markdown("**Manual scalp exit protection**")
+    st.markdown("**Automatic scalp exit protection**")
     scalp_profit_target = st.slider("Net profit target (¢ per contract)", 2, 20, 5, key="scalp_profit_target")
     scalp_trailing_lock = st.slider("Profit giveback warning (¢)", 1, 10, 2, key="scalp_trailing_lock")
     scalp_max_loss = st.slider("Loss warning (¢ per contract)", 3, 30, 8, key="scalp_max_loss")
     scalp_max_hold = st.slider("Maximum time in trade (seconds)", 30, 600, 180, step=15, key="scalp_max_hold")
     scalp_slippage = st.slider("Extra exit slippage reserve (¢ per contract)", 0.0, 5.0, 1.0, step=.5, key="scalp_slippage")
-    st.caption("Exit fees are estimates until verified. This is manual research only, not auto-sell.")
+    st.markdown("**Optional live Kalshi position sync**")
+    st.caption("Read-only API access lets the bot discover fills automatically. No order placement.")
+    _sync_key_id = _secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
+    _sync_pem = _secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+    _scalp_view_guard = _secret("SCALP_VIEW_PASSWORD") or os.environ.get("SCALP_VIEW_PASSWORD")
+    kalshi_sync_configured = bool(_sync_key_id and _sync_pem and _scalp_view_guard)
+    kalshi_sync_enabled = False
+    if kalshi_sync_configured:
+        _input_view_password = st.text_input(
+            "Unlock private account data", type="password", key="scalp_view_password",
+            help="This password protects account position data in a publicly shared Streamlit dashboard."
+        )
+        kalshi_sync_enabled = bool(_input_view_password) and hmac.compare_digest(
+            str(_input_view_password), str(_scalp_view_guard)
+        )
+        if kalshi_sync_enabled:
+            st.success("Private account view unlocked for this browser session")
+    else:
+        st.caption("To enable real fill tracking, configure KALSHI_READ_KEY_ID, "
+                   "KALSHI_READ_PRIVATE_KEY and SCALP_VIEW_PASSWORD in Streamlit Secrets.")
+    st.caption("Signals and automatic SIMULATED tracking work without a Kalshi key.")
+    st.caption("Exit fees are estimates until verified. No trades are automatically placed.")
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
