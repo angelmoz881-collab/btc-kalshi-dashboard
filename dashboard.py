@@ -2685,9 +2685,38 @@ def _render_live_dashboard_inner():
         reversal, engine.get("remaining_sec"), history=quote_history,
         stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
     )
-    scalp_position = st.session_state.get("scalp_position")
+    # Live positions are reconstructed directly from REAL Kalshi buy/sell fills.
+    # In unconnected mode, build a separate one-contract hypothetical paper
+    # position from two matching entry watches. PAPER must never look like LIVE.
+    is_live_position = bool(kalshi_sync_enabled and account_info.get("ticker"))
+    paper_event = None
+    if is_live_position:
+        scalp_position = account_position
+    else:
+        auto_paper_state, paper_event = paper_step(
+            auto_paper_state, active_ticker, kalshi_data, scalp_watch,
+            engine.get("scalp_score"), reversal, engine.get("remaining_sec"),
+            quote_history, stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
+            slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
+            trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
+            max_hold_sec=scalp_max_hold,
+        )
+        st.session_state["auto_paper_scalp"] = auto_paper_state
+        scalp_position = auto_paper_state.get("position")
+
     scalp_exit = None
     if isinstance(scalp_position, dict) and scalp_position.get("ticker") == active_ticker:
+        if is_live_position:
+            # Keep peak for the SAME inventory. Reset if quantity or basis changes.
+            fingerprint = (scalp_position["ticker"], scalp_position["side"],
+                           round(scalp_position["quantity"], 5),
+                           round(scalp_position["entry_price_cents"], 5),
+                           round(scalp_position["entry_fee_cents"], 3))
+            if fingerprint == st.session_state.get("scalp_live_fingerprint"):
+                scalp_position["peak_net_cents"] = st.session_state.get("scalp_live_peak", 0)
+            else:
+                st.session_state["scalp_live_fingerprint"] = fingerprint
+                st.session_state["scalp_live_peak"] = 0
         scalp_exit = review_open_position(
             scalp_position, kalshi_data, engine.get("scalp_score"), reversal,
             engine.get("remaining_sec"), history=quote_history,
@@ -2696,13 +2725,13 @@ def _render_live_dashboard_inner():
             trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
             max_hold_sec=scalp_max_hold,
         )
-        if scalp_exit.get("actionable"):
-            scalp_position["peak_net_cents"] = scalp_exit["peak_net_cents"]
-            st.session_state["scalp_position"] = scalp_position
+        if scalp_exit.get("actionable") and is_live_position:
+            st.session_state["scalp_live_peak"] = scalp_exit["peak_net_cents"]
     engine["scalp"] = scalp_exit["status"] if scalp_exit else scalp_watch["status"]
     engine["scalp_watch"] = scalp_watch
     engine["scalp_exit"] = scalp_exit
-
+    engine["scalp_source"] = "KALSHI LIVE" if is_live_position else "SIMULATED"
+    engine["paper_event"] = paper_event
     # Visual notification once when the alert changes; browser session only.
     alert_id = f"{active_ticker}:{scalp_exit['status']}" if scalp_exit else None
     if alert_id != st.session_state.get("scalp_last_alert"):
