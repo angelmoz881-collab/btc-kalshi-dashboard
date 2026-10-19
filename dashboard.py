@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from arena_core import analyze_arena
+from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 import json
 import html
 import os
@@ -2210,6 +2211,13 @@ with st.sidebar:
         "Minimum confidence for ABOVE/BELOW call", 45, 85, 60,
         help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
     )
+    st.markdown("**Manual scalp exit protection**")
+    scalp_profit_target = st.slider("Net profit target (¢ per contract)", 2, 20, 5, key="scalp_profit_target")
+    scalp_trailing_lock = st.slider("Profit giveback warning (¢)", 1, 10, 2, key="scalp_trailing_lock")
+    scalp_max_loss = st.slider("Loss warning (¢ per contract)", 3, 30, 8, key="scalp_max_loss")
+    scalp_max_hold = st.slider("Maximum time in trade (seconds)", 30, 600, 180, step=15, key="scalp_max_hold")
+    scalp_slippage = st.slider("Extra exit slippage reserve (¢ per contract)", 0.0, 5.0, 1.0, step=.5, key="scalp_slippage")
+    st.caption("Exit fees are estimates until verified. This is manual research only, not auto-sell.")
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
@@ -2223,7 +2231,12 @@ if _fragment is None:
 
 def _render_live_dashboard_inner():
     active_ticker = market_ticker
-    if not manual_ticker:
+    # Keep the tracked contract selected; otherwise auto-rotation could display
+    # a different contract's quotes while a position is still open.
+    pinned_position = st.session_state.get("scalp_position")
+    if isinstance(pinned_position, dict) and pinned_position.get("ticker"):
+        active_ticker = pinned_position["ticker"]
+    elif not manual_ticker:
         try:
             _live_markets = discover_btc_15m_markets()
             _open_tickers = {m.get("ticker") for m in _live_markets if m.get("ticker")}
@@ -2319,6 +2332,19 @@ def _render_live_dashboard_inner():
             else:
                 kalshi_error = str(exc)
 
+
+    # Timestamp actual Kalshi bids, never reusing cached fallback quotes as new ticks.
+    quote_history = []
+    if active_ticker:
+        histories = st.session_state.setdefault("scalp_quote_history", {})
+        quote_history = histories.get(active_ticker, [])
+        ts = time.time()
+        quote_history = [row for row in quote_history if 0 <= ts - row.get("t", -1e9) <= 120][-120:]
+        if kalshi_data and not kalshi_stale and not kalshi_data.get("book_error"):
+            point = {"t": ts, "yes_bid": kalshi_data.get("yes_bid"), "no_bid": kalshi_data.get("no_bid")}
+            if not quote_history or ts - quote_history[-1]["t"] >= .75:
+                quote_history.append(point)
+        histories[active_ticker] = quote_history
 
     # Dual-purpose research signals: deliberately conservative, not calibrated probabilities.
     @st.cache_data(ttl=2, show_spinner=False)
@@ -2522,8 +2548,8 @@ def _render_live_dashboard_inner():
             scalp_score += float(np.clip(model_edge*1.25, -20, 20))
         scalp_score = float(np.clip(scalp_score, -100, 100))
 
-        # Expiry EV is not a scalp forecast. No independently validated scalp
-        # exit model exists here, so keep scalp eligibility at WAIT.
+        # A separate cash-out monitor uses observed Kalshi bids and liquidity,
+        # not expiry EV, after the reversal detector has run.
         scalp = "WAIT"
         trade_review = expiration_trade_review(prob_above, snapshot, remaining_sec,
                                                brti_proxy, disagreement, min_edge)
@@ -2617,7 +2643,7 @@ def _render_live_dashboard_inner():
     # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "⚡ SCALP", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -3032,7 +3058,7 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>EXPIRATION OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
             <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
             <div class="tile"><small>EVIDENCE SCORE</small><strong id="confidence"></strong><em id="confSub"></em></div>
-            <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>scalp model unvalidated</em></div>
+            <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>manual exits · experimental</em></div>
           </div>
           <div class="rev"><b id="possibleOutcome" style="color:#ffcf77"></b><span id="possibleDetail"></span></div>
           <div class="rev" id="revBox"><b id="reversal"></b><span id="reversalSub"></span></div>
@@ -3360,7 +3386,7 @@ def _render_live_dashboard_inner():
             review = engine.get("trade_review", {})
             st.info(review.get("summary", "NO TRADE"))
             st.caption(review.get("reason", "Missing inputs"))
-            st.caption("Expiration estimates are uncalibrated research estimates. Evidence score is not win probability. Scalp remains WAIT until a separate exit model is validated.")
+            st.caption("Expiry estimates are uncalibrated. The separate SCALP tab monitors live bid depth and manual net exits. Entry watches and exit alerts have not been backtested or validated.")
             st.caption("Order-book depth is not a forecast. Quotes can change and may not be executable at the displayed size. The official settlement source is CME CF BRTI, not Coinbase.")
 
     if selected_page == "📖 GUIDE":
