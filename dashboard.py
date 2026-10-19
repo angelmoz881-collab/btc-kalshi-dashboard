@@ -3273,6 +3273,83 @@ def _render_live_dashboard_inner():
 
 
 
+    if selected_page == "⚡ SCALP":
+        st.subheader("⚡ Scalp Exit Desk")
+        st.caption("Short exits only — Kalshi asks are possible buy prices; bids are possible cash-out prices. No orders are placed.")
+        if active_ticker:
+            st.caption(f"Kalshi ticker: {active_ticker}")
+        if kalshi_data:
+            a, b, c, d = st.columns(4)
+            a.metric("YES buy", show_price(kalshi_data.get("yes_ask")))
+            b.metric("YES sell", show_price(kalshi_data.get("yes_bid")))
+            c.metric("NO buy", show_price(kalshi_data.get("no_ask")))
+            d.metric("NO sell", show_price(kalshi_data.get("no_bid")))
+        if scalp_exit:
+            status = scalp_exit["status"]
+            if status in ("TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON", "PREPARE TO CASH", "EXIT WINDOW CLOSING"):
+                st.warning("🔔 " + status)
+            elif status in ("DATA STALE", "LIQUIDITY WARNING", "STOP LOSS REVIEW", "INVALID POSITION", "MARKET CLOSED"):
+                st.error("⚠️ " + status)
+            else:
+                st.info(status)
+            st.write(scalp_exit.get("reason", ""))
+            if scalp_exit.get("actionable"):
+                a, b, c = st.columns(3)
+                a.metric("Estimated net if sold", f"USD {scalp_exit['net_total_dollars']:+.2f}",
+                         f"{scalp_exit['net_cents']:+.1f}¢ / contract")
+                b.metric("Full-size sell VWAP", f"{scalp_exit['exit_bid_cents']:.1f}¢")
+                c.metric("Peak observed net", f"{scalp_exit['peak_net_cents']:+.1f}¢ / contract")
+                st.caption(
+                    f"Approx. break-even sell bid {scalp_exit['breakeven_bid_cents']:.1f}¢"
+                    f" · target sell bid {scalp_exit['target_bid_cents']:.1f}¢"
+                    f" · estimated exit fee {scalp_exit['exit_fee_cents']:.1f}¢ total"
+                    f" · extra slippage budget {scalp_slippage:.1f}¢/contract"
+                    f" · displayed bid depth {scalp_exit['available_depth']:.0f} contracts"
+                )
+                delta = scalp_exit.get("bid_move_cents")
+                st.caption(f"Sell bid change over recent seconds: {delta:+.1f}¢" if delta is not None
+                           else "Collecting bid history for earlier exit warnings.")
+            if st.button("I sold / stop tracking this position", key="scalp_clear_position"):
+                st.session_state.pop("scalp_position", None)
+                st.rerun()
+        elif scalp_position:
+            st.warning("Tracked position is pinned to another market. Check the sidebar ticker.")
+        else:
+            st.info(f"Experimental entry setup: {scalp_watch['status']} · {scalp_watch['reason']}")
+            st.caption("WATCH is not a validated BUY signal. Enter an actual Kalshi fill below only after you buy manually.")
+            with st.form("scalp_track_form"):
+                side = st.radio("What did you buy?", ["YES", "NO"], horizontal=True)
+                entry_price = st.number_input(
+                    "Actual average filled purchase price (¢)",
+                    min_value=0.1, max_value=99.9, value=50.0, step=0.1,
+                    help="Use your Kalshi executed price, not the current ask."
+                )
+                quantity = st.number_input("Filled contract quantity", min_value=1, max_value=100000, value=1, step=1)
+                use_fee_estimate = st.checkbox("Estimate entry taker fee", value=True)
+                actual_fee = st.number_input(
+                    "Actual entry fee for the whole purchase (¢) if estimate is unchecked",
+                    min_value=0.0, value=0.0, step=0.01
+                )
+                start = st.form_submit_button("Track my filled trade", disabled=not bool(active_ticker))
+            if start and active_ticker:
+                entry_fee = (
+                    estimated_taker_fee_cents(entry_price, quantity)
+                    if use_fee_estimate else actual_fee
+                )
+                st.session_state["scalp_position"] = {
+                    "ticker": active_ticker, "side": side.lower(),
+                    "quantity": int(quantity), "entry_price_cents": float(entry_price),
+                    "entry_fee_cents": float(entry_fee),
+                    "opened_at": time.time(), "entry_score": engine.get("scalp_score"),
+                    "peak_net_cents": 0.0,
+                }
+                st.rerun()
+        st.caption(
+            "Manual alerts only. This screen cannot sell in your Kalshi account. "
+            "Refresh alerts depend on the app staying open; they stop if you close it. "
+            "Displayed depth is not guaranteed to fill. Fee estimates may differ from your account."
+        )
+
     if selected_page == "🏆 ARENA":
         arena = engine.get("arena") or {}
         review = arena.get("paper") or {}
