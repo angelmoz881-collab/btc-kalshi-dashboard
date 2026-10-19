@@ -1,0 +1,29 @@
+name: Scalp engine checks
+
+on:
+  push:
+    paths:
+      - "scalp_engine.py"
+      - "test_scalp_engine.py"
+      - "dashboard.py"
+      - ".github/workflows/scalp-tests.yml"
+  pull_request:
+    paths:
+      - "scalp_engine.py"
+      - "test_scalp_engine.py"
+      - "dashboard.py"
+      - ".github/workflows/scalp-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check Python syntax
+        run: python -m py_compile dashboard.py scalp_engine.py
+      - name: Test scalp exit model
+        run: python -m unittest -v test_scalp_engine.py
