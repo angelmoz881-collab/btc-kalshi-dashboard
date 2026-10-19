@@ -2666,6 +2666,23 @@ def _render_live_dashboard_inner():
 
 
     if selected_page == "📈 CHART":
+        if scalp_exit:
+            if scalp_exit.get("actionable"):
+                _scalp_note = (
+                    f"{scalp_exit['status']} · net if sold now {scalp_exit['net_cents']:+.1f}¢/contract "
+                    f"(USD {scalp_exit['net_total_dollars']:+.2f} total) · sellable bid {scalp_exit['exit_bid_cents']:.1f}¢"
+                )
+            else:
+                _scalp_note = f"{scalp_exit['status']} · {scalp_exit.get('reason', '')}"
+            if scalp_exit["status"] in ("TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON", "PREPARE TO CASH", "EXIT WINDOW CLOSING"):
+                st.warning("⚡ " + _scalp_note)
+            elif scalp_exit["status"] in ("DATA STALE", "LIQUIDITY WARNING", "STOP LOSS REVIEW"):
+                st.error("⚡ " + _scalp_note)
+            else:
+                st.info("⚡ " + _scalp_note)
+            st.caption("Manual cash-out only. Open ⚡ SCALP for estimated fees, liquidity and your sell target.")
+        else:
+            st.caption(f"⚡ Experimental scalp setup: {scalp_watch['status']} · {scalp_watch['reason']} · Track a filled trade in ⚡ SCALP.")
         val = (engine.get("arena") or {}).get("validation") or {}
         if val.get("active"):
             st.caption("🏆 Arena blend passed historical validation · paper research only")
