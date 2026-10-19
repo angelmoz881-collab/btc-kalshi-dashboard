@@ -85,7 +85,7 @@ def get_market_fills(ticker, key_id, private_pem, max_pages=5):
     cursor = None
     fills = []
     for _ in range(max_pages):
-        params = {"limit": 200, "ticker": ticker}
+        params = {"limit": 200, "ticker": ticker, "subaccount": 0}
         if cursor:
             params["cursor"] = cursor
         payload = _get("portfolio/fills", params, key_id, private_pem)
