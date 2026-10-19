@@ -110,6 +110,8 @@ def candle_possible_signal(current_price, strike, remaining_sec, candle_forecast
             "historical_effective_n": sample,
             "model_disagreement": disagreement,
             "reversal_risk": reversal,
+            "confidence_gate": confidence_gate,
+            "weak_structure": bool(weak_structure),
             "horizon_sec": seconds,
             "spot": price, "strike": target,
         }
