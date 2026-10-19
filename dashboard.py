@@ -1,5 +1,6 @@
 import time
 import math
+import hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import requests
@@ -10,6 +11,8 @@ import numpy as np
 import streamlit as st
 from arena_core import analyze_arena
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
+from auto_scalp import paper_step, marketable_entry
+from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
 import json
 import html
 import os
@@ -2211,13 +2214,34 @@ with st.sidebar:
         "Minimum confidence for ABOVE/BELOW call", 45, 85, 60,
         help="Higher values make the bot say UNCERTAIN more often, but only commit when more evidence agrees.",
     )
-    st.markdown("**Manual scalp exit protection**")
+    st.markdown("**Automatic scalp exit protection**")
     scalp_profit_target = st.slider("Net profit target (¢ per contract)", 2, 20, 5, key="scalp_profit_target")
     scalp_trailing_lock = st.slider("Profit giveback warning (¢)", 1, 10, 2, key="scalp_trailing_lock")
     scalp_max_loss = st.slider("Loss warning (¢ per contract)", 3, 30, 8, key="scalp_max_loss")
     scalp_max_hold = st.slider("Maximum time in trade (seconds)", 30, 600, 180, step=15, key="scalp_max_hold")
     scalp_slippage = st.slider("Extra exit slippage reserve (¢ per contract)", 0.0, 5.0, 1.0, step=.5, key="scalp_slippage")
-    st.caption("Exit fees are estimates until verified. This is manual research only, not auto-sell.")
+    st.markdown("**Optional live Kalshi position sync**")
+    st.caption("Read-only API access lets the bot discover fills automatically. No order placement.")
+    _sync_key_id = _secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
+    _sync_pem = _secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+    _scalp_view_guard = _secret("SCALP_VIEW_PASSWORD") or os.environ.get("SCALP_VIEW_PASSWORD")
+    kalshi_sync_configured = bool(_sync_key_id and _sync_pem and _scalp_view_guard)
+    kalshi_sync_enabled = False
+    if kalshi_sync_configured:
+        _input_view_password = st.text_input(
+            "Unlock private account data", type="password", key="scalp_view_password",
+            help="This password protects account position data in a publicly shared Streamlit dashboard."
+        )
+        kalshi_sync_enabled = bool(_input_view_password) and hmac.compare_digest(
+            str(_input_view_password), str(_scalp_view_guard)
+        )
+        if kalshi_sync_enabled:
+            st.success("Private account view unlocked for this browser session")
+    else:
+        st.caption("To enable real fill tracking, configure KALSHI_READ_KEY_ID, "
+                   "KALSHI_READ_PRIVATE_KEY and SCALP_VIEW_PASSWORD in Streamlit Secrets.")
+    st.caption("Signals and automatic SIMULATED tracking work without a Kalshi key.")
+    st.caption("Exit fees are estimates until verified. No trades are automatically placed.")
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
@@ -2229,13 +2253,42 @@ if _fragment is None:
             return fn
         return decorate
 
+@st.cache_data(ttl=3, show_spinner=False)
+def _read_btc_account_snapshot():
+    """Only called after the user unlocks a server-side password gate."""
+    key_id = _secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
+    private_key = _secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+    rows = get_btc_open_positions(key_id, private_key)
+    if not rows:
+        return {"ticker": None, "position": None, "count": 0, "reason": "No open BTC15M holdings"}
+    rows.sort(key=lambda row: str(row.get("last_updated_ts", "")), reverse=True)
+    selected = rows[0]
+    ticker = selected["ticker"]
+    fills = get_market_fills(ticker, key_id, private_key)
+    position, reason = reconstruct_position(selected, fills)
+    return {"ticker": ticker, "position": position, "count": len(rows), "reason": reason}
+
+
 def _render_live_dashboard_inner():
+    account_info = {"ticker": None, "position": None, "count": 0, "reason": "Account not connected"}
+    account_sync_error = None
+    if kalshi_sync_enabled:
+        try:
+            account_info = _read_btc_account_snapshot()
+        except requests.HTTPError as exc:
+            account_sync_error = f"Kalshi read failed (HTTP {exc.response.status_code if exc.response is not None else 'unknown'}). Verify a read-only key."
+        except Exception:
+            # Never render exception text: crypto/auth errors may contain credential snippets.
+            account_sync_error = "Kalshi read-only sync unavailable. Verify key, permissions and network."
+    account_position = account_info.get("position")
+    auto_paper_state = st.session_state.get("auto_paper_scalp") or {}
+    current_paper = auto_paper_state.get("position")
     active_ticker = market_ticker
-    # Keep the tracked contract selected; otherwise auto-rotation could display
-    # a different contract's quotes while a position is still open.
-    pinned_position = st.session_state.get("scalp_position")
-    if isinstance(pinned_position, dict) and pinned_position.get("ticker"):
-        active_ticker = pinned_position["ticker"]
+    # Real account holding first, then any hypothetical open trade; never mix them.
+    if kalshi_sync_enabled and account_info.get("ticker"):
+        active_ticker = account_info["ticker"]
+    elif isinstance(current_paper, dict) and current_paper.get("ticker"):
+        active_ticker = current_paper["ticker"]
     elif not manual_ticker:
         try:
             _live_markets = discover_btc_15m_markets()
@@ -2632,9 +2685,38 @@ def _render_live_dashboard_inner():
         reversal, engine.get("remaining_sec"), history=quote_history,
         stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
     )
-    scalp_position = st.session_state.get("scalp_position")
+    # Live positions are reconstructed directly from REAL Kalshi buy/sell fills.
+    # In unconnected mode, build a separate one-contract hypothetical paper
+    # position from two matching entry watches. PAPER must never look like LIVE.
+    is_live_position = bool(kalshi_sync_enabled and account_info.get("ticker"))
+    paper_event = None
+    if is_live_position:
+        scalp_position = account_position
+    else:
+        auto_paper_state, paper_event = paper_step(
+            auto_paper_state, active_ticker, kalshi_data, scalp_watch,
+            engine.get("scalp_score"), reversal, engine.get("remaining_sec"),
+            quote_history, stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
+            slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
+            trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
+            max_hold_sec=scalp_max_hold,
+        )
+        st.session_state["auto_paper_scalp"] = auto_paper_state
+        scalp_position = auto_paper_state.get("position")
+
     scalp_exit = None
     if isinstance(scalp_position, dict) and scalp_position.get("ticker") == active_ticker:
+        if is_live_position:
+            # Keep peak for the SAME inventory. Reset if quantity or basis changes.
+            fingerprint = (scalp_position["ticker"], scalp_position["side"],
+                           round(scalp_position["quantity"], 5),
+                           round(scalp_position["entry_price_cents"], 5),
+                           round(scalp_position["entry_fee_cents"], 3))
+            if fingerprint == st.session_state.get("scalp_live_fingerprint"):
+                scalp_position["peak_net_cents"] = st.session_state.get("scalp_live_peak", 0)
+            else:
+                st.session_state["scalp_live_fingerprint"] = fingerprint
+                st.session_state["scalp_live_peak"] = 0
         scalp_exit = review_open_position(
             scalp_position, kalshi_data, engine.get("scalp_score"), reversal,
             engine.get("remaining_sec"), history=quote_history,
@@ -2643,21 +2725,30 @@ def _render_live_dashboard_inner():
             trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
             max_hold_sec=scalp_max_hold,
         )
-        if scalp_exit.get("actionable"):
-            scalp_position["peak_net_cents"] = scalp_exit["peak_net_cents"]
-            st.session_state["scalp_position"] = scalp_position
-    engine["scalp"] = scalp_exit["status"] if scalp_exit else scalp_watch["status"]
+        if scalp_exit.get("actionable") and is_live_position:
+            st.session_state["scalp_live_peak"] = scalp_exit["peak_net_cents"]
+    engine["scalp"] = ("COST UNKNOWN" if is_live_position and not account_position else
+                       scalp_exit["status"] if scalp_exit else scalp_watch["status"])
     engine["scalp_watch"] = scalp_watch
     engine["scalp_exit"] = scalp_exit
-
+    engine["scalp_source"] = "KALSHI LIVE" if is_live_position else "SIMULATED"
+    engine["paper_event"] = paper_event
     # Visual notification once when the alert changes; browser session only.
-    alert_id = f"{active_ticker}:{scalp_exit['status']}" if scalp_exit else None
+    alert_id = (
+        f"{active_ticker}:{engine['scalp']}:{engine['scalp_source']}"
+        if engine["scalp"] != "WAIT" else None
+    )
     if alert_id != st.session_state.get("scalp_last_alert"):
-        if scalp_exit and scalp_exit["status"] in (
-            "TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON",
-            "PREPARE TO CASH", "EXIT WINDOW CLOSING", "LIQUIDITY WARNING",
-        ):
-            st.toast("Scalp exit alert: " + scalp_exit["status"], icon="⚡")
+        if alert_id and time.time() - st.session_state.get("scalp_last_toast_at", 0) >= 20:
+            if scalp_exit and scalp_exit["status"] in (
+                "TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON",
+                "PREPARE TO CASH", "EXIT WINDOW CLOSING", "LIQUIDITY WARNING",
+            ):
+                st.toast(("LIVE" if is_live_position else "PAPER") + " scalp: " + scalp_exit["status"], icon="⚡")
+                st.session_state["scalp_last_toast_at"] = time.time()
+            elif not scalp_exit and scalp_watch.get("side"):
+                st.toast("ENTRY WATCH: " + scalp_watch["side"] + " (research only)", icon="⚡")
+                st.session_state["scalp_last_toast_at"] = time.time()
         st.session_state["scalp_last_alert"] = alert_id
 
     # Automatically journal one snapshot in each time bucket (max six per market).
@@ -2691,9 +2782,22 @@ def _render_live_dashboard_inner():
                 st.error("⚡ " + _scalp_note)
             else:
                 st.info("⚡ " + _scalp_note)
-            st.caption("Manual cash-out only. Open ⚡ SCALP for estimated fees, liquidity and your sell target.")
+            st.caption(("🔒 REAL KALSHI HOLDING" if is_live_position else "🧪 SIMULATED TRADE")
+                       + " · No real auto-sell. Open ⚡ SCALP for detail.")
+        elif is_live_position and not account_position:
+            st.error("⚡ REAL HOLDING DETECTED · Exit basis unavailable: " + str(account_info.get("reason") or "fills incomplete"))
         else:
-            st.caption(f"⚡ Experimental scalp setup: {scalp_watch['status']} · {scalp_watch['reason']} · Track a filled trade in ⚡ SCALP.")
+            if scalp_watch.get("side"):
+                _entry_side = scalp_watch["side"].lower()
+                _entry_ask = marketable_entry(kalshi_data, _entry_side, 1)
+                st.warning(
+                    f"⚡ ENTRY WATCH {_entry_side.upper()} · estimated 1-contract ask "
+                    + (f"{_entry_ask:.1f}¢" if _entry_ask is not None else "unavailable")
+                    + " · not a confirmed profit opportunity"
+                )
+            else:
+                st.caption(f"⚡ WAIT · {scalp_watch['reason']}")
+            st.caption("🧪 Simulated entry/exit starts automatically after a confirmed setup. Live positions require read-only account sync.")
         val = (engine.get("arena") or {}).get("validation") or {}
         if val.get("active"):
             st.caption("🏆 Arena blend passed historical validation · paper research only")
@@ -3069,7 +3173,8 @@ def _render_live_dashboard_inner():
         intel = {
             "expiry": timer_expiry, "btc": f"${ref_price:,.0f}", "yes": yes_buy, "no": no_buy,
             "yesSell": yes_sell, "noSell": no_sell, "outcome": outcome_text,
-            "scalp": engine["scalp"], "target": target_text, "distance": distance_text,
+            "scalp": engine["scalp"], "scalpMode": engine["scalp_source"],
+            "target": target_text, "distance": distance_text,
             "above": prob_above_text, "below": prob_below_text, "confidence": conf_text,
             "confSub": conf_sub, "proxySub": proxy_sub, "edge": edge_text,
             "settleNote": settle_note, "mood": mood, "moodColor": mood_color,
@@ -3101,7 +3206,7 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>EXPIRATION OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
             <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
             <div class="tile"><small>EVIDENCE SCORE</small><strong id="confidence"></strong><em id="confSub"></em></div>
-            <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>manual exits · experimental</em></div>
+            <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em id="scalpMode">experimental</em></div>
           </div>
           <div class="rev"><b id="possibleOutcome" style="color:#ffcf77"></b><span id="possibleDetail"></span></div>
           <div class="rev" id="revBox"><b id="reversal"></b><span id="reversalSub"></span></div>
@@ -3111,6 +3216,7 @@ def _render_live_dashboard_inner():
         document.getElementById('possibleOutcome').textContent=d.possibleOutcome||'UNAVAILABLE';document.getElementById('possibleDetail').textContent=d.possibleDetail||'';
         for(const id of ['btc','yes','no','outcome','above','confidence','scalp']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
+        document.getElementById('scalpMode').textContent=d.scalpMode||'—';
         document.getElementById('below').textContent='below '+(d.below||'—');document.getElementById('confSub').textContent=d.confSub||'—';document.getElementById('proxySub').textContent=d.proxySub||'—';document.getElementById('edge').textContent=d.edge||'—';document.getElementById('settleNote').textContent=d.settleNote||'—';
         const rv=document.getElementById('reversal');rv.textContent=d.reversal||'NO CLEAR REVERSAL';rv.style.color=d.reversalColor||'#ffcf77';document.getElementById('reversalSub').textContent=d.reversalSub||'—';document.getElementById('revBox').style.borderColor=d.reversalColor||'#3b3138';
         document.getElementById('distance').textContent='Proxy vs target: '+(d.distance||'—')+' · official BRTI is the settlement source; this is an estimate, not a guarantee';
@@ -3285,80 +3391,87 @@ def _render_live_dashboard_inner():
 
 
     if selected_page == "⚡ SCALP":
-        st.subheader("⚡ Scalp Exit Desk")
-        st.caption("Short exits only — Kalshi asks are possible buy prices; bids are possible cash-out prices. No orders are placed.")
+        st.subheader("⚡ Automatic Scalp Signals")
+        st.caption("Auto-entry watch and early-exit guidance. Never places a real order.")
         if active_ticker:
-            st.caption(f"Kalshi ticker: {active_ticker}")
+            st.caption(f"Watching: {active_ticker}")
         if kalshi_data:
             a, b, c, d = st.columns(4)
             a.metric("YES buy", show_price(kalshi_data.get("yes_ask")))
             b.metric("YES sell", show_price(kalshi_data.get("yes_bid")))
             c.metric("NO buy", show_price(kalshi_data.get("no_ask")))
             d.metric("NO sell", show_price(kalshi_data.get("no_bid")))
+        if account_sync_error:
+            st.error(account_sync_error + " · LIVE position/P&L unavailable")
+        elif kalshi_sync_enabled and account_info.get("ticker"):
+            st.success("🔒 REAL KALSHI HOLDING DETECTED · " + account_info["ticker"])
+            if account_info.get("count", 0) > 1:
+                st.warning(f"{account_info['count']} open BTC15M positions detected; monitoring the most recently changed one.")
+            if not account_position:
+                st.error("Cannot safely reconstruct the live entry cost or fees. " +
+                         str(account_info.get("reason") or "Check portfolio fills"))
+        elif kalshi_sync_enabled:
+            st.info("🔒 Read-only Kalshi sync connected · no open BTC15M position. Public entry signals and simulated tracking still operate.")
+        else:
+            st.info("SIMULATED MODE · No Kalshi account connected. Quotes and estimated trades are not actual purchases or sales.")
+
+        _last_paper = auto_paper_state.get("last_closed")
         if scalp_exit:
-            status = scalp_exit["status"]
+            status = scalp_exit.get("status", "NO QUOTE")
+            prefix = "🔒 REAL POSITION" if is_live_position else "🧪 SIMULATED POSITION"
             if status in ("TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON", "PREPARE TO CASH", "EXIT WINDOW CLOSING"):
-                st.warning("🔔 " + status)
+                st.warning(prefix + " · " + status)
             elif status in ("DATA STALE", "LIQUIDITY WARNING", "STOP LOSS REVIEW", "INVALID POSITION", "MARKET CLOSED"):
-                st.error("⚠️ " + status)
+                st.error(prefix + " · " + status)
             else:
-                st.info(status)
-            st.write(scalp_exit.get("reason", ""))
+                st.info(prefix + " · " + status)
+            st.caption(scalp_exit.get("reason", ""))
             if scalp_exit.get("actionable"):
                 a, b, c = st.columns(3)
-                a.metric("Estimated net if sold", f"USD {scalp_exit['net_total_dollars']:+.2f}",
+                a.metric("Net if sold at bids (est.)", f"USD {scalp_exit['net_total_dollars']:+.2f}",
                          f"{scalp_exit['net_cents']:+.1f}¢ / contract")
-                b.metric("Full-size sell VWAP", f"{scalp_exit['exit_bid_cents']:.1f}¢")
-                c.metric("Peak observed net", f"{scalp_exit['peak_net_cents']:+.1f}¢ / contract")
+                b.metric("Sell VWAP", f"{scalp_exit['exit_bid_cents']:.1f}¢")
+                c.metric("Profit peak observed", f"{scalp_exit['peak_net_cents']:+.1f}¢ / contract")
                 st.caption(
-                    f"Approx. break-even sell bid {scalp_exit['breakeven_bid_cents']:.1f}¢"
+                    f"Entry {scalp_position['entry_price_cents']:.1f}¢"
+                    f" · quantity {scalp_position['quantity']:g}"
                     f" · target sell bid {scalp_exit['target_bid_cents']:.1f}¢"
-                    f" · estimated exit fee {scalp_exit['exit_fee_cents']:.1f}¢ total"
-                    f" · extra slippage budget {scalp_slippage:.1f}¢/contract"
-                    f" · displayed bid depth {scalp_exit['available_depth']:.0f} contracts"
+                    f" · break even {scalp_exit['breakeven_bid_cents']:.1f}¢"
+                    f" · entry fee {scalp_exit['entry_fee_cents']:.1f}¢ total"
+                    f" · estimated sell fee {scalp_exit['exit_fee_cents']:.1f}¢ total"
+                    f" · reserve {scalp_slippage:.1f}¢/contract"
                 )
                 delta = scalp_exit.get("bid_move_cents")
-                st.caption(f"Sell bid change over recent seconds: {delta:+.1f}¢" if delta is not None
-                           else "Collecting bid history for earlier exit warnings.")
-            if st.button("I sold / stop tracking this position", key="scalp_clear_position"):
-                st.session_state.pop("scalp_position", None)
-                st.rerun()
-        elif scalp_position:
-            st.warning("Tracked position is pinned to another market. Check the sidebar ticker.")
+                if delta is not None:
+                    st.caption(f"Observed change in sell-side bid: {delta:+.1f}¢ over recent seconds.")
+        elif is_live_position:
+            st.error("REAL POSITION · fee-adjusted cash-out cannot be calculated until all fills reconcile.")
         else:
-            st.info(f"Experimental entry setup: {scalp_watch['status']} · {scalp_watch['reason']}")
-            st.caption("WATCH is not a validated BUY signal. Enter an actual Kalshi fill below only after you buy manually.")
-            with st.form("scalp_track_form"):
-                side = st.radio("What did you buy?", ["YES", "NO"], horizontal=True)
-                entry_price = st.number_input(
-                    "Actual average filled purchase price (¢)",
-                    min_value=0.1, max_value=99.9, value=50.0, step=0.1,
-                    help="Use your Kalshi executed price, not the current ask."
-                )
-                quantity = st.number_input("Filled contract quantity", min_value=1, max_value=100000, value=1, step=1)
-                use_fee_estimate = st.checkbox("Estimate entry taker fee", value=True)
-                actual_fee = st.number_input(
-                    "Actual entry fee for the whole purchase (¢) if estimate is unchecked",
-                    min_value=0.0, value=0.0, step=0.01
-                )
-                start = st.form_submit_button("Track my filled trade", disabled=not bool(active_ticker))
-            if start and active_ticker:
-                entry_fee = (
-                    estimated_taker_fee_cents(entry_price, quantity)
-                    if use_fee_estimate else actual_fee
-                )
-                st.session_state["scalp_position"] = {
-                    "ticker": active_ticker, "side": side.lower(),
-                    "quantity": int(quantity), "entry_price_cents": float(entry_price),
-                    "entry_fee_cents": float(entry_fee),
-                    "opened_at": time.time(), "entry_score": engine.get("scalp_score"),
-                    "peak_net_cents": 0.0,
-                }
-                st.rerun()
+            side = (scalp_watch.get("side") or "").lower()
+            if side in ("yes", "no"):
+                ask = marketable_entry(kalshi_data, side, 1)
+                bid = (kalshi_data or {}).get(side + "_bid")
+                if ask is not None:
+                    st.warning(f"⚡ ENTRY WATCH {side.upper()} · hypothetical buy around {ask:.1f}¢")
+                    st.caption(f"Current sell bid: {show_price(bid)} · two consecutive confirmed watches needed for a simulated entry. {scalp_watch['reason']}")
+                else:
+                    st.warning(f"⚡ ENTRY WATCH {side.upper()} · buy depth unavailable; no fill assumed.")
+            else:
+                st.info("WAIT / NO ENTRY · " + scalp_watch["reason"])
+        if _last_paper and (time.time() - float(_last_paper.get("exited_at", 0)) < 90):
+            outcome_text = (
+                f"{_last_paper['net_cents']:+.1f}¢ per paper contract"
+                if _last_paper.get("net_cents") is not None else "unknown P&L"
+            )
+            st.caption(f"Last simulated exit: {_last_paper.get('exit_reason', 'CLOSED')} · {outcome_text}. This is not a confirmed Kalshi fill.")
+        if auto_paper_state.get("history"):
+            with st.expander("🧪 Session paper trade history"):
+                st.dataframe(pd.DataFrame(auto_paper_state["history"][-30:]), use_container_width=True, hide_index=True)
         st.caption(
-            "Manual alerts only. This screen cannot sell in your Kalshi account. "
-            "Refresh alerts depend on the app staying open; they stop if you close it. "
-            "Displayed depth is not guaranteed to fill. Fee estimates may differ from your account."
+            "Only a real synced portfolio position can use your actual fill price/quantity automatically. "
+            "Without read-only sync, the bot models one hypothetical contract at observed asks/bids. "
+            "Cash-out signals are unvalidated and bids may disappear. The app must remain open for updates. "
+            "Manual Kalshi buy/sell is required."
         )
 
     if selected_page == "🏆 ARENA":
