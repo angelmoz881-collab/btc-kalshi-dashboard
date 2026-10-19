@@ -2727,19 +2727,28 @@ def _render_live_dashboard_inner():
         )
         if scalp_exit.get("actionable") and is_live_position:
             st.session_state["scalp_live_peak"] = scalp_exit["peak_net_cents"]
-    engine["scalp"] = scalp_exit["status"] if scalp_exit else scalp_watch["status"]
+    engine["scalp"] = ("COST UNKNOWN" if is_live_position and not account_position else
+                       scalp_exit["status"] if scalp_exit else scalp_watch["status"])
     engine["scalp_watch"] = scalp_watch
     engine["scalp_exit"] = scalp_exit
     engine["scalp_source"] = "KALSHI LIVE" if is_live_position else "SIMULATED"
     engine["paper_event"] = paper_event
     # Visual notification once when the alert changes; browser session only.
-    alert_id = f"{active_ticker}:{scalp_exit['status']}" if scalp_exit else None
+    alert_id = (
+        f"{active_ticker}:{engine['scalp']}:{engine['scalp_source']}"
+        if engine["scalp"] != "WAIT" else None
+    )
     if alert_id != st.session_state.get("scalp_last_alert"):
-        if scalp_exit and scalp_exit["status"] in (
-            "TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON",
-            "PREPARE TO CASH", "EXIT WINDOW CLOSING", "LIQUIDITY WARNING",
-        ):
-            st.toast("Scalp exit alert: " + scalp_exit["status"], icon="⚡")
+        if alert_id and time.time() - st.session_state.get("scalp_last_toast_at", 0) >= 20:
+            if scalp_exit and scalp_exit["status"] in (
+                "TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON",
+                "PREPARE TO CASH", "EXIT WINDOW CLOSING", "LIQUIDITY WARNING",
+            ):
+                st.toast(("LIVE" if is_live_position else "PAPER") + " scalp: " + scalp_exit["status"], icon="⚡")
+                st.session_state["scalp_last_toast_at"] = time.time()
+            elif not scalp_exit and scalp_watch.get("side"):
+                st.toast("ENTRY WATCH: " + scalp_watch["side"] + " (research only)", icon="⚡")
+                st.session_state["scalp_last_toast_at"] = time.time()
         st.session_state["scalp_last_alert"] = alert_id
 
     # Automatically journal one snapshot in each time bucket (max six per market).
@@ -2773,9 +2782,22 @@ def _render_live_dashboard_inner():
                 st.error("⚡ " + _scalp_note)
             else:
                 st.info("⚡ " + _scalp_note)
-            st.caption("Manual cash-out only. Open ⚡ SCALP for estimated fees, liquidity and your sell target.")
+            st.caption(("🔒 REAL KALSHI HOLDING" if is_live_position else "🧪 SIMULATED TRADE")
+                       + " · No real auto-sell. Open ⚡ SCALP for detail.")
+        elif is_live_position and not account_position:
+            st.error("⚡ REAL HOLDING DETECTED · Exit basis unavailable: " + str(account_info.get("reason") or "fills incomplete"))
         else:
-            st.caption(f"⚡ Experimental scalp setup: {scalp_watch['status']} · {scalp_watch['reason']} · Track a filled trade in ⚡ SCALP.")
+            if scalp_watch.get("side"):
+                _entry_side = scalp_watch["side"].lower()
+                _entry_ask = marketable_entry(kalshi_data, _entry_side, 1)
+                st.warning(
+                    f"⚡ ENTRY WATCH {_entry_side.upper()} · estimated 1-contract ask "
+                    + (f"{_entry_ask:.1f}¢" if _entry_ask is not None else "unavailable")
+                    + " · not a confirmed profit opportunity"
+                )
+            else:
+                st.caption(f"⚡ WAIT · {scalp_watch['reason']}")
+            st.caption("🧪 Simulated entry/exit starts automatically after a confirmed setup. Live positions require read-only account sync.")
         val = (engine.get("arena") or {}).get("validation") or {}
         if val.get("active"):
             st.caption("🏆 Arena blend passed historical validation · paper research only")
@@ -3151,7 +3173,8 @@ def _render_live_dashboard_inner():
         intel = {
             "expiry": timer_expiry, "btc": f"${ref_price:,.0f}", "yes": yes_buy, "no": no_buy,
             "yesSell": yes_sell, "noSell": no_sell, "outcome": outcome_text,
-            "scalp": engine["scalp"], "target": target_text, "distance": distance_text,
+            "scalp": engine["scalp"], "scalpMode": engine["scalp_source"],
+            "target": target_text, "distance": distance_text,
             "above": prob_above_text, "below": prob_below_text, "confidence": conf_text,
             "confSub": conf_sub, "proxySub": proxy_sub, "edge": edge_text,
             "settleNote": settle_note, "mood": mood, "moodColor": mood_color,
@@ -3183,7 +3206,7 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>EXPIRATION OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
             <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
             <div class="tile"><small>EVIDENCE SCORE</small><strong id="confidence"></strong><em id="confSub"></em></div>
-            <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em>manual exits · experimental</em></div>
+            <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em id="scalpMode">experimental</em></div>
           </div>
           <div class="rev"><b id="possibleOutcome" style="color:#ffcf77"></b><span id="possibleDetail"></span></div>
           <div class="rev" id="revBox"><b id="reversal"></b><span id="reversalSub"></span></div>
@@ -3193,6 +3216,7 @@ def _render_live_dashboard_inner():
         document.getElementById('possibleOutcome').textContent=d.possibleOutcome||'UNAVAILABLE';document.getElementById('possibleDetail').textContent=d.possibleDetail||'';
         for(const id of ['btc','yes','no','outcome','above','confidence','scalp']) document.getElementById(id).textContent=d[id]||'—';
         document.getElementById('yesSell').textContent='sell '+(d.yesSell||'—');document.getElementById('noSell').textContent='sell '+(d.noSell||'—');
+        document.getElementById('scalpMode').textContent=d.scalpMode||'—';
         document.getElementById('below').textContent='below '+(d.below||'—');document.getElementById('confSub').textContent=d.confSub||'—';document.getElementById('proxySub').textContent=d.proxySub||'—';document.getElementById('edge').textContent=d.edge||'—';document.getElementById('settleNote').textContent=d.settleNote||'—';
         const rv=document.getElementById('reversal');rv.textContent=d.reversal||'NO CLEAR REVERSAL';rv.style.color=d.reversalColor||'#ffcf77';document.getElementById('reversalSub').textContent=d.reversalSub||'—';document.getElementById('revBox').style.borderColor=d.reversalColor||'#3b3138';
         document.getElementById('distance').textContent='Proxy vs target: '+(d.distance||'—')+' · official BRTI is the settlement source; this is an estimate, not a guarantee';
