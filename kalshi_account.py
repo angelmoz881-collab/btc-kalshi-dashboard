@@ -12,7 +12,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
-BASE_URL = "https://api.elections.kalshi.com"
+BASE_URL = "https://external-api.kalshi.com"
 PREFIX = "/trade-api/v2"
 HTTP = requests.Session()
 
