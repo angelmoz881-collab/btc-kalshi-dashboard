@@ -11,6 +11,7 @@ import numpy as np
 import streamlit as st
 from arena_core import analyze_arena
 from candle_possible import candle_possible_signal
+from candle_calibration import train_candle_calibrator, apply_candle_calibration
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
@@ -123,6 +124,8 @@ LEARNING_COLUMNS = [
     "momentum", "pressure", "bid_balance", "spread", "candle_outcome_score",
     "z_distance", "sigma_1m", "venue_count", "dispersion_bps", "disagreement",
     "outcome_call", "result", "settled_utc", "settlement_value",
+    "candle_possible_raw_prob", "candle_possible_raw_call",
+    "candle_possible_calibrated_prob", "candle_possible_calibration_active",
 ]
 LEARNING_LOCAL_PATH = Path(os.environ.get("KALSHI_LEARNING_PATH", "data/btc_kalshi_learning.csv"))
 LEARNING_GITHUB_PATH = os.environ.get("LEARNING_GITHUB_PATH", "data/btc_kalshi_learning.csv")
@@ -155,6 +158,7 @@ def _learning_path():
 
 LEARNING_TEXT_COLUMNS = (
     "recorded_utc", "ticker", "checkpoint", "outcome_call", "result", "settled_utc",
+    "candle_possible_raw_call",
 )
 
 
@@ -178,6 +182,8 @@ def _normalize_learning_history(df):
         "stat_prob", "analog_prob", "market_prob", "flow_prob", "final60_prob", "momentum",
         "pressure", "bid_balance", "spread", "candle_outcome_score", "z_distance", "sigma_1m",
         "venue_count", "dispersion_bps", "disagreement", "settlement_value",
+        "candle_possible_raw_prob", "candle_possible_calibrated_prob",
+        "candle_possible_calibration_active",
     ]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     # CSV readers infer all-blank text columns (especially settled_utc) as
@@ -188,6 +194,12 @@ def _normalize_learning_history(df):
     out["result"] = out["result"].str.lower()
     out = out.drop_duplicates(subset=["ticker", "checkpoint"], keep="last")
     return out.sort_values(["recorded_utc", "ticker"], na_position="last").reset_index(drop=True)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_candle_calibrator(history):
+    """Model only frozen candle snapshots with official settled labels."""
+    return train_candle_calibrator(history)
 
 
 def possible_expiration_outcome(engine):
@@ -686,7 +698,27 @@ def record_learning_snapshot(history, ticker, engine, candle_engine):
     if exists:
         return df, False
     row = current_learning_feature_row(engine, candle_engine)
+    possible = engine.get("candle_possible") or {}
+    raw = possible.get("raw_p_above")
+    try:
+        raw = float(raw)
+        if (not str(ticker).startswith("KXBTC15M")
+                or possible.get("source") != "BTC CANDLES ONLY"
+                or possible.get("raw_status") not in ("POSSIBLE ABOVE", "POSSIBLE BELOW", "NO CLEAR LEAN")
+                or not np.isfinite(raw) or not .005 <= raw <= .995
+                or float(engine.get("remaining_sec") or 0) <= 75):
+            raw = np.nan
+    except (TypeError, ValueError):
+        raw = np.nan
     row.update({
+        "candle_possible_raw_prob": raw,
+        "candle_possible_raw_call": possible.get("raw_status", "") if np.isfinite(raw) else "",
+        "candle_possible_calibrated_prob": (
+            possible.get("p_above") if np.isfinite(raw) and possible.get("calibrated") else np.nan
+        ),
+        "candle_possible_calibration_active": (
+            1.0 if np.isfinite(raw) and possible.get("calibrated") else 0.0
+        ),
         "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "ticker": str(ticker), "checkpoint": checkpoint,
         "outcome_call": str(engine.get("outcome", "UNCERTAIN")),
@@ -2294,6 +2326,7 @@ def _render_live_dashboard_inner():
     learning_history = load_learning_history()
     learning_history, _learning_updates = refresh_learning_outcomes(learning_history, force=False)
     learning_model = get_adaptive_learner(learning_history)
+    candle_calibrator = cached_candle_calibrator(learning_history)
 
     candle_feed_stale = False
     try:
@@ -2669,10 +2702,13 @@ def _render_live_dashboard_inner():
     candle_analog = empirical_analog_probability(
         outcome_history, price, target_hint, engine.get("remaining_sec", 0) / 60.0
     )
-    engine["candle_possible"] = candle_possible_signal(
-        price, target_hint, engine.get("remaining_sec"),
-        candle_forecast, candle_engine, candle_stat, candle_analog,
-        stale=(candle_feed_stale or spot_feed_stale),
+    engine["candle_possible"] = apply_candle_calibration(
+        candle_possible_signal(
+            price, target_hint, engine.get("remaining_sec"),
+            candle_forecast, candle_engine, candle_stat, candle_analog,
+            stale=(candle_feed_stale or spot_feed_stale),
+        ),
+        candle_calibrator,
     )
     engine["hourly_price_forecast"] = hourly_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
@@ -3235,9 +3271,12 @@ def _render_live_dashboard_inner():
         if _cp.get("p_above") is not None:
             _parts = _cp.get("components") or {}
             _reasons = _cp.get("reasons") or []
+            _calibration_state = _cp.get("calibration") or {}
+            _candle_label = ("forward-validated calibration active" if _cp.get("calibrated")
+                             else f"uncalibrated · {_calibration_state.get('status','collecting')}")
             st.caption(
                 f"🕯️ Candle-only POSSIBLE model: {_cp['p_above']*100:.0f}% ABOVE / "
-                f"{_cp['p_below']*100:.0f}% BELOW (uncalibrated) · "
+                f"{_cp['p_below']*100:.0f}% BELOW ({_candle_label}) · "
                 f"1m/5m/15m pattern score {_parts.get('candle_pattern_score',0):+.0f} "
                 + (" · " + " · ".join(_reasons[:2]) if _reasons else "")
             )
@@ -3355,6 +3394,29 @@ def _render_live_dashboard_inner():
             st.caption(
                 "The learner only changes the live probability after at least 100 independent settled markets AND chronological held-out Brier score improves. "
                 "That prevents a few lucky trades from making the bot overconfident."
+            )
+            st.markdown("**Candle-only Possible Prediction calibration (separate)**")
+            cc = candle_calibrator
+            st.caption(
+                f"{cc.get('status','COLLECTING')} · "
+                f"{cc.get('resolved_markets',0)} independent settled markets · "
+                f"{cc.get('validation_markets',0)} forward-tested markets. "
+                "The raw model still runs when calibration is not validated."
+            )
+            if cc.get("calibrated_brier") is not None:
+                st.caption(
+                    f"Forward-tested Brier error: raw {cc['raw_brier']:.3f} vs "
+                    f"calibrated {cc['calibrated_brier']:.3f} "
+                    f"(lower is better). "
+                    f"Calibration error: {cc['raw_ece']:.3f} → {cc['calibrated_ece']:.3f}."
+                )
+                if cc.get("reliability"):
+                    st.dataframe(pd.DataFrame(cc["reliability"]), hide_index=True, use_container_width=True)
+            st.caption(
+                "Only snapshots recorded BEFORE each KXBTC15M settlement count. "
+                "After at least 100 distinct settled markets, chronological tests "
+                "must prove better probability accuracy before candle odds change. "
+                "A calibrated probability is not a guarantee or a profitable scalp signal."
             )
             if st.button("Check old markets for new settlements", key="refresh_learning_results"):
                 learning_history, newly = refresh_learning_outcomes(learning_history, force=True, max_markets=40)
@@ -3657,7 +3719,7 @@ def _render_live_dashboard_inner():
     - Candle intelligence, aggressive Coinbase trade flow and Kalshi depth are used as a **small confirmation layer**, not allowed to overpower the strike-distance/statistical models.
     - During the **last 60 seconds**, the bot records the live multi-exchange proxy and estimates the average already observed. It then calculates the average price still required over the remaining seconds for the final 60-second settlement average to finish above the strike.
     - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
-    - **POSSIBLE ABOVE / BELOW** is now a separate **BTC-CANDLES-ONLY** expiry estimate. It uses 1m/5m/15m candle structure, RSI/MACD/EMA/volume, volatility versus the contract's strike, and comparable historical BTC candle setups for the actual time remaining. It does **not** use Kalshi odds, bid/ask flow, whale trades, exchange order flow, the BRTI proxy or the fused/adaptive model. It is tentative and uncalibrated, and defaults to NO CLEAR LEAN when signals conflict or settlement is too close. A candle-only estimate is still not a direct forecast of the official BRTI last-minute averaging.
+    - **POSSIBLE ABOVE / BELOW** is a separate **BTC-CANDLES-ONLY** expiry estimate. It uses 1m/5m/15m candle structure, RSI/MACD/EMA/volume, volatility versus the contract's strike, and historical BTC candle setups for time remaining. It does **not** use Kalshi odds, bids, whale trades, exchange flow, the BRTI proxy or the fused/adaptive model as prediction inputs. It records its own frozen probabilities and learns against official settled YES/NO outcomes, but only adjusts its live percentages when at least 100 independent settled markets and forward-held-out Brier validation prove an improvement. Otherwise it clearly displays UNCALIBRATED. NO CLEAR LEAN remains available when candles conflict or settlement is too close. Candle-only estimates cannot directly forecast the official BRTI final-minute average.
     - The regular **FUSION ABOVE/BELOW** prediction is unchanged, so you can independently compare its market-informed view with the candle-only POSSIBLE prediction. The SCALP cash-out estimator is also unchanged.
 
     **How candle reading is used**
