@@ -2253,13 +2253,42 @@ if _fragment is None:
             return fn
         return decorate
 
+@st.cache_data(ttl=3, show_spinner=False)
+def _read_btc_account_snapshot():
+    """Only called after the user unlocks a server-side password gate."""
+    key_id = _secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
+    private_key = _secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+    rows = get_btc_open_positions(key_id, private_key)
+    if not rows:
+        return {"ticker": None, "position": None, "count": 0, "reason": "No open BTC15M holdings"}
+    rows.sort(key=lambda row: str(row.get("last_updated_ts", "")), reverse=True)
+    selected = rows[0]
+    ticker = selected["ticker"]
+    fills = get_market_fills(ticker, key_id, private_key)
+    position, reason = reconstruct_position(selected, fills)
+    return {"ticker": ticker, "position": position, "count": len(rows), "reason": reason}
+
+
 def _render_live_dashboard_inner():
+    account_info = {"ticker": None, "position": None, "count": 0, "reason": "Account not connected"}
+    account_sync_error = None
+    if kalshi_sync_enabled:
+        try:
+            account_info = _read_btc_account_snapshot()
+        except requests.HTTPError as exc:
+            account_sync_error = f"Kalshi read failed (HTTP {exc.response.status_code if exc.response is not None else 'unknown'}). Verify a read-only key."
+        except Exception:
+            # Never render exception text: crypto/auth errors may contain credential snippets.
+            account_sync_error = "Kalshi read-only sync unavailable. Verify key, permissions and network."
+    account_position = account_info.get("position")
+    auto_paper_state = st.session_state.get("auto_paper_scalp") or {}
+    current_paper = auto_paper_state.get("position")
     active_ticker = market_ticker
-    # Keep the tracked contract selected; otherwise auto-rotation could display
-    # a different contract's quotes while a position is still open.
-    pinned_position = st.session_state.get("scalp_position")
-    if isinstance(pinned_position, dict) and pinned_position.get("ticker"):
-        active_ticker = pinned_position["ticker"]
+    # Real account holding first, then any hypothetical open trade; never mix them.
+    if kalshi_sync_enabled and account_info.get("ticker"):
+        active_ticker = account_info["ticker"]
+    elif isinstance(current_paper, dict) and current_paper.get("ticker"):
+        active_ticker = current_paper["ticker"]
     elif not manual_ticker:
         try:
             _live_markets = discover_btc_15m_markets()
