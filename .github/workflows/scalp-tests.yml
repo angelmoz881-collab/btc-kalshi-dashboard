@@ -6,12 +6,18 @@ on:
       - "scalp_engine.py"
       - "test_scalp_engine.py"
       - "dashboard.py"
+      - "auto_scalp.py"
+      - "kalshi_account.py"
+      - "test_auto_scalp.py"
       - ".github/workflows/scalp-tests.yml"
   pull_request:
     paths:
       - "scalp_engine.py"
       - "test_scalp_engine.py"
       - "dashboard.py"
+      - "auto_scalp.py"
+      - "kalshi_account.py"
+      - "test_auto_scalp.py"
       - ".github/workflows/scalp-tests.yml"
   workflow_dispatch:
 
@@ -24,6 +30,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Check Python syntax
-        run: python -m py_compile dashboard.py scalp_engine.py
+        run: python -m py_compile dashboard.py scalp_engine.py auto_scalp.py kalshi_account.py
       - name: Test scalp exit model
-        run: python -m unittest -v test_scalp_engine.py
+        run: |
+          python -m pip install -q requests cryptography
+          python -m unittest -v test_scalp_engine.py test_auto_scalp.py
