@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from arena_core import analyze_arena
+from candle_possible import candle_possible_signal
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
@@ -190,23 +191,13 @@ def _normalize_learning_history(df):
 
 
 def possible_expiration_outcome(engine):
-    """A tentative view of the same expiry estimate, independent of the regular call."""
-    try:
-        p = float(engine.get("prob_above"))
-        confidence = float(engine.get("confidence", 0))
-        remaining = float(engine.get("remaining_sec"))
-        target = float(engine.get("target"))
-    except (TypeError, ValueError):
-        return "UNAVAILABLE", "Waiting for expiry inputs"
-    if not all(math.isfinite(x) for x in (p, confidence, remaining, target)) or not 0 <= p <= 1:
-        return "UNAVAILABLE", "Waiting for valid expiry inputs"
-    if remaining <= 0:
-        return "EXPIRED", "Waiting for official settlement"
-    if .45 < p < .55:
-        return "NO CLEAR LEAN", "Evidence too weak or close to 50/50"
-    direction = "ABOVE" if p > .5 else "BELOW"
-    probability = p if p > .5 else 1 - p
-    return f"POSSIBLE {direction}", f"Uncalibrated estimate {probability:.0%} · evidence {confidence:.0f}/100 · tentative"
+    """Independent, exclusively candle-derived tentative expiry prediction.
+
+    Never fall back to the blended Kalshi-market/flow probability. This guards
+    against accidentally relabeling exchange odds as a candle-only model.
+    """
+    signal = engine.get("candle_possible") or {}
+    return signal.get("status", "UNAVAILABLE"), signal.get("detail", "Waiting for candle-only prediction")
 
 
 def expiration_trade_review(prob, snapshot, remaining_sec, proxy, disagreement, min_edge):
@@ -2667,6 +2658,22 @@ def _render_live_dashboard_inner():
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
                               outcome_history, brti_proxy, proxy_samples, learning_model)
     engine["candle_only_15m"] = candle_forecast
+
+    # A genuinely independent "POSSIBLE ABOVE/BELOW" view. Only BTC OHLCV,
+    # historical BTC candles and the contract's strike/time are inputs.
+    # In particular, DO NOT reuse engine["prob_above"], flow probabilities,
+    # order-book bids, whale pressure or the multi-venue benchmark proxy here.
+    candle_stat = parametric_strike_probability(
+        candles, price, target_hint, engine.get("remaining_sec", 0) / 60.0
+    )
+    candle_analog = empirical_analog_probability(
+        outcome_history, price, target_hint, engine.get("remaining_sec", 0) / 60.0
+    )
+    engine["candle_possible"] = candle_possible_signal(
+        price, target_hint, engine.get("remaining_sec"),
+        candle_forecast, candle_engine, candle_stat, candle_analog,
+        stale=(candle_feed_stale or spot_feed_stale),
+    )
     engine["hourly_price_forecast"] = hourly_forecast
     reversal = reversal_intelligence(candles, whale_trades, candle_engine, outcome_history, target_hint)
     engine["reversal"] = reversal
