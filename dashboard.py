@@ -3202,7 +3202,7 @@ def _render_live_dashboard_inner():
         .foot{margin-top:5px;color:#8e7a84;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         @media(max-width:430px){.panel{padding:6px}.grid4,.grid4b{gap:3px}.tile{padding:5px 4px}.tile strong{font-size:11px}.tile small,.tile em,.foot{font-size:7px}.mood{font-size:9px}}
         </style></head><body><div class="panel">
-          <div class="head"><div class="mood" id="mood"></div><div class="sub">OUTCOME FUSION · BRTI-AWARE PROXY</div></div>
+          <div class="head"><div class="mood" id="mood"></div><div class="sub">FUSION ODDS · MARKET + BTC</div></div>
           <div class="grid4">
             <div class="tile"><small>TIME LEFT</small><strong id="count">--:--</strong><em id="settleNote"></em></div>
             <div class="tile"><small>BRTI PROXY</small><strong id="btc"></strong><em id="proxySub"></em></div>
@@ -3210,8 +3210,8 @@ def _render_live_dashboard_inner():
             <div class="tile"><small>NO BUY</small><strong id="no"></strong><em id="noSell"></em></div>
           </div>
           <div class="grid4b">
-            <div class="tile"><small>EXPIRATION OUTCOME</small><strong id="outcome"></strong><em id="edge"></em></div>
-            <div class="tile"><small>EST. ABOVE</small><strong id="above"></strong><em id="below"></em></div>
+            <div class="tile"><small>FUSION EXPIRY</small><strong id="outcome"></strong><em id="edge"></em></div>
+            <div class="tile"><small>FUSION ABOVE</small><strong id="above"></strong><em id="below"></em></div>
             <div class="tile"><small>EVIDENCE SCORE</small><strong id="confidence"></strong><em id="confSub"></em></div>
             <div class="tile"><small>SCALP</small><strong id="scalp"></strong><em id="scalpMode">experimental</em></div>
           </div>
@@ -3231,6 +3231,18 @@ def _render_live_dashboard_inner():
         const c=document.getElementById('count');function tick(){if(!d.expiry){c.textContent='--:--';return}const ms=Date.parse(d.expiry)-Date.now();if(!Number.isFinite(ms)||ms<=0){c.textContent='EXPIRED';return}const sec=Math.ceil(ms/1000),h=Math.floor(sec/3600),mm=Math.floor((sec%3600)/60),ss=sec%60;c.textContent=(h?String(h).padStart(2,'0')+':':'')+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')}tick();setInterval(tick,1000);
         </script></body></html>""".replace("__INTEL__", intel_json)
         components.html(intel_html, height=216, scrolling=False)
+        _cp = engine.get("candle_possible") or {}
+        if _cp.get("p_above") is not None:
+            _parts = _cp.get("components") or {}
+            _reasons = _cp.get("reasons") or []
+            st.caption(
+                f"🕯️ Candle-only POSSIBLE model: {_cp['p_above']*100:.0f}% ABOVE / "
+                f"{_cp['p_below']*100:.0f}% BELOW (uncalibrated) · "
+                f"1m/5m/15m pattern score {_parts.get('candle_pattern_score',0):+.0f} "
+                + (" · " + " · ".join(_reasons[:2]) if _reasons else "")
+            )
+        else:
+            st.caption("🕯️ Candle-only possible model: " + str(_cp.get("detail", "Waiting for BTC candles")))
         direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
         if abs(direction_score) < 8:
             context = "NO CLEAR EDGE — wait for confirmation"
@@ -3593,7 +3605,7 @@ def _render_live_dashboard_inner():
             st.caption(f"Strike: {market.get('floor_strike', market.get('cap_strike', market.get('strike_price', 'not provided')))}")
             st.markdown("### Live YES / NO quotes")
             possible_outcome, possible_detail = possible_expiration_outcome(engine)
-            st.caption(f"Lower-confidence expiry view: {possible_outcome} · {possible_detail}")
+            st.caption(f"BTC CANDLES ONLY (no Kalshi flow or odds): {possible_outcome} · {possible_detail}")
             yes_col, no_col = st.columns(2)
             with yes_col:
                 st.metric("🟢 Buy YES", show_price(k["yes_ask"]))
@@ -3645,7 +3657,8 @@ def _render_live_dashboard_inner():
     - Candle intelligence, aggressive Coinbase trade flow and Kalshi depth are used as a **small confirmation layer**, not allowed to overpower the strike-distance/statistical models.
     - During the **last 60 seconds**, the bot records the live multi-exchange proxy and estimates the average already observed. It then calculates the average price still required over the remaining seconds for the final 60-second settlement average to finish above the strike.
     - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
-    - **POSSIBLE ABOVE / BELOW** is a separate tentative expiration view using the same model: it needs at least 55% estimated directional probability; its evidence score stays visible. Near 50/50 or with weaker evidence it says **NO CLEAR LEAN**. It does not change the regular expiration call, scalp signals, or learning labels. Model confidence is an evidence score, not a success probability.
+    - **POSSIBLE ABOVE / BELOW** is now a separate **BTC-CANDLES-ONLY** expiry estimate. It uses 1m/5m/15m candle structure, RSI/MACD/EMA/volume, volatility versus the contract's strike, and comparable historical BTC candle setups for the actual time remaining. It does **not** use Kalshi odds, bid/ask flow, whale trades, exchange order flow, the BRTI proxy or the fused/adaptive model. It is tentative and uncalibrated, and defaults to NO CLEAR LEAN when signals conflict or settlement is too close. A candle-only estimate is still not a direct forecast of the official BRTI last-minute averaging.
+    - The regular **FUSION ABOVE/BELOW** prediction is unchanged, so you can independently compare its market-informed view with the candle-only POSSIBLE prediction. The SCALP cash-out estimator is also unchanged.
 
     **How candle reading is used**
     - Long bodies and closes near an extreme imply stronger one-sided control; long two-sided wicks imply conflict/indecision.
