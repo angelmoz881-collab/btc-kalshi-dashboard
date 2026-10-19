@@ -2537,15 +2537,16 @@ def _render_live_dashboard_inner():
                 outcome = "UNCERTAIN"
             outcome_score = float(np.clip((prob_above-.5)*200.0, -100, 100))
 
-        # Scalp model reacts faster and now includes model-vs-market edge.
+        # Keep this separate from the expiry probability and expiry EV.
+        # Candle momentum and recent BTC aggressor flow create a research score,
+        # then the Scalp Desk requires observed Kalshi bid follow-through.
         scalp_score = 28 * np.tanh(momentum / 1.25)
-        scalp_score += 30 * (candle_intel.get("scalp_score", 0.0) / 100.0)
-        if pressure is not None: scalp_score += 18 * pressure
-        if balance is not None: scalp_score += 12 * balance
+        scalp_score += 34 * (candle_intel.get("scalp_score", 0.0) / 100.0)
+        if pressure is not None: scalp_score += 22 * pressure
+        if balance is not None: scalp_score += 14 * balance
         model_edge = None
         if prob_above is not None and market_p is not None:
             model_edge = (prob_above-market_p)*100.0
-            scalp_score += float(np.clip(model_edge*1.25, -20, 20))
         scalp_score = float(np.clip(scalp_score, -100, 100))
 
         # A separate cash-out monitor uses observed Kalshi bids and liquidity,
@@ -2648,6 +2649,16 @@ def _render_live_dashboard_inner():
     engine["scalp"] = scalp_exit["status"] if scalp_exit else scalp_watch["status"]
     engine["scalp_watch"] = scalp_watch
     engine["scalp_exit"] = scalp_exit
+
+    # Visual notification once when the alert changes; browser session only.
+    alert_id = f"{active_ticker}:{scalp_exit['status']}" if scalp_exit else None
+    if alert_id != st.session_state.get("scalp_last_alert"):
+        if scalp_exit and scalp_exit["status"] in (
+            "TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON",
+            "PREPARE TO CASH", "EXIT WINDOW CLOSING", "LIQUIDITY WARNING",
+        ):
+            st.toast("Scalp exit alert: " + scalp_exit["status"], icon="⚡")
+        st.session_state["scalp_last_alert"] = alert_id
 
     # Automatically journal one snapshot in each time bucket (max six per market).
     # Once the market settles, refresh_learning_outcomes supplies the official YES/NO
