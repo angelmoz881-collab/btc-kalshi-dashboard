@@ -54,6 +54,18 @@ class LevelPressureTest(unittest.TestCase):
         self.assertEqual(result["bias"], "SELLERS")
         self.assertIn("VOLUME-CONFIRMED BREAK BELOW", result["setup"])
 
+    def test_broken_resistance_becomes_candidate_support(self):
+        result = analyze_buyer_seller_pressure(bars("breakout_up"), executed("buy"), now=NOW)
+        self.assertAlmostEqual(result["support"], 100.65, places=1)
+        if result["resistance"] is not None:
+            self.assertGreater(result["resistance"], result["support"])
+
+    def test_broken_support_becomes_candidate_resistance(self):
+        result = analyze_buyer_seller_pressure(bars("breakout_down"), executed("sell"), now=NOW)
+        self.assertAlmostEqual(result["resistance"], 99.35, places=1)
+        if result["support"] is not None:
+            self.assertLess(result["support"], result["resistance"])
+
     def test_rejection_at_high_is_not_confirmed_breakout(self):
         result = analyze_buyer_seller_pressure(bars("failed_up"), executed("sell"), now=NOW)
         self.assertEqual(result["bias"], "SELLERS")
