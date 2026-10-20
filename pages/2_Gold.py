@@ -86,4 +86,66 @@ _replace_once(
 ''',
 )
 
+
+# Gold is settled on Pyth GOLD. GC=F is not interchangeable with Pyth candles.
+# Fetch real Pyth Pro XAU/USD history when authorized; never treat Yahoo's
+# regularMarketPrice metadata as an OHLC candle with real momentum/wicks.
+_begin = _source.index("    # Yahoo's chart candles can lag the current quote")
+_end = _source.index("    df = pd.DataFrame(rows)", _begin)
+_source = _source[:_begin] + "    # Only actual one-minute OHLC bars are accepted.\n" + _source[_end:]
+
+_replace_once(
+    'import streamlit as st\n',
+    'import streamlit as st\nfrom gold_data_quality import load_gold_candles\n',
+)
+_replace_once(
+    '        candles = fetch_gold_proxy_history()\n        pyth = gold_reference_with_fallback(candles)\n',
+    '        candles, candle_quality = load_gold_candles(\n'
+    '            _secret("PYTH_PRO_API_KEY", ""), fetch_gold_proxy_history, max_age_sec=135\n'
+    '        )\n'
+    '        pyth = gold_reference_with_fallback(candles)\n',
+)
+_replace_once(
+    '    model = build_gold_model(candles, pyth, snapshot, extra_buffer_cents=settings["extra_buffer"])',
+    '    # Never compute a prediction from stale GC futures, an old Pyth quote, or\n'
+    '    # unverified candles. A freshly repainted screen is NOT a fresh data feed.\n'
+    '    quote_age = _safe_float(pyth.get("age_sec"))\n'
+    '    quote_ok = (pyth.get("is_settlement_reference", False) and quote_age is not None\n'
+    '                and 0 <= quote_age <= min(settings["max_quote_age"], 60))\n'
+    '    model_inputs_ready = candle_quality["fresh"] and candle_quality["is_pyth_candles"] and quote_ok\n'
+    '    model_candles = candles if model_inputs_ready else candles.iloc[0:0]\n'
+    '    model = build_gold_model(model_candles, pyth, snapshot, extra_buffer_cents=settings["extra_buffer"])\n'
+    '    if not model_inputs_ready:\n'
+    '        issue = candle_quality["reason"]\n'
+    '        if not candle_quality["is_pyth_candles"]:\n'
+    '            issue = "Pyth Pro 1m candles unavailable; GC=F is display-only"\n'
+    '        if not quote_ok:\n'
+    '            issue += "; Pyth Core settlement quote missing or stale"\n'
+    '        st.error("NO VERIFIED GOLD PREDICTION · " + issue)\n'
+    '    else:\n'
+    '        st.caption("Pyth Pro 1m candles fresh ({:.0f}s old) · Pyth Core quote {:.1f}s old".format(candle_quality["candle_age_sec"], quote_age))',
+)
+_replace_once(
+    '    side, edge, blockers = _execution_candidate(model, snapshot, settings, pyth)',
+    '    side, edge, blockers = _execution_candidate(model, snapshot, settings, pyth)\n'
+    '    if not model_inputs_ready:\n'
+    '        blockers = list(blockers) + ["No verified current Pyth Gold candle + quote pair"]',
+)
+_replace_once(
+    '        refresh_label=refresh_mode,\n',
+    '        refresh_label=refresh_mode,\n'
+    '        source_label=candle_quality["source"],\n'
+    '        candle_age_sec=candle_quality.get("candle_age_sec"),\n',
+)
+_replace_once(
+    '            "reference_quote_age_sec": pyth.get("age_sec"),',
+    '            "reference_quote_age_sec": pyth.get("age_sec"),\n'
+    '            "candle_source": candle_quality["source"],\n'
+    '            "last_candle_utc": candle_quality.get("last_candle_utc"),\n'
+    '            "candle_age_sec": candle_quality.get("candle_age_sec"),\n'
+    '            "candle_fresh": candle_quality["fresh"],\n'
+    '            "candle_quality_reason": candle_quality["reason"],\n'
+    '            "pyth_pro_error": candle_quality.get("pyth_pro_error"),',
+)
+
 exec(compile(_source, "2_Gold.py", "exec"), globals(), globals())

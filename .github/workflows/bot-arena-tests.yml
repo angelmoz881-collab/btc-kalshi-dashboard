@@ -14,8 +14,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
-        run: python -m pip install pandas numpy pytest
+        run: python -m pip install pandas numpy pytest requests
       - name: Compile all Python sources
-        run: python -m compileall -q dashboard.py arena_core.py gold_trader_chart.py pages
+        run: python -m compileall -q dashboard.py arena_core.py gold_trader_chart.py gold_data_quality.py pages
       - name: Run Arena regression tests
-        run: python -m pytest -q tests/test_arena_core.py
+        run: python -m pytest -q tests/test_arena_core.py tests/test_gold_data_quality.py

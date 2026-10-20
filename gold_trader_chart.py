@@ -60,7 +60,7 @@ def render_gold_expiry_timer(expiry, ticker="gold"):
     components.html(html, height=92, scrolling=False)
 
 
-def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None, refresh_label=None):
+def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None, refresh_label=None, source_label="GC=F", candle_age_sec=None):
     """Render Gold with the same HyperTradez-style Lightweight Charts UI as BTC."""
     if candles is None or candles.empty:
         st.info("No Gold candle data available yet.")
@@ -104,12 +104,15 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
 
     strike_value = _safe_float(strike)
     current_value = _safe_float(current_ref)
+    source_label = str(source_label or "GC=F")
+    is_pyth_history = source_label == "Pyth Pro XAU/USD"
     payload = json.dumps({
         "bars": bars,
         "overlays": overlays,
         "visible": min(60, len(bars)),
-        "strike": strike_value,
-        "reference": current_value,
+        "strike": strike_value if is_pyth_history else None,
+        "reference": current_value if is_pyth_history else None,
+        "source": source_label,
         "ticker": str(ticker or "KXGOLD15M"),
     }, allow_nan=False)
 
@@ -125,10 +128,11 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
     #reset-view{position:absolute;top:9px;right:70px;z-index:3;background:#211925;color:#d9e3f1;border:1px solid #56303a;border-radius:6px;padding:5px 8px;cursor:pointer}
     #error{color:#ff9eaa;padding:15px;display:none}
     </style></head><body>
-    <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">GC=F GOLD · 1M · __TICKER__</div><div id="chart"></div><div id="error"></div></div>
+    <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">GOLD · 1M · __TICKER__</div><div id="chart"></div><div id="error"></div></div>
     <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
     const data=__PAYLOAD__;
+    document.getElementById("status").textContent=data.source+" · 1M · "+data.ticker;
     const root=document.getElementById('chart');
     const error=document.getElementById('error');
     try {
@@ -227,7 +231,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
     components.html(chart_html, height=308, scrolling=False)
 
     latest_close = float(bars[-1]["close"])
-    if strike_value is not None:
+    if strike_value is not None and is_pyth_history:
         side = "ABOVE" if latest_close >= strike_value else "BELOW"
         ref_text = ""
         if current_value is not None:
@@ -235,13 +239,13 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
             ref_text = f" · Pyth {ref_side} ${abs(current_value-strike_value):,.2f}"
         refresh_text = f" · ⚡ {str(refresh_label).replace(' · ', ' ')}" if refresh_label else ""
         st.caption(
-            f"🔴 Strike ${strike_value:,.2f} · GC=F {side} ${abs(latest_close-strike_value):,.2f}{ref_text}{refresh_text} · 👆 Drag · 🤏 Pinch"
+            f"🔴 Strike ${strike_value:,.2f} · Pyth Pro {side} ${abs(latest_close-strike_value):,.2f}{ref_text}{refresh_text} · 👆 Drag · 🤏 Pinch"
         )
     else:
-        refresh_text = f" · ⚡ {str(refresh_label).replace(' · ', ' ')}" if refresh_label else ""
-        st.caption(f"GC=F 1m proxy · EMA 5/15{refresh_text} · 👆 Drag · 🤏 Pinch zoom · Strike unavailable")
+        age = f"{candle_age_sec:.0f}s old" if candle_age_sec is not None else "age unknown"
+        if not is_pyth_history:
+            st.caption(f"GC=F FUTURES RESEARCH ONLY · Last candle {age} · futures prices are not the Pyth settlement price. No strike/settlement comparison shown on this chart.")
+        else:
+            st.caption(f"Pyth Pro XAU/USD 1m candles · Last candle {age} · strike unavailable")
 
-    st.caption(
-        "Gold now uses the same HyperTradez-style Lightweight Charts renderer as BTC. "
-        "GC=F supplies the candle proxy; Pyth XAU/USD remains the settlement-reference line when available."
-    )
+    st.caption(f"Gold candle source: {source_label}. Chart refresh does not imply a new provider candle.")
