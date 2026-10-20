@@ -80,8 +80,18 @@ def _levels(candles, atr):
     lower = float(window["low"].min())
     price = float(candles["close"].iloc[-1])
     margin = max(atr * .30, price * .00003)
-    supports = [v for v in clusters["low"] if v < price + margin]
-    resistances = [v for v in clusters["high"] if v > price - margin]
+    supports = [v for v in clusters["low"] if v <= price + margin]
+    resistances = [v for v in clusters["high"] if v >= price - margin]
+    if price > upper + margin:
+        # Broken resistance may become support on a confirmed retest.
+        supports.append(upper)
+        resistance = min((v for v in resistances if v > price + margin), default=None)
+        return float(max(supports)), (float(resistance) if resistance is not None else None), upper, lower
+    if price < lower - margin:
+        # Broken support may become resistance on a failed reclaim.
+        resistances.append(lower)
+        support = max((v for v in supports if v < price - margin), default=None)
+        return (float(support) if support is not None else None), float(min(resistances)), upper, lower
     supports.append(lower)
     resistances.append(upper)
     support = max((v for v in supports if v <= price + margin), default=lower)
