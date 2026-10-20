@@ -3391,10 +3391,15 @@ def _render_live_dashboard_inner():
                 f"{bp.get('status','UNAVAILABLE')} · {bp.get('setup','waiting')} · "
                 f"signal horizon {bp.get('horizon','next 1–5 min')}."
             )
-            if bp.get("support") is not None and bp.get("resistance") is not None:
+            if bp.get("range_high") is not None and bp.get("range_low") is not None:
+                levels = []
+                if bp.get("support") is not None:
+                    levels.append(f"support ~ ${bp['support']:,.2f}")
+                if bp.get("resistance") is not None:
+                    levels.append(f"resistance ~ ${bp['resistance']:,.2f}")
                 st.caption(
-                    f"BTC spot support ~ ${bp['support']:,.2f} · resistance ~ ${bp['resistance']:,.2f} · "
-                    f"prior 20 closed-minute range ${bp['range_low']:,.2f} – ${bp['range_high']:,.2f}."
+                    "BTC spot " + (" · ".join(levels) if levels else "no confirmed nearby pivot") +
+                    f" · prior 20 closed-minute range ${bp['range_low']:,.2f} – ${bp['range_high']:,.2f}."
                 )
             for e in bp.get("evidence", []):
                 st.caption("• " + e)
