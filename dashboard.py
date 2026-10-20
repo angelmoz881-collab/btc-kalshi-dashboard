@@ -11,6 +11,7 @@ import numpy as np
 import streamlit as st
 from arena_core import analyze_arena
 from candle_possible import candle_possible_signal
+from buyer_seller_levels import analyze_buyer_seller_pressure
 from candle_calibration import train_candle_calibrator, apply_candle_calibration
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
@@ -2426,23 +2427,31 @@ def _render_live_dashboard_inner():
     # Dual-purpose research signals: deliberately conservative, not calibrated probabilities.
     @st.cache_data(ttl=2, show_spinner=False)
     def recent_exchange_trades():
+        """One fetch for Fusion legacy trade tuples and independent BTC tape."""
         r = HTTP.get(f"{COINBASE}/products/BTC-USD/trades", headers=HEADERS, timeout=9)
         r.raise_for_status()
         trades = r.json()
         if not isinstance(trades, list):
             raise ValueError("Unexpected exchange trade format")
-        result = []
+        result, tape = [], []
         for t in trades:
             try:
                 size = float(t["size"])
                 px = float(t["price"])
-                side = str(t.get("side", "")).lower()
-                if size > 0 and px > 0 and side in ("buy", "sell"):
-                    # Coinbase Exchange trade 'side' is the maker side; the aggressor is opposite.
-                    result.append(("buy" if side == "sell" else "sell", size * px))
+                maker_side = str(t.get("side", "")).lower()
+                if np.isfinite(size) and np.isfinite(px) and size > 0 and px > 0 and maker_side in ("buy", "sell"):
+                    # Coinbase 'side' is the maker side, opposite of aggressor.
+                    aggressor = "buy" if maker_side == "sell" else "sell"
+                    notional = size * px
+                    result.append((aggressor, notional))
+                    tape.append({
+                        "aggressor": aggressor, "notional": notional,
+                        "id": str(t.get("trade_id") or ""),
+                        "time": str(t.get("time") or ""),
+                    })
             except (KeyError, ValueError, TypeError):
                 pass
-        return result
+        return result, tape
 
     @st.cache_data(ttl=15, show_spinner=False)
     def blockchain_activity():
@@ -2652,10 +2661,10 @@ def _render_live_dashboard_inner():
         }
 
     try:
-        whale_trades = recent_exchange_trades()
+        whale_trades, buyer_seller_tape = recent_exchange_trades()
         whale_error = None
     except (requests.RequestException, ValueError) as exc:
-        whale_trades, whale_error = [], str(exc)
+        whale_trades, buyer_seller_tape, whale_error = [], [], str(exc)
     try:
         chain_count, chain_vsize = blockchain_activity()
         chain_error = None
@@ -2691,6 +2700,10 @@ def _render_live_dashboard_inner():
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
                               outcome_history, brti_proxy, proxy_samples, learning_model)
     engine["candle_only_15m"] = candle_forecast
+    # Separate short-horizon BTC spot radar, independent of Kalshi quote and strike.
+    engine["buyer_seller_levels"] = analyze_buyer_seller_pressure(
+        candles, buyer_seller_tape, stale=(candle_feed_stale or spot_feed_stale)
+    )
 
     # A genuinely independent "POSSIBLE ABOVE/BELOW" view. Only BTC OHLCV,
     # historical BTC candles and the contract's strike/time are inputs.
@@ -2958,6 +2971,8 @@ def _render_live_dashboard_inner():
             "visible": visible_count,
             "strike": strike_value,
             "reference": float(engine.get("reference_price")) if engine.get("reference_price") is not None else None,
+            "support": (engine.get("buyer_seller_levels") or {}).get("support"),
+            "resistance": (engine.get("buyer_seller_levels") or {}).get("resistance"),
         }, allow_nan=False)
         chart_html = r"""<!doctype html><html><head>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
@@ -3019,6 +3034,18 @@ def _render_live_dashboard_inner():
               title:'BRTI PROXY'
             });
           }
+
+          // Independent BTC spot levels. Distinct from the Kalshi settlement strike.
+          if (Number.isFinite(data.support)) main.createPriceLine({
+            price:data.support,color:'#38d9a5',lineWidth:1,
+            lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'SUPPORT'
+          });
+          if (Number.isFinite(data.resistance) &&
+              (!Number.isFinite(data.support) || Math.abs(data.resistance-data.support)>0.01))
+            main.createPriceLine({
+              price:data.resistance,color:'#fbbf24',lineWidth:1,
+              lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'RESISTANCE'
+            });
 
           data.overlays.forEach(o=>{
             const series=chart.addLineSeries({color:o.color,lineWidth:1,
@@ -3282,6 +3309,14 @@ def _render_live_dashboard_inner():
             )
         else:
             st.caption("🕯️ Candle-only possible model: " + str(_cp.get("detail", "Waiting for BTC candles")))
+        _bp = engine.get("buyer_seller_levels") or {}
+        _vr = _bp.get("volume_ratio")
+        _vtext = f"{_vr:.2f}× 1m volume" if _vr is not None else "volume not ready"
+        st.caption(
+            f"⚖️ BTC BUYERS vs SELLERS · next 1–5m: {_bp.get('status','UNAVAILABLE')} · "
+            f"{_bp.get('setup','waiting')} · {_vtext} · "
+            "Independent of Kalshi YES/NO prices; unvalidated pressure heuristic."
+        )
         direction_score = np.clip((ret5 if pd.notna(ret5) else 0) * 18 + (ret15 if pd.notna(ret15) else 0) * 5, -100, 100)
         if abs(direction_score) < 8:
             context = "NO CLEAR EDGE — wait for confirmation"
@@ -3349,6 +3384,27 @@ def _render_live_dashboard_inner():
             else:
                 st.caption("No settlement probability is available because the strike or required live inputs are missing.")
             st.caption("Kalshi KXBTC15M settles from the simple average of 60 official BRTI values during the last minute. The dashboard uses a multi-exchange proxy and deliberately shows UNCERTAIN when evidence is not strong enough.")
+
+            st.markdown("**BTC breakout / buyer–seller pressure radar**")
+            bp = engine.get("buyer_seller_levels") or {}
+            st.caption(
+                f"{bp.get('status','UNAVAILABLE')} · {bp.get('setup','waiting')} · "
+                f"signal horizon {bp.get('horizon','next 1–5 min')}."
+            )
+            if bp.get("support") is not None and bp.get("resistance") is not None:
+                st.caption(
+                    f"BTC spot support ~ ${bp['support']:,.2f} · resistance ~ ${bp['resistance']:,.2f} · "
+                    f"prior 20 closed-minute range ${bp['range_low']:,.2f} – ${bp['range_high']:,.2f}."
+                )
+            for e in bp.get("evidence", []):
+                st.caption("• " + e)
+            st.caption(bp.get("detail", "Waiting for BTC spot evidence."))
+            st.caption(
+                "Support/resistance are previous confirmed candle levels, not guaranteed walls. "
+                "Exchange executions reveal which side *already* crossed the spread; they cannot prove "
+                "who will trade next. Candle volume by itself never identifies buyers vs sellers. "
+                "A no-clear-control result is normal when breakouts or evidence conflict."
+            )
 
             st.markdown("**Candle intelligence**")
             tf_text = " · ".join([f"{m}m {candle_engine['timeframes'][m]['score']:+.0f}" for m in (1,5,15)])
@@ -3721,6 +3777,13 @@ def _render_live_dashboard_inner():
     - The model reports **EST. ABOVE**, **EST. BELOW**, and **MODEL CONFIDENCE**. If the components disagree or data quality is weak, it deliberately shows **UNCERTAIN** instead of forcing ABOVE or BELOW.
     - **POSSIBLE ABOVE / BELOW** is a separate **BTC-CANDLES-ONLY** expiry estimate. It uses 1m/5m/15m candle structure, RSI/MACD/EMA/volume, volatility versus the contract's strike, and historical BTC candle setups for time remaining. It does **not** use Kalshi odds, bids, whale trades, exchange flow, the BRTI proxy or the fused/adaptive model as prediction inputs. It records its own frozen probabilities and learns against official settled YES/NO outcomes, but only adjusts its live percentages when at least 100 independent settled markets and forward-held-out Brier validation prove an improvement. Otherwise it clearly displays UNCALIBRATED. NO CLEAR LEAN remains available when candles conflict or settlement is too close. Candle-only estimates cannot directly forecast the official BRTI final-minute average.
     - The regular **FUSION ABOVE/BELOW** prediction is unchanged, so you can independently compare its market-informed view with the candle-only POSSIBLE prediction. The SCALP cash-out estimator is also unchanged.
+
+    **How buyer/seller pressure and breakthrough levels are used**
+    - The independent BTC spot radar uses closed candles and their volume to locate support/resistance; a close beyond the prior range with elevated volume and a firm candle body indicates a possible breakout.
+    - Wicks through a level that close back inside, or a breakout that immediately falls back within the range, can reveal buying/selling absorption or failed breakouts; retests that hold can support continuation.
+    - It also observes Coinbase BTC spot *executed aggressor* imbalance from recent trades (maker side inverted). Candle volume alone does not identify buy and sell order direction.
+    - This research estimate covers possible next 1–5m buying/selling pressure; it is independent of Kalshi market-implied odds, Fusion, the candle-only expiry estimate, and Scalp.
+    - It is not backtested or a guaranteed prediction of future buying/selling. The chart draws BTC support in green, resistance in amber and Kalshi strike in red.
 
     **How candle reading is used**
     - Long bodies and closes near an extreme imply stronger one-sided control; long two-sided wicks imply conflict/indecision.
