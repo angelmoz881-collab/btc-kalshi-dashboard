@@ -12,6 +12,7 @@ import streamlit as st
 from arena_core import analyze_arena
 from candle_possible import candle_possible_signal
 from buyer_seller_levels import analyze_buyer_seller_pressure
+from kalshi_btc_discovery import discover_btc_markets, live_btc_market
 from candle_calibration import train_candle_calibrator, apply_candle_calibration
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
@@ -1372,32 +1373,26 @@ def get_orderbook(ticker):
 
 
 @st.cache_data(ttl=5, show_spinner=False)
+def _fetch_btc_15m_discovery():
+    """Query documented Kalshi public market and event endpoints, with host failover."""
+    return discover_btc_markets(HTTP.get)
+
+
 def discover_btc_15m_markets():
-    """Fetch open KXBTC15M markets and prioritize the nearest future close."""
-    found = []
-    cursor = None
-    now = datetime.now(timezone.utc)
-    for _ in range(5):
-        params = {"series_ticker": "KXBTC15M", "status": "open", "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        response = HTTP.get(f"{KALSHI}/markets", params=params, headers=HEADERS, timeout=12)
-        response.raise_for_status()
-        payload = response.json()
-        found.extend(payload.get("markets", []))
-        cursor = payload.get("cursor")
-        if not cursor:
-            break
-
-    def seconds_to_close(market):
-        try:
-            dt = datetime.fromisoformat(str(market.get("close_time", "")).replace("Z", "+00:00"))
-            return (dt - now).total_seconds()
-        except (ValueError, TypeError):
-            return -1
-
-    unique = {m["ticker"]: m for m in found if m.get("ticker") and seconds_to_close(m) > 0}
-    return sorted(unique.values(), key=seconds_to_close)
+    """Remember only confirmed, still-open BTC markets across brief API hiccups."""
+    response = dict(_fetch_btc_15m_discovery())
+    if response["markets"]:
+        st.session_state["last_confirmed_btc_15m"] = response["markets"]
+        return response
+    old = st.session_state.get("last_confirmed_btc_15m") or []
+    valid = [m for m in old if live_btc_market(m)]
+    if valid:
+        response["markets"] = valid
+        response["source"] = "recently verified (retrying live API)"
+        response["status"] = "USING RECENTLY VERIFIED MARKET · API RETRYING"
+    else:
+        st.session_state.pop("last_confirmed_btc_15m", None)
+    return response
 
 def cents(value):
     if value is None:
@@ -2200,10 +2195,13 @@ with st.sidebar:
     st.header("Settings")
     st.caption("Automatically searches Kalshi for open BTC 15-minute markets; refreshes discovery about every 5 seconds.")
     try:
-        discovered_markets = discover_btc_15m_markets()
+        discovery_details = discover_btc_15m_markets()
+        discovered_markets = discovery_details.get("markets", [])
     except Exception as e:
+        discovery_details = {"markets": [], "source": "none",
+                             "status": "BTC discovery failed",
+                             "errors": [type(e).__name__]}
         discovered_markets = []
-        st.warning(f"Automatic market discovery failed: {e}")
     market_options = {
         f"{m.get('title') or m.get('subtitle') or m['ticker']} · {m['ticker']}": m["ticker"]
         for m in discovered_markets if m.get("ticker")
@@ -2212,9 +2210,22 @@ with st.sidebar:
         selected_label = st.selectbox("Detected open BTC 15-minute market", list(market_options.keys()), index=0)
         market_ticker = market_options[selected_label]
         st.success(f"Selected ticker: {market_ticker}")
-        st.caption("The nearest-closing active contract is selected by default on every refresh. You can select another open contract if needed.")
+        st.caption(
+            f"Discovered via {discovery_details.get('source','Kalshi')}. "
+            "The live chart automatically rolls to a new contract when the selected one expires. "
+            "Use the manual field below only to override it."
+        )
+        if discovery_details.get("source", "").startswith("recently verified"):
+            st.warning("Kalshi lookup is temporarily unavailable; showing only a previously confirmed, unexpired ticker.")
     else:
-        st.info("No matching open BTC 15-minute markets were found automatically. You can enter a ticker manually below.")
+        st.warning(
+            "No currently trading KXBTC15M contract confirmed. "
+            "Checked Kalshi market listings and nested BTC events; a new window "
+            "may not be open yet, or Kalshi's API may be unavailable."
+        )
+        if discovery_details.get("errors"):
+            st.caption("Kalshi discovery diagnostics: " + " · ".join(discovery_details["errors"][:3]))
+        st.caption("Next refresh retries automatically. You can enter a verified market ticker below.")
         market_ticker = ""
     manual_ticker = st.text_input(
         "Or enter ticker manually",
@@ -2315,12 +2326,15 @@ def _render_live_dashboard_inner():
         active_ticker = current_paper["ticker"]
     elif not manual_ticker:
         try:
-            _live_markets = discover_btc_15m_markets()
+            _live_markets = discover_btc_15m_markets().get("markets", [])
             _open_tickers = {m.get("ticker") for m in _live_markets if m.get("ticker")}
             if active_ticker not in _open_tickers and _live_markets:
                 active_ticker = _live_markets[0]["ticker"]
         except Exception:
             pass
+    # This is the actual live-market ticker used by the fragment; unlike the
+    # sidebar selectbox, it can advance without a full Streamlit page reload.
+    st.session_state["btc_active_ticker"] = active_ticker
     # Load previous prediction snapshots, automatically attach any newly settled
     # Kalshi results, then train the adaptive calibration layer. The model only
     # activates after chronological held-out validation proves it improves Brier score.
@@ -2391,6 +2405,7 @@ def _render_live_dashboard_inner():
         age = max(0, int(time.time() - float(st.session_state.get("_last_good_candles_ts", time.time()))))
         st.caption(f"⚠️ BTC candle feed reconnecting — showing last good data ({age}s old).")
 
+    st.caption(f"Kalshi live BTC15M ticker: {active_ticker or 'not yet available'} · Auto-roll enabled")
     kalshi_data = None
     kalshi_error = None
     kalshi_stale = False
