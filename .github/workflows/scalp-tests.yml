@@ -7,6 +7,8 @@ on:
       - "test_scalp_engine.py"
       - "dashboard.py"
       - "candle_possible.py"
+      - "kalshi_btc_discovery.py"
+      - "test_kalshi_btc_discovery.py"
       - "buyer_seller_levels.py"
       - "test_buyer_seller_levels.py"
       - "candle_calibration.py"
@@ -22,6 +24,8 @@ on:
       - "test_scalp_engine.py"
       - "dashboard.py"
       - "candle_possible.py"
+      - "kalshi_btc_discovery.py"
+      - "test_kalshi_btc_discovery.py"
       - "buyer_seller_levels.py"
       - "test_buyer_seller_levels.py"
       - "candle_calibration.py"
@@ -42,8 +46,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Check Python syntax
-        run: python -m py_compile dashboard.py scalp_engine.py auto_scalp.py kalshi_account.py candle_possible.py candle_calibration.py buyer_seller_levels.py
+        run: python -m py_compile dashboard.py scalp_engine.py auto_scalp.py kalshi_account.py candle_possible.py candle_calibration.py buyer_seller_levels.py kalshi_btc_discovery.py
       - name: Test scalp exit model
         run: |
           python -m pip install -q requests cryptography pandas numpy
-          python -m unittest -v test_scalp_engine.py test_auto_scalp.py test_candle_possible.py test_candle_calibration.py test_buyer_seller_levels.py
+          python -m unittest -v test_scalp_engine.py test_auto_scalp.py test_candle_possible.py test_candle_calibration.py test_buyer_seller_levels.py test_kalshi_btc_discovery.py
