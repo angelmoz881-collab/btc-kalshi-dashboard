@@ -124,6 +124,47 @@ class BTCDiscoveryTest(unittest.TestCase):
         result = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
         self.assertEqual(result["markets"], [])
 
+    def test_direct_event_lookup_recovers_live_market(self):
+        """Both listing endpoints empty; verified event lookup returns actual child market."""
+        def handler(url, p):
+            if url.endswith("/markets"):
+                return {"markets": [], "cursor": ""}
+            if url.endswith("/events"):
+                return {"events": [], "cursor": ""}
+            if "/events/KXBTC15M-" in url:
+                return {"event": {"event_ticker": url.rsplit("/", 1)[-1],
+                                  "series_ticker": "KXBTC15M", "status": "open",
+                                  "markets": [market()]}}
+            return {"events": [], "cursor": ""}
+        api = FakeAPI(handler)
+        result = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
+        self.assertEqual(result["markets"][0]["ticker"], TICKER)
+        self.assertEqual(result["source"], "Kalshi direct event")
+        self.assertTrue(any("/events/KXBTC15M-" in u for u, _ in api.calls))
+
+    def test_direct_event_supports_markets_in_top_level_response(self):
+        def handler(url, p):
+            if url.endswith("/markets"):
+                return {"markets": [], "cursor": ""}
+            if url.endswith("/events"):
+                return {"events": [], "cursor": ""}
+            return {"event": {"series_ticker": "KXBTC15M", "status": "open"},
+                    "markets": [market()]}
+        result = discover_btc_markets(FakeAPI(handler), now=NOW, hosts=["https://api.test"])
+        self.assertEqual(result["source"], "Kalshi direct event")
+        self.assertEqual(result["markets"][0]["ticker"], TICKER)
+
+    def test_does_not_fabricate_market_from_event_name(self):
+        api = FakeAPI(lambda url, p:
+            {"markets": [], "cursor": ""} if url.endswith("/markets") else
+            {"events": [], "cursor": ""} if url.endswith("/events") else
+            {"event": {"series_ticker": "KXBTC15M",
+                       "event_ticker": "KXBTC15M-26OCT241900", "status": "open",
+                       "markets": []}}
+        )
+        result = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
+        self.assertEqual(result["markets"], [])
+
     def test_missing_response_data_is_not_a_fake_success(self):
         api = FakeAPI(lambda url, p: {"data": []})
         result = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
