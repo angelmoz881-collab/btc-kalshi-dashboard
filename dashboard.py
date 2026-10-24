@@ -12,7 +12,7 @@ import streamlit as st
 from arena_core import analyze_arena
 from candle_possible import candle_possible_signal
 from buyer_seller_levels import analyze_buyer_seller_pressure
-from kalshi_btc_discovery import discover_btc_markets, live_btc_market
+from kalshi_btc_discovery import discover_btc_markets, live_btc_market, HOSTS
 from candle_calibration import train_candle_calibrator, apply_candle_calibration
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
@@ -1357,18 +1357,29 @@ def final_minute_probability(proxy_price, strike, expiry_ts, samples, sigma_1m):
         "remaining_sec": float(remaining),
     }
 
+def _public_kalshi_json(path):
+    """Use the same public-host failover for quotes as for discovery."""
+    last_error = None
+    for host in HOSTS:
+        try:
+            r = HTTP.get(f"{host}/{path}", headers=HEADERS, timeout=8)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("Kalshi market data unavailable")
+
+
 @st.cache_data(ttl=1, show_spinner=False)
 def get_market(ticker):
-    r = HTTP.get(f"{KALSHI}/markets/{ticker}", headers=HEADERS, timeout=12)
-    r.raise_for_status()
-    j = r.json()
+    j = _public_kalshi_json(f"markets/{ticker}")
     return j.get("market", j)
 
 @st.cache_data(ttl=1, show_spinner=False)
 def get_orderbook(ticker):
-    r = HTTP.get(f"{KALSHI}/markets/{ticker}/orderbook", headers=HEADERS, timeout=12)
-    r.raise_for_status()
-    j = r.json()
+    j = _public_kalshi_json(f"markets/{ticker}/orderbook")
     return j.get("orderbook_fp") or j.get("orderbook") or j
 
 
