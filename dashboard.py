@@ -2205,7 +2205,7 @@ def hourly_price_forecast(frame, history=None, hours=6):
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("Automatically searches Kalshi for open BTC 15-minute markets; refreshes discovery about every 5 seconds.")
+    st.caption("BTC ticker repair v3 · Oct 24 · Kalshi markets → events → verified direct event lookup. Updates on live refresh.")
     try:
         discovery_details = discover_btc_15m_markets()
         discovered_markets = discovery_details.get("markets", [])
@@ -2236,9 +2236,14 @@ with st.sidebar:
             "may not be open yet, or Kalshi's API may be unavailable."
         )
         if discovery_details.get("errors"):
-            st.caption("Kalshi discovery diagnostics: " + " · ".join(discovery_details["errors"][:3]))
-        st.caption("Next refresh retries automatically. You can enter a verified market ticker below.")
+            st.caption("Kalshi request errors: " + " · ".join(discovery_details["errors"][:4]))
+        if discovery_details.get("diagnostics"):
+            st.caption("Search results: " + " · ".join(discovery_details["diagnostics"][:6]))
+        st.caption("Next live refresh retries automatically. You can enter a verified market ticker below.")
         market_ticker = ""
+    if st.button("Retry BTC ticker search now", key="retry_btc_lookup"):
+        _fetch_btc_15m_discovery.clear()
+        st.rerun()
     manual_ticker = st.text_input(
         "Or enter ticker manually",
         placeholder="KX...-...",
@@ -2347,6 +2352,14 @@ def _render_live_dashboard_inner():
     # This is the actual live-market ticker used by the fragment; unlike the
     # sidebar selectbox, it can advance without a full Streamlit page reload.
     st.session_state["btc_active_ticker"] = active_ticker
+    if not active_ticker:
+        _diag = discover_btc_15m_markets()
+        if _diag.get("errors"):
+            st.warning("Kalshi API request errors: " + " · ".join(_diag["errors"][:3]))
+        elif _diag.get("diagnostics"):
+            st.info("Kalshi BTC discovery found no live contract: " + " · ".join(_diag["diagnostics"][:3]))
+        else:
+            st.info("BTC contract discovery is waiting for Kalshi to publish an open market.")
     # Load previous prediction snapshots, automatically attach any newly settled
     # Kalshi results, then train the adaptive calibration layer. The model only
     # activates after chronological held-out validation proves it improves Brier score.
