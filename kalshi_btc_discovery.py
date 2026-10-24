@@ -5,7 +5,7 @@ existing and Kalshi's canonical public Trade API host. Only OPEN, currently
 trading KXBTC15M contracts may be selected. Unopened and expired contracts
 are never silently substituted for live tickers.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections.abc import Mapping
 
 SERIES = "KXBTC15M"
@@ -61,7 +61,7 @@ def live_btc_market(market, now=None):
     return True
 
 
-def _load_pages(get, host, endpoint, params, errors, max_pages=3):
+def _load_pages(get, host, endpoint, params, errors, max_pages=2):
     """Fetch a bounded number of cursor pages, stopping once data is nonempty."""
     cursor = None
     seen = set()
@@ -78,6 +78,8 @@ def _load_pages(get, host, endpoint, params, errors, max_pages=3):
                 errors.append(f"{host.split('/')[2]} {endpoint}: unexpected API response")
                 break
             collected.extend(payload[endpoint])
+            # Surface actual empty responses to distinguish "no live markets"
+            # from a response format problem or a connectivity failure.
             cursor = payload.get("cursor")
             if not cursor or not isinstance(cursor, str) or cursor in seen:
                 break
@@ -91,33 +93,103 @@ def _load_pages(get, host, endpoint, params, errors, max_pages=3):
     return collected
 
 
-def discover_btc_markets(get, now=None, hosts=HOSTS):
-    """Return {"markets": [...], "source": ..., "errors": [...], "status": ...}.
+def _event_candidates(now):
+    """Candidate EVENT tickers only; never invent or select a market ticker."""
+    quarter = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+    # Kalshi's 15m event tickers encode their window time. Try nearby
+    # boundaries, then rely entirely on Kalshi's actual returned child market.
+    return [
+        (quarter + timedelta(minutes=15 * step)).strftime(
+            "KXBTC15M-%y%b%d%H%M"
+        ).upper()
+        for step in (0, 1, 2, -1)
+    ]
 
-    A selected ticker is always an actual market ticker provided by Kalshi,
-    never a generated ticker and never merely an event/series ticker.
+
+def _from_event_response(payload, now):
+    """Accept both /events response layouts (nested or top-level markets)."""
+    if not isinstance(payload, Mapping):
+        return []
+    event = payload.get("event") or {}
+    if not isinstance(event, Mapping):
+        return []
+    if str(event.get("series_ticker") or SERIES).upper() != SERIES:
+        return []
+    markets = event.get("markets")
+    if not isinstance(markets, list):
+        markets = payload.get("markets") or []
+    accepted = []
+    for m in markets:
+        if not isinstance(m, Mapping):
+            continue
+        item = dict(m)
+        item.setdefault("status", event.get("status") or "open")
+        if live_btc_market(item, now):
+            accepted.append(item)
+    return accepted
+
+
+def _direct_event_lookup(get, host, now, errors):
+    """Try published 15-minute event windows via Kalshi; verify child markets.
+
+    A candidate event identifier is NOT a market ticker. We only return the
+    real market ticker from the API after validating its trading status/times.
+    """
+    results = {}
+    for event_id in _event_candidates(now):
+        try:
+            r = get(
+                f"{host}/events/{event_id}",
+                params={"with_nested_markets": "true"}, timeout=4,
+            )
+            if getattr(r, "status_code", None) == 404:
+                continue
+            r.raise_for_status()
+            payload = r.json()
+            for item in _from_event_response(payload, now):
+                results[item["ticker"]] = item
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            code = getattr(response, "status_code", None)
+            if code != 404:
+                errors.append(
+                    f"{host.split('/')[2]} direct event: HTTP {code}"
+                    if code else f"{host.split('/')[2]} direct event: {type(exc).__name__}"
+                )
+                # A connection failure is not fixed by asking this host for
+                # four adjacent events.
+                if code in (403, 429, 500, 502, 503, 504) or code is None:
+                    break
+    return results
+
+
+def discover_btc_markets(get, now=None, hosts=HOSTS):
+    """Find Kalshi-confirmed currently-open BTC 15-minute market tickers.
+
+    Three Kalshi routes are attempted: filtered /markets, nested /events,
+    then direct /events/{event_ticker} around the current UTC window.
     """
     now = _utc(now) if now is not None else datetime.now(timezone.utc)
     errors = []
+    diagnostics = []
     for host in hosts:
         rows = _load_pages(
             get, host, "markets",
-            {"series_ticker": SERIES, "status": "open", "mve_filter": "exclude", "limit": 200},
+            {"series_ticker": SERIES, "status": "open",
+             "mve_filter": "exclude", "limit": 200},
             errors,
         )
         valid = {}
         for m in rows:
             if isinstance(m, Mapping):
                 item = dict(m)
-                # Endpoint explicitly filters to status=open. Some API variants
-                # omit status on an abbreviated item; the filter is authoritative.
                 item.setdefault("status", "open")
                 if live_btc_market(item, now):
                     valid[item["ticker"]] = item
+        diagnostics.append(f"{host.split('/')[2]} markets: {len(rows)} returned / {len(valid)} usable")
         if valid:
-            return _result(valid, "Kalshi markets", errors)
-        # When /markets is temporarily empty, query the parent events with
-        # nested markets instead of fabricating an active 15m ticker.
+            return _result(valid, "Kalshi markets", errors, diagnostics)
+
         events = _load_pages(
             get, host, "events",
             {"series_ticker": SERIES, "status": "open",
@@ -127,22 +199,32 @@ def discover_btc_markets(get, now=None, hosts=HOSTS):
         for event in events:
             if not isinstance(event, Mapping) or str(event.get("series_ticker") or SERIES).upper() != SERIES:
                 continue
-            for m in event.get("markets") or []:
+            nested = event.get("markets") or []
+            for m in nested:
                 if not isinstance(m, Mapping):
                     continue
                 item = dict(m)
-                item.setdefault("status", str(event.get("status") or "open"))
+                item.setdefault("status", event.get("status") or "open")
                 if live_btc_market(item, now):
                     valid[item["ticker"]] = item
+        diagnostics.append(f"{host.split('/')[2]} events: {len(events)} returned / {len(valid)} usable")
         if valid:
-            return _result(valid, "Kalshi nested events", errors)
+            return _result(valid, "Kalshi nested events", errors, diagnostics)
+
+        direct = _direct_event_lookup(get, host, now, errors)
+        diagnostics.append(f"{host.split('/')[2]} direct events: {len(direct)} usable")
+        if direct:
+            return _result(direct, "Kalshi direct event", errors, diagnostics)
+
     return {
         "markets": [], "source": "none", "errors": errors,
-        "status": ("Kalshi API lookup failed or returned no usable markets"
-                   if errors else "Kalshi returned no currently open BTC 15-minute contracts"),
+        "diagnostics": diagnostics,
+        "status": ("Kalshi API request errors" if errors
+                   else "Kalshi returned no currently open KXBTC15M contracts"),
     }
 
 
-def _result(markets, source, errors):
+def _result(markets, source, errors, diagnostics=None):
     ordered = sorted(markets.values(), key=lambda m: (close_time(m), m["ticker"]))
-    return {"markets": ordered, "source": source, "errors": errors, "status": "LIVE"}
+    return {"markets": ordered, "source": source, "errors": errors,
+            "diagnostics": diagnostics or [], "status": "LIVE"}
