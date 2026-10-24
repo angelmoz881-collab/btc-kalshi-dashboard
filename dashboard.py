@@ -1466,9 +1466,10 @@ def kalshi_snapshot(ticker):
     book_error = None
     try:
         book = get_orderbook(ticker)
-    except requests.RequestException as exc:
+    except (requests.RequestException, ValueError) as exc:
+        # Missing orderbook must not hide an otherwise valid live BTC market.
         book = {}
-        book_error = str(exc)
+        book_error = f"Kalshi orderbook unavailable ({type(exc).__name__})"
     yes = levels(book, "yes")
     no = levels(book, "no")
     ybid = quote_cents(market, "yes", "bid")
