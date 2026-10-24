@@ -10,8 +10,9 @@ from collections.abc import Mapping
 
 SERIES = "KXBTC15M"
 HOSTS = (
-    "https://api.elections.kalshi.com/trade-api/v2",
+    # Preferred documented public endpoint; older elections host is fallback.
     "https://external-api.kalshi.com/trade-api/v2",
+    "https://api.elections.kalshi.com/trade-api/v2",
 )
 
 
