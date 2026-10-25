@@ -13,6 +13,7 @@ from arena_core import analyze_arena
 from candle_possible import candle_possible_signal
 from buyer_seller_levels import analyze_buyer_seller_pressure
 from kalshi_btc_discovery import discover_btc_markets, live_btc_market, HOSTS
+from kalshi_btc_strike import kalshi_btc_target, same_contract_target
 from candle_calibration import train_candle_calibrator, apply_candle_calibration
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
@@ -1462,6 +1463,18 @@ def levels(book, side):
 
 def kalshi_snapshot(ticker):
     market = get_market(ticker)
+    if not isinstance(market, dict):
+        raise ValueError("Kalshi returned invalid market metadata")
+    # Some market-detail responses initially omit their opening target while
+    # the already-returned public listing has it. Reuse ONLY the exact same
+    # API-provided ticker's official value, never spot or prior-window values.
+    target, target_source = same_contract_target(
+        ticker, market, st.session_state.get("last_confirmed_btc_15m") or []
+    )
+    market = dict(market)
+    market["_target_source"] = target_source
+    if target is not None and kalshi_btc_target(market)[0] is None:
+        market["floor_strike"] = target
     # A quote is useful even if the order-book endpoint is temporarily unavailable.
     book_error = None
     try:
@@ -1492,18 +1505,10 @@ def safe_float(x):
 
 
 def extract_strike(snapshot):
-    """Return a plausible BTC strike/threshold from a Kalshi market snapshot."""
-    if not snapshot or not isinstance(snapshot, dict):
+    """Official Kalshi BTC15M target, never a spot-price approximation."""
+    if not isinstance(snapshot, dict):
         return None
-    market = snapshot.get("market") or {}
-    for key in ("floor_strike", "cap_strike", "strike_price"):
-        try:
-            value = float(market.get(key))
-            if np.isfinite(value) and 1000 < value < 1000000:
-                return value
-        except (TypeError, ValueError):
-            pass
-    return None
+    return kalshi_btc_target(snapshot.get("market") or {})[0]
 
 
 def resample_ohlcv(frame, minutes):
@@ -2205,7 +2210,7 @@ def hourly_price_forecast(frame, history=None, hours=6):
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("BTC ticker repair v4 · Oct 24 · accepts active Kalshi markets and Eastern-time event windows.")
+    st.caption("BTC ticker + strike repair v5 · Oct 25 · corrected Kalshi market query and verified target-price line.")
     try:
         discovery_details = discover_btc_15m_markets()
         discovered_markets = discovery_details.get("markets", [])
@@ -2994,13 +2999,9 @@ def _render_live_dashboard_inner():
             overlays.append({"color": color, "points": [
                 {"time": b["time"], "value": float(v)} for b, v in zip(clean_bars, avg)
             ]})
-        strike_value = engine.get("target")
-        try:
-            strike_value = float(strike_value) if strike_value is not None else None
-            if strike_value is not None and not np.isfinite(strike_value):
-                strike_value = None
-        except (TypeError, ValueError):
-            strike_value = None
+        # Chart the verified target directly from the selected Kalshi market.
+        # Do not depend on a model prediction existing before showing the line.
+        strike_value = extract_strike(kalshi_data)
 
         chart_data = json.dumps({
             "bars": clean_bars,
@@ -3197,19 +3198,31 @@ def _render_live_dashboard_inner():
             ref_side = "ABOVE" if ref_now >= strike_value else "BELOW"
             st.caption(f"🔴 Strike ${strike_value:,.2f} · Coinbase {side_text} ${abs(price-strike_value):,.2f} · BRTI proxy {ref_side} ${abs(ref_now-strike_value):,.2f} · ⚡ {refresh_label} · 👆 Drag · 🤏 Pinch")
         else:
-            st.caption(f"⚡ {refresh_label} · 👆 Drag · 🤏 Pinch zoom · Tap candle · Strike unavailable for this contract")
+            if kalshi_data:
+                _market_meta = kalshi_data.get("market") or {}
+                _target_reason = _market_meta.get("_target_source", "target field missing")
+                st.warning(
+                    f"⚠️ Kalshi BTC market {_market_meta.get('ticker',active_ticker)} loaded, "
+                    f"but the official strike is unavailable ({_target_reason}). "
+                    "The strike line and settlement probability remain disabled until Kalshi publishes it."
+                )
+            else:
+                st.warning(
+                    "⚠️ No verified BTC contract data; a strike line cannot be shown. "
+                    "Open Settings and check Kalshi request errors."
+                )
+            st.caption(f"⚡ {refresh_label} · 👆 Drag · 🤏 Pinch zoom")
         # Compact all essential live information into one terminal-style panel.
         expiry_raw = None
         if kalshi_data:
             market_info = kalshi_data["market"]
             expiry_raw = market_info.get("close_time") or market_info.get("expiration_time")
-            target_raw = market_info.get("floor_strike") or market_info.get("cap_strike") or market_info.get("strike_price")
-            try:
-                target_value = float(target_raw)
+            target_value = extract_strike(kalshi_data)
+            if target_value is not None:
                 distance = price - target_value
                 target_text = f"${target_value:,.0f}"
                 distance_text = f"${distance:+,.0f}"
-            except (ValueError, TypeError):
+            else:
                 target_text, distance_text = "—", "—"
         else:
             target_text, distance_text = "—", "—"
