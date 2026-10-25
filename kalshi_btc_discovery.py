@@ -182,7 +182,7 @@ def discover_btc_markets(get, now=None, hosts=HOSTS):
     for host in hosts:
         rows = _load_pages(
             get, host, "markets",
-            {"series_ticker": SERIES, "status": "open", "limit": 200},
+            {"series_ticker": SERIES, "status": "open", "mve_filter": "exclude", "limit": 200},
             errors,
         )
         valid = {}
