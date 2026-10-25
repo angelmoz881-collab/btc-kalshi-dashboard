@@ -1384,7 +1384,7 @@ def get_orderbook(ticker):
     return j.get("orderbook_fp") or j.get("orderbook") or j
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def _fetch_btc_15m_discovery():
     """Query documented Kalshi public market and event endpoints, with host failover."""
     return discover_btc_markets(HTTP.get)
@@ -2210,7 +2210,7 @@ def hourly_price_forecast(frame, history=None, hours=6):
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("BTC ticker + strike repair v5 · Oct 25 · corrected Kalshi market query and verified target-price line.")
+    st.caption("BTC ticker + strike repair v6 · Oct 25 · alternate live listings, expiry verification and API diagnostics.")
     try:
         discovery_details = discover_btc_15m_markets()
         discovered_markets = discovery_details.get("markets", [])
@@ -2236,15 +2236,22 @@ with st.sidebar:
             st.warning("Kalshi lookup is temporarily unavailable; showing only a previously confirmed, unexpired ticker.")
     else:
         st.warning(
-            "No currently trading KXBTC15M contract confirmed. "
-            "Checked Kalshi market listings and nested BTC events; a new window "
-            "may not be open yet, or Kalshi's API may be unavailable."
+            "BTC market lookup has not confirmed a live contract ticker. "
+            "This does NOT mean Kalshi has no BTC market: the API may have "
+            "returned no matching records or rejected the queries. "
+            "The strike line stays disabled rather than guessing a target."
         )
-        if discovery_details.get("errors"):
-            st.caption("Kalshi request errors: " + " · ".join(discovery_details["errors"][:4]))
-        if discovery_details.get("diagnostics"):
-            st.caption("Search results: " + " · ".join(discovery_details["diagnostics"][:6]))
-        st.caption("Next live refresh retries automatically. You can enter a verified market ticker below.")
+        with st.expander("Why couldn't Kalshi find the BTC ticker?", expanded=True):
+            st.caption("API status: " + str(discovery_details.get("status") or "unknown"))
+            for line in (discovery_details.get("diagnostics") or []):
+                st.caption("• " + str(line))
+            for line in (discovery_details.get("errors") or [])[:6]:
+                st.caption("⚠️ " + str(line))
+            st.caption(
+                "Returned/usable counts show whether the Kalshi API is empty, "
+                "markets are being filtered out, or a network request failed."
+            )
+        st.caption("Automatic lookup refreshes about every 20 seconds to avoid API rate limits; use Retry to force a new search.")
         market_ticker = ""
     if st.button("Retry BTC ticker search now", key="retry_btc_lookup"):
         _fetch_btc_15m_discovery.clear()
