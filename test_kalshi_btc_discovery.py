@@ -58,6 +58,7 @@ class BTCDiscoveryTest(unittest.TestCase):
         self.assertEqual(answer["status"], "LIVE")
         self.assertEqual(api.calls[0][1]["series_ticker"], "KXBTC15M")
         self.assertEqual(api.calls[0][1]["status"], "open")
+        self.assertEqual(api.calls[0][1]["mve_filter"], "exclude")
         self.assertEqual(nearer["status"], "active")
 
     def test_real_kalshi_active_market_response_no_longer_discarded(self):
