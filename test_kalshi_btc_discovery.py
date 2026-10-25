@@ -11,7 +11,7 @@ def iso(dt):
     return dt.isoformat().replace("+00:00", "Z")
 
 
-def market(ticker=TICKER, status="open", close_in=600, **changes):
+def market(ticker=TICKER, status="active", close_in=600, **changes):
     obj = {
         "ticker": ticker, "status": status,
         "open_time": iso(NOW - timedelta(minutes=5)),
@@ -57,7 +57,39 @@ class BTCDiscoveryTest(unittest.TestCase):
         self.assertEqual(answer["markets"][0]["ticker"], TICKER)
         self.assertEqual(answer["status"], "LIVE")
         self.assertEqual(api.calls[0][1]["series_ticker"], "KXBTC15M")
-        self.assertEqual(api.calls[0][1]["mve_filter"], "exclude")
+        self.assertEqual(api.calls[0][1]["status"], "open")
+        self.assertEqual(nearer["status"], "active")
+
+    def test_real_kalshi_active_market_response_no_longer_discarded(self):
+        # Matches the live KXBTC15M /markets payload verified Oct 24, 2026.
+        ref_now = datetime(2026, 10, 25, 4, 20, tzinfo=timezone.utc)
+        confirmed = {
+            "ticker": "KXBTC15M-26OCT250030-30",
+            "event_ticker": "KXBTC15M-26OCT250030",
+            "status": "active",
+            "open_time": "2026-10-25T04:15:00Z",
+            "close_time": "2026-10-25T04:30:00Z",
+            "expiration_time": "2026-11-01T04:30:00Z",
+            "floor_strike": 80744.94,
+            "title": "BTC price up in next 15 mins?",
+        }
+        api = FakeAPI(lambda url, p: {"markets": [confirmed], "cursor": ""})
+        result = discover_btc_markets(api, now=ref_now, hosts=["https://api.test"])
+        self.assertEqual(result["status"], "LIVE")
+        self.assertEqual(result["markets"][0]["ticker"], confirmed["ticker"])
+        self.assertEqual(result["source"], "Kalshi markets")
+        self.assertEqual(api.calls[0][1]["status"], "open")
+
+    def test_active_nested_event_market_is_accepted(self):
+        def handler(url, p):
+            if url.endswith("/markets"):
+                return {"markets": [], "cursor": ""}
+            return {"events": [{
+                "series_ticker": "KXBTC15M", "status": "active",
+                "markets": [market(status="active")],
+            }], "cursor": ""}
+        result = discover_btc_markets(FakeAPI(handler), now=NOW, hosts=["https://api.test"])
+        self.assertEqual(result["markets"][0]["ticker"], TICKER)
 
     def test_uses_nested_events_when_market_list_empty(self):
         def handler(url, p):
