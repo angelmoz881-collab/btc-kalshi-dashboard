@@ -170,55 +170,112 @@ def _direct_event_lookup(get, host, now, errors):
     return results
 
 
-def discover_btc_markets(get, now=None, hosts=HOSTS):
-    """Find Kalshi-confirmed currently-open BTC 15-minute market tickers.
+def _rejection_reason(market, now):
+    """Explain why an API-returned record cannot be treated as tradable."""
+    if not isinstance(market, Mapping):
+        return "invalid metadata"
+    ticker = str(market.get("ticker") or "").upper()
+    if not ticker.startswith(SERIES + "-"):
+        return "wrong series/ticker"
+    status = str(market.get("status") or "").lower()
+    if status not in ("active", "open"):
+        return "status " + (status or "missing")
+    closing = close_time(market)
+    if closing is None:
+        return "no expiry"
+    if (closing - now).total_seconds() <= 2:
+        return "expired"
+    opening = _utc(market.get("open_time") or market.get("open_ts"))
+    if opening is not None and opening > now:
+        return "not yet open"
+    return None
 
-    Three Kalshi routes are attempted: filtered /markets, nested /events,
-    then direct /events/{event_ticker} around the current UTC window.
+
+def _collect(rows, now, valid):
+    counts = {}
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        market = dict(item)
+        reason = _rejection_reason(market, now)
+        if reason is None:
+            valid[market["ticker"]] = market
+        else:
+            counts[reason] = counts.get(reason, 0) + 1
+    summary = ", ".join(f"{reason}={count}" for reason, count in sorted(counts.items())[:5])
+    return f"{len(rows)} returned / {len(valid)} usable" + (f" / excluded {summary}" if summary else "")
+
+
+def discover_btc_markets(get, now=None, hosts=HOSTS):
+    """Look up the actual KXBTC15M market across multiple official public routes.
+
+    Listing fallbacks handle cases where /markets?status=open unexpectedly
+    yields no entries. A market must be from Kalshi, explicitly active/open,
+    trading already, and not expired. No market ticker or strike is generated.
     """
     now = _utc(now) if now is not None else datetime.now(timezone.utc)
     errors = []
     diagnostics = []
+    market_queries = [
+        ("open+mve", {"series_ticker": SERIES, "status": "open",
+                       "mve_filter": "exclude", "limit": 200}),
+        # If the status-filtered endpoint is empty, query near-close markets
+        # without status. Only ACTIVE items may survive local validation.
+        ("recent closes", {"series_ticker": SERIES, "mve_filter": "exclude",
+                            "min_close_ts": int(now.timestamp()) - 60, "limit": 200}),
+        # Secondary API behavior compatibility; still validate every result.
+        ("open", {"series_ticker": SERIES, "status": "open", "limit": 200}),
+    ]
     for host in hosts:
-        rows = _load_pages(
-            get, host, "markets",
-            {"series_ticker": SERIES, "status": "open", "mve_filter": "exclude", "limit": 200},
-            errors,
-        )
+        hostname = host.split("/")[2]
         valid = {}
-        for m in rows:
-            if isinstance(m, Mapping):
-                item = dict(m)
-                item.setdefault("status", "active")
-                if live_btc_market(item, now):
-                    valid[item["ticker"]] = item
-        diagnostics.append(f"{host.split('/')[2]} markets: {len(rows)} returned / {len(valid)} usable")
-        if valid:
-            return _result(valid, "Kalshi markets", errors, diagnostics)
+        for label, params in market_queries:
+            rows = _load_pages(get, host, "markets", params, errors)
+            # The status-filtered query's contract explicitly asks for open
+            # markets; missing status in abridged rows can be inferred there.
+            # Unfiltered results are never promoted to active by inference.
+            if "status" in params:
+                rows = [
+                    dict(m, status="active") if isinstance(m, Mapping)
+                    and not m.get("status") else m
+                    for m in rows
+                ]
+            summary = _collect(rows, now, valid)
+            diagnostics.append(f"{hostname} {label}: {summary}")
+            if valid:
+                return _result(valid, f"Kalshi markets ({label})", errors, diagnostics)
 
-        events = _load_pages(
-            get, host, "events",
-            {"series_ticker": SERIES, "status": "open",
-             "with_nested_markets": "true", "limit": 200},
-            errors,
-        )
-        for event in events:
-            if not isinstance(event, Mapping) or str(event.get("series_ticker") or SERIES).upper() != SERIES:
-                continue
-            nested = event.get("markets") or []
-            for m in nested:
-                if not isinstance(m, Mapping):
+        event_queries = [
+            ("open", {"series_ticker": SERIES, "status": "open",
+                      "with_nested_markets": "true", "limit": 200}),
+            ("all", {"series_ticker": SERIES,
+                     "with_nested_markets": "true", "limit": 200}),
+        ]
+        for label, params in event_queries:
+            events = _load_pages(get, host, "events", params, errors)
+            nested = []
+            for event in events:
+                if not isinstance(event, Mapping):
                     continue
-                item = dict(m)
-                item.setdefault("status", event.get("status") or "open")
-                if live_btc_market(item, now):
-                    valid[item["ticker"]] = item
-        diagnostics.append(f"{host.split('/')[2]} events: {len(events)} returned / {len(valid)} usable")
-        if valid:
-            return _result(valid, "Kalshi nested events", errors, diagnostics)
+                if str(event.get("series_ticker") or SERIES).upper() != SERIES:
+                    continue
+                for m in event.get("markets") or []:
+                    if not isinstance(m, Mapping):
+                        continue
+                    market = dict(m)
+                    # For status-filtered events, the parent may have status
+                    # while the child is abbreviated; do not infer active from
+                    # unfiltered parent events.
+                    if label == "open" and not market.get("status"):
+                        market["status"] = event.get("status") or "open"
+                    nested.append(market)
+            summary = _collect(nested, now, valid)
+            diagnostics.append(f"{hostname} events {label}: {len(events)} events; {summary}")
+            if valid:
+                return _result(valid, f"Kalshi nested events ({label})", errors, diagnostics)
 
         direct = _direct_event_lookup(get, host, now, errors)
-        diagnostics.append(f"{host.split('/')[2]} direct events: {len(direct)} usable")
+        diagnostics.append(f"{hostname} direct events: {len(direct)} usable")
         if direct:
             return _result(direct, "Kalshi direct event", errors, diagnostics)
 
@@ -226,7 +283,7 @@ def discover_btc_markets(get, now=None, hosts=HOSTS):
         "markets": [], "source": "none", "errors": errors,
         "diagnostics": diagnostics,
         "status": ("Kalshi API request errors" if errors
-                   else "Kalshi returned no currently open KXBTC15M contracts"),
+                   else "No eligible KXBTC15M market in queried public responses"),
     }
 
 
