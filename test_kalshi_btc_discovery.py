@@ -1,7 +1,7 @@
 """Deterministic regression checks for resilient Kalshi KXBTC15M discovery."""
 import unittest
 from datetime import datetime, timedelta, timezone
-from kalshi_btc_discovery import close_time, discover_btc_markets, live_btc_market
+from kalshi_btc_discovery import _event_candidates, close_time, discover_btc_markets, live_btc_market
 
 NOW = datetime(2026, 10, 24, 17, 0, tzinfo=timezone.utc)
 TICKER = "KXBTC15M-26OCT241715-15"
@@ -90,6 +90,13 @@ class BTCDiscoveryTest(unittest.TestCase):
             }], "cursor": ""}
         result = discover_btc_markets(FakeAPI(handler), now=NOW, hosts=["https://api.test"])
         self.assertEqual(result["markets"][0]["ticker"], TICKER)
+
+    def test_direct_event_uses_kalshi_eastern_clock_not_utc(self):
+        # Verified API event: 2026-10-25T04:30:00Z maps to 00:30 EDT.
+        now = datetime(2026, 10, 25, 4, 20, tzinfo=timezone.utc)
+        candidates = _event_candidates(now)
+        self.assertIn("KXBTC15M-26OCT250030", candidates)
+        self.assertNotIn("KXBTC15M-26OCT250430", candidates)
 
     def test_uses_nested_events_when_market_list_empty(self):
         def handler(url, p):
