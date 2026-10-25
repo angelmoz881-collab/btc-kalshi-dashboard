@@ -78,7 +78,7 @@ class BTCDiscoveryTest(unittest.TestCase):
         result = discover_btc_markets(api, now=ref_now, hosts=["https://api.test"])
         self.assertEqual(result["status"], "LIVE")
         self.assertEqual(result["markets"][0]["ticker"], confirmed["ticker"])
-        self.assertEqual(result["source"], "Kalshi markets")
+        self.assertEqual(result["source"], "Kalshi markets (open+mve)")
         self.assertEqual(api.calls[0][1]["status"], "open")
 
     def test_active_nested_event_market_is_accepted(self):
@@ -99,6 +99,38 @@ class BTCDiscoveryTest(unittest.TestCase):
         self.assertIn("KXBTC15M-26OCT250030", candidates)
         self.assertNotIn("KXBTC15M-26OCT250430", candidates)
 
+    def test_unfiltered_recent_close_fallback_recovers_active_btc_contract(self):
+        """Status-filtered list is empty; real active listing is not."""
+        def handler(url, params):
+            if url.endswith("/markets"):
+                if params.get("status") == "open":
+                    return {"markets": [], "cursor": ""}
+                return {"markets": [market(status="active")], "cursor": ""}
+            return {"events": [], "cursor": ""}
+        api = FakeAPI(handler)
+        outcome = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
+        self.assertEqual(outcome["markets"][0]["ticker"], TICKER)
+        self.assertEqual(outcome["source"], "Kalshi markets (recent closes)")
+        self.assertEqual(api.calls[1][1]["min_close_ts"], int(NOW.timestamp())-60)
+
+    def test_unfiltered_list_does_not_infer_open_status(self):
+        """Unfiltered listing can contain unopened, closed, or missing-status records."""
+        def handler(url, params):
+            if url.endswith("/markets") and "status" not in params:
+                return {"markets": [
+                    market(status="unopened"),
+                    market(status="closed"),
+                    market(status=""),
+                ], "cursor": ""}
+            if url.endswith("/markets"):
+                return {"markets": [], "cursor": ""}
+            if url.endswith("/events"):
+                return {"events": [], "cursor": ""}
+            return {"event": {"series_ticker": "KXBTC15M", "markets": []}}
+        outcome = discover_btc_markets(FakeAPI(handler), now=NOW, hosts=["https://api.test"])
+        self.assertEqual(outcome["markets"], [])
+        self.assertTrue(any("status missing" in s for s in outcome["diagnostics"]))
+
     def test_uses_nested_events_when_market_list_empty(self):
         def handler(url, p):
             if url.endswith("/markets"):
@@ -108,7 +140,7 @@ class BTCDiscoveryTest(unittest.TestCase):
         api = FakeAPI(handler)
         answer = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
         self.assertEqual(answer["markets"][0]["ticker"], TICKER)
-        self.assertEqual(answer["source"], "Kalshi nested events")
+        self.assertEqual(answer["source"], "Kalshi nested events (open)")
         self.assertEqual(api.calls[1][1]["with_nested_markets"], "true")
 
     def test_fails_over_to_second_host(self):
@@ -122,7 +154,7 @@ class BTCDiscoveryTest(unittest.TestCase):
         answer = discover_btc_markets(api, now=NOW, hosts=["https://broken.test", "https://good.test"])
         self.assertEqual(answer["markets"][0]["ticker"], TICKER)
         self.assertTrue(answer["errors"])
-        self.assertEqual(answer["source"], "Kalshi markets")
+        self.assertEqual(answer["source"], "Kalshi markets (open+mve)")
 
     def test_does_not_select_closed_expired_unopened_or_wrong_series(self):
         candidates = [
