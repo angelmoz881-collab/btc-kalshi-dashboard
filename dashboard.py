@@ -2205,7 +2205,7 @@ def hourly_price_forecast(frame, history=None, hours=6):
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("BTC ticker repair v3 · Oct 24 · Kalshi markets → events → verified direct event lookup. Updates on live refresh.")
+    st.caption("BTC ticker repair v4 · Oct 24 · accepts active Kalshi markets and Eastern-time event windows.")
     try:
         discovery_details = discover_btc_15m_markets()
         discovered_markets = discovery_details.get("markets", [])
