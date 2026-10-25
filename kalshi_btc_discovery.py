@@ -49,7 +49,7 @@ def live_btc_market(market, now=None):
     if not ticker.startswith(SERIES + "-"):
         return False
     status = str(market.get("status") or "").lower()
-    if status != "open":
+    if status not in ("active", "open"):
         return False
     now = _utc(now) if now is not None else datetime.now(timezone.utc)
     closing = close_time(market)
@@ -184,7 +184,7 @@ def discover_btc_markets(get, now=None, hosts=HOSTS):
         for m in rows:
             if isinstance(m, Mapping):
                 item = dict(m)
-                item.setdefault("status", "open")
+                item.setdefault("status", "active")
                 if live_btc_market(item, now):
                     valid[item["ticker"]] = item
         diagnostics.append(f"{host.split('/')[2]} markets: {len(rows)} returned / {len(valid)} usable")
