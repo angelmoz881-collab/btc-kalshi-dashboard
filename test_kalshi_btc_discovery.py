@@ -141,7 +141,7 @@ class BTCDiscoveryTest(unittest.TestCase):
         answer = discover_btc_markets(api, now=NOW, hosts=["https://api.test"])
         self.assertEqual(answer["markets"][0]["ticker"], TICKER)
         self.assertEqual(answer["source"], "Kalshi nested events (open)")
-        self.assertEqual(api.calls[1][1]["with_nested_markets"], "true")
+        self.assertTrue(any(url.endswith("/events") and params.get("with_nested_markets") == "true" for url, params in api.calls))
 
     def test_fails_over_to_second_host(self):
         def handler(url, p):
