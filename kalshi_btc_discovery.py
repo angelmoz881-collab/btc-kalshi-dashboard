@@ -6,6 +6,7 @@ trading KXBTC15M contracts may be selected. Unopened and expired contracts
 are never silently substituted for live tickers.
 """
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from collections.abc import Mapping
 
 SERIES = "KXBTC15M"
@@ -96,9 +97,14 @@ def _load_pages(get, host, endpoint, params, errors, max_pages=2):
 
 def _event_candidates(now):
     """Candidate EVENT tickers only; never invent or select a market ticker."""
-    quarter = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
-    # Kalshi's 15m event tickers encode their window time. Try nearby
-    # boundaries, then rely entirely on Kalshi's actual returned child market.
+    # Kalshi BTC15M event ticker clock uses New York local time, not UTC.
+    # Example verified in Kalshi's API: 04:30Z on Oct 25 -> 00:30 EDT,
+    # event ticker KXBTC15M-26OCT250030.
+    market_now = now.astimezone(ZoneInfo("America/New_York"))
+    quarter = market_now.replace(minute=(market_now.minute // 15) * 15,
+                                 second=0, microsecond=0)
+    # Only use these guesses to discover an event; require an actual
+    # API-provided ACTIVE child market ticker before selecting anything.
     return [
         (quarter + timedelta(minutes=15 * step)).strftime(
             "KXBTC15M-%y%b%d%H%M"
