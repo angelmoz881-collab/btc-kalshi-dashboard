@@ -127,7 +127,7 @@ def _pyth_context(api_key):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _futures_context():
-    r = requests.get(YAHOO_GOLD, params={"interval": "1d", "range": "3y"},
+    r = requests.get(YAHOO_GOLD, params={"interval": "1d", "range": "2y"},
                      headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
     r.raise_for_status()
     result = (r.json().get("chart", {}).get("result") or [None])[0]
