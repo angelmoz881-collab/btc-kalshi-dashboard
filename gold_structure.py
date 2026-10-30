@@ -41,7 +41,7 @@ def completed(frame, resolution="1min", now=None):
     now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
     ts = d["time"]
     if resolution == "W":
-        start = ts.dt.normalize() - pd.to_timedelta(ts.dt.weekday, unit="D")
+        start = ts.dt.normalize() - pd.to_timedelta(ts.dt.day_of_week, unit="D")
         end = start + pd.Timedelta(days=7)
     elif resolution == "D":
         end = ts.dt.normalize() + pd.Timedelta(days=1)
@@ -225,7 +225,7 @@ def turning_zones(intraday, daily=None, weekly=None, *, source_matched=False, pr
                                  .4 * ("Daily" in z["tf"] or "Weekly" in z["tf"])))
     output = []
     for z in clusters:
-        if any(abs(z["center"] - kept["center"]) < max(z["half"], (kept["high"] - kept["low"]) / 2) * 1.4
+        if any(abs(z["center"] - (kept["low"] + kept["high"]) / 2) < max(z["half"], (kept["high"] - kept["low"]) / 2) * 1.4
                and z["kind"] == kept["kind"] for kept in output):
             continue
         output.append({"kind": z["kind"], "low": round(z["center"] - z["half"], 2),
