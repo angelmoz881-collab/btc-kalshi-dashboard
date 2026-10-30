@@ -148,4 +148,91 @@ _replace_once(
     '            "pyth_pro_error": candle_quality.get("pyth_pro_error"),',
 )
 
+
+# Price-action analysis is deliberately separate from Kalshi's market-implied odds.
+# The research call needs agreeing daily/weekly swings AND a completed candle
+# confirmation at a same-source support/resistance zone.
+_replace_once(
+    '    market = snapshot["market"]\n    strike = model.get("strike")',
+    '''    from gold_structure import load_context, analyze_gold_structure
+    try:
+        htf_day, htf_week, htf_source, htf_error = load_context(_secret("PYTH_PRO_API_KEY", ""))
+        structure_report = analyze_gold_structure(
+            candles, htf_day, htf_week,
+            intraday_source=candle_quality["source"], context_source=htf_source,
+        )
+        structure_report["htf_error"] = htf_error
+    except Exception as exc:
+        structure_report = {
+            "daily": {"trend": "INSUFFICIENT"}, "weekly": {"trend": "INSUFFICIENT"},
+            "bias": "UNAVAILABLE", "zones": [], "patterns": [],
+            "source_matched": False, "context_source": "Unavailable",
+            "htf_error": str(exc),
+        }
+    recent_price_time = int(pd.Timestamp(candles["time"].iloc[-1]).timestamp()) if len(candles) else 0
+    recent_patterns = [
+        p for p in structure_report.get("patterns", [])
+        if 0 <= recent_price_time - p["confirmed_at"] <= 900
+    ]
+    recent_pattern = recent_patterns[0] if recent_patterns else None
+    bias = structure_report.get("bias", "UNAVAILABLE")
+    pattern_direction = recent_pattern["direction"] if recent_pattern else None
+    structure_call = ("YES" if bias == "UPTREND" and pattern_direction == "BULLISH"
+                      else "NO" if bias == "DOWNTREND" and pattern_direction == "BEARISH"
+                      else "WAIT")
+    if not (model_inputs_ready and structure_report.get("source_matched")):
+        structure_call = "WAIT"
+    st.markdown("### Gold structure · Daily / Weekly / Confirmation")
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Daily swings", structure_report.get("daily", {}).get("trend", "—"),
+              structure_report.get("daily", {}).get("swing_labels"))
+    t2.metric("Weekly swings", structure_report.get("weekly", {}).get("trend", "—"),
+              structure_report.get("weekly", {}).get("swing_labels"))
+    t3.metric("Candle-only setup", structure_call,
+              recent_pattern["pattern"] if recent_pattern else "Awaiting confirmed reaction")
+    st.caption("Context: {} · Chart candles: {} · Zones are ranges from historical turning points. "
+               "Doji is indecision until a later closed candle confirms direction. "
+               "Candle setup is a research signal, NOT a calibrated probability."
+               .format(structure_report.get("context_source"), candle_quality["source"]))
+    if structure_report.get("htf_error"):
+        st.caption("Historical-feed diagnostic: " + str(structure_report["htf_error"]))
+    if not structure_report.get("source_matched"):
+        st.warning("Higher-timeframe feed and live chart use different price series, or history is unavailable. "
+                   "No cross-source zones or confirmed trade setup will be asserted.")
+    with st.expander("Support / resistance zones and candle confirmations", expanded=True):
+        if structure_report.get("zones"):
+            st.dataframe(pd.DataFrame([
+                {"Type": z["kind"], "From": z["low"], "To": z["high"],
+                 "Turning points": z["touches"], "Timeframes": z["tf"]}
+                for z in structure_report["zones"]
+            ]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Not enough confirmed price turns to establish zones.")
+        if recent_pattern:
+            st.write("{} · {} · {} at {} zone · closed candle confirmed".format(
+                recent_pattern["tf"], recent_pattern["direction"],
+                recent_pattern["pattern"], recent_pattern["zone"]))
+        else:
+            st.caption("No confirmed doji/hammer/shooting-star/engulfing reaction at a zone in the past 15 minutes.")
+    market = snapshot["market"]
+    strike = model.get("strike")''',
+)
+
+_replace_once(
+    '    side, edge, blockers = _execution_candidate(model, snapshot, settings, pyth)',
+    '''    side, edge, blockers = _execution_candidate(model, snapshot, settings, pyth)
+    # This change can only VETO automatic orders; it never grants an entry,
+    # increases confidence, or replaces any existing execution safety gate.
+    if side and model_inputs_ready and structure_call != side:
+        blockers = list(blockers) + [
+            "Gold HTF/candle setup not confirmed in the proposed " + side + " direction"
+        ]''',
+)
+
+_replace_once(
+    '        candle_age_sec=candle_quality.get("candle_age_sec"),\n',
+    '        candle_age_sec=candle_quality.get("candle_age_sec"),\n'
+    '        structure=structure_report,\n',
+)
+
 exec(compile(_source, "2_Gold.py", "exec"), globals(), globals())
