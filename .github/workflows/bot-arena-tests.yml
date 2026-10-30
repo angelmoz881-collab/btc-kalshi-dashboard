@@ -16,6 +16,6 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install pandas numpy pytest requests
       - name: Compile all Python sources
-        run: python -m compileall -q dashboard.py arena_core.py gold_trader_chart.py gold_data_quality.py gold_structure.py pages
+        run: python -m compileall -q dashboard.py arena_core.py gold_trader_chart.py gold_data_quality.py gold_structure.py gold_tradingview.py pages
       - name: Run Arena regression tests
         run: python -m pytest -q tests/test_arena_core.py tests/test_gold_data_quality.py tests/test_gold_structure.py

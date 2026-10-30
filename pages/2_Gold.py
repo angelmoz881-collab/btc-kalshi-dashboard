@@ -26,7 +26,7 @@ _replace_once(
 )
 _replace_once(
     '@st.cache_data(ttl=15, show_spinner=False)\ndef fetch_gold_proxy_history',
-    '@st.cache_data(ttl=2, show_spinner=False)\ndef fetch_gold_proxy_history',
+    '@st.cache_data(ttl=30, show_spinner=False)\ndef fetch_gold_proxy_history',
 )
 _replace_once(
     '@st.cache_data(ttl=2, show_spinner=False)\ndef fetch_market',
@@ -75,14 +75,15 @@ _replace_once(
     }), height=280, use_container_width=True)
     st.caption("Pyth XAU/USD is used for current strike distance when authenticated. If unavailable, GC=F is shown only as a temporary research proxy; DEMO/LIVE auto-orders remain blocked.")
 ''',
-'''    from gold_trader_chart import render_gold_trader_chart
-    render_gold_trader_chart(
-        candles,
-        strike=strike,
-        current_ref=model.get("current"),
-        ticker=ticker,
-        refresh_label=refresh_mode,
-    )
+'''    with st.expander("Pyth/Kalshi analysis chart · strike and support/resistance zones", expanded=False):
+        from gold_trader_chart import render_gold_trader_chart
+        render_gold_trader_chart(
+            candles,
+            strike=strike,
+            current_ref=model.get("current"),
+            ticker=ticker,
+            refresh_label=refresh_mode,
+        )
 ''',
 )
 
@@ -233,6 +234,13 @@ _replace_once(
     '        candle_age_sec=candle_quality.get("candle_age_sec"),\n',
     '        candle_age_sec=candle_quality.get("candle_age_sec"),\n'
     '        structure=structure_report,\n',
+)
+
+# Keep TradingView's independent market feed mounted OUTSIDE the fast fragment.
+# The native Pyth chart stays below as a disclosure-rich strike / signals view.
+_replace_once(
+    '\n_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)',
+    '\nfrom gold_tradingview import render_tradingview_gold\nrender_tradingview_gold()\n\n_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)',
 )
 
 exec(compile(_source, "2_Gold.py", "exec"), globals(), globals())
