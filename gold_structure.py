@@ -295,8 +295,13 @@ def analyze_gold_structure(intraday, daily, weekly, *, intraday_source, context_
     d = completed(intraday, "1min", now=now)
     day = completed(daily, "D", now=now)
     week = completed(weekly, "W", now=now)
-    dtrend = structure(day) if len(day) >= 18 else {"trend": "INSUFFICIENT"}
-    wtrend = structure(week) if len(week) >= 18 else {"trend": "INSUFFICIENT"}
+    clock = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    clock = clock.tz_localize("UTC") if clock.tzinfo is None else clock.tz_convert("UTC")
+    # Sessions close on weekends and holidays; reject truly stale HTF history.
+    day_recent = len(day) > 0 and clock - day["time"].iloc[-1] <= pd.Timedelta(days=7)
+    week_recent = len(week) > 0 and clock - week["time"].iloc[-1] <= pd.Timedelta(days=22)
+    dtrend = structure(day) if len(day) >= 18 and day_recent else {"trend": "INSUFFICIENT"}
+    wtrend = structure(week) if len(week) >= 18 and week_recent else {"trend": "INSUFFICIENT"}
     ready = dtrend["trend"] not in ("INSUFFICIENT",) and wtrend["trend"] not in ("INSUFFICIENT",)
     source_matched = (str(intraday_source) == "Pyth Pro XAU/USD" and
                       str(context_source) == "Pyth Pro XAU/USD") or (
