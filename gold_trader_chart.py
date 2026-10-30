@@ -60,13 +60,24 @@ def render_gold_expiry_timer(expiry, ticker="gold"):
     components.html(html, height=92, scrolling=False)
 
 
-def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None, refresh_label=None, source_label="GC=F", candle_age_sec=None):
+def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None, refresh_label=None, source_label="GC=F", candle_age_sec=None, structure=None):
     """Render Gold with the same HyperTradez-style Lightweight Charts UI as BTC."""
     if candles is None or candles.empty:
         st.info("No Gold candle data available yet.")
         return
 
-    chart = candles.tail(180).copy()
+    timeframe = st.radio(
+        "Gold chart timeframe", ["1m", "5m", "15m"], horizontal=True,
+        key="gold_chart_timeframe", label_visibility="collapsed"
+    )
+    chart = candles.copy()
+    chart["time"] = pd.to_datetime(chart["time"], utc=True, errors="coerce")
+    if timeframe != "1m":
+        freq = {"5m": "5min", "15m": "15min"}[timeframe]
+        chart = chart.dropna(subset=["time"]).set_index("time").resample(
+            freq, label="left", closed="left"
+        ).agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna().reset_index()
+    chart = chart.tail(180).copy()
     chart["time"] = pd.to_datetime(chart["time"], utc=True, errors="coerce")
     for col in ("open", "high", "low", "close"):
         chart[col] = pd.to_numeric(chart[col], errors="coerce")
@@ -106,6 +117,24 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
     current_value = _safe_float(current_ref)
     source_label = str(source_label or "GC=F")
     is_pyth_history = source_label == "Pyth Pro XAU/USD"
+    marker_points = []
+    known_bars = {b["time"] for b in bars}
+    seconds = {"1m": 60, "5m": 300, "15m": 900}[timeframe]
+    for finding in (structure or {}).get("patterns", []):
+        event_time = int(finding.get("time", 0))
+        bucket_time = event_time - (event_time % seconds)
+        if bucket_time not in known_bars:
+            continue
+        bullish = finding.get("direction") == "BULLISH"
+        marker_points.append({
+            "time": bucket_time, "position": "belowBar" if bullish else "aboveBar",
+            "color": "#34d399" if bullish else "#fb7185",
+            "shape": "arrowUp" if bullish else "arrowDown",
+            "text": ("UP" if bullish else "DOWN") + " " + finding.get("tf", ""),
+        })
+    # Lightweight Charts v4 expects chronologically ordered, unique marker times.
+    marker_points = list({m["time"]: m for m in marker_points}.values())
+    marker_points.sort(key=lambda m: m["time"])
     payload = json.dumps({
         "bars": bars,
         "overlays": overlays,
@@ -114,32 +143,42 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
         "reference": current_value if is_pyth_history else None,
         "source": source_label,
         "ticker": str(ticker or "KXGOLD15M"),
+        "timeframe": timeframe,
+        "zones": (structure or {}).get("zones", []),
+        "markers": marker_points,
     }, allow_nan=False)
 
-    st.markdown("### Gold / Kalshi live")
+    st.markdown("### Gold / Kalshi live · price-action zones")
     chart_html = r"""<!doctype html><html><head>
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
     <style>
     html,body{margin:0;background:#0b0b11;color:#d9e3f1;font-family:system-ui;overflow:hidden}
-    #frame{position:relative;width:100%;height:300px;overflow:hidden}
-    #chart{width:100%;height:300px;touch-action:none;overscroll-behavior:contain}
+    #frame{position:relative;width:100%;height:410px;overflow:hidden}
+    #chart{width:100%;height:410px;touch-action:none;overscroll-behavior:contain}
     #status{position:absolute;top:9px;left:12px;pointer-events:none;background:#120e16d9;
       border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
     #reset-view{position:absolute;top:9px;right:70px;z-index:3;background:#211925;color:#d9e3f1;border:1px solid #56303a;border-radius:6px;padding:5px 8px;cursor:pointer}
     #error{color:#ff9eaa;padding:15px;display:none}
+    #zone-bands{position:absolute;inset:0;pointer-events:none;z-index:1;overflow:hidden}
+    .zone-band{position:absolute;left:0;right:52px;border-top:1px dashed;border-bottom:1px dashed;
+      font-size:10px;font-weight:700;line-height:12px;padding-left:4px;opacity:.85;white-space:nowrap}
+    .zone-band.support{border-color:#20a67e;background:rgba(20,150,100,.12);color:#78e8c1}
+    .zone-band.resistance{border-color:#d19a35;background:rgba(211,154,53,.12);color:#f4cd70}
+    @media(max-width:650px){#frame,#chart{height:340px}.zone-band{font-size:9px}}
+
     </style></head><body>
-    <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">GOLD · 1M · __TICKER__</div><div id="chart"></div><div id="error"></div></div>
+    <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">GOLD · 1M · __TICKER__</div><div id="chart"></div><div id="zone-bands"></div><div id="error"></div></div>
     <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
     const data=__PAYLOAD__;
-    document.getElementById("status").textContent=data.source+" · 1M · "+data.ticker;
+    document.getElementById("status").textContent=data.source+" · "+data.timeframe.toUpperCase()+" · "+data.ticker;
     const root=document.getElementById('chart');
     const error=document.getElementById('error');
     try {
       if(!window.LightweightCharts) throw new Error('Chart library unavailable.');
       const LC=window.LightweightCharts;
       const chart=LC.createChart(root,{
-        width:root.clientWidth,height:300,
+        width:root.clientWidth,height:root.clientHeight,
         layout:{background:{type:'solid',color:'#0b0b11'},textColor:'#b9c9df'},
         grid:{vertLines:{color:'#251c27'},horzLines:{color:'#251c27'}},
         rightPriceScale:{borderColor:'#51303b',scaleMargins:{top:.08,bottom:.12}},
@@ -151,6 +190,32 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
       });
       const main=chart.addCandlestickSeries({upColor:'#34d399',downColor:'#fb7185',borderVisible:false,wickUpColor:'#34d399',wickDownColor:'#fb7185'});
       main.setData(data.bars);
+      if(data.markers.length) main.setMarkers(data.markers);
+      const zoneRoot=document.getElementById('zone-bands');
+      let zoneQueued=false;
+      function drawZones(){
+        zoneQueued=false;
+        zoneRoot.replaceChildren();
+        data.zones.forEach((z)=>{
+          const yTop=main.priceToCoordinate(z.high), yBottom=main.priceToCoordinate(z.low);
+          if(!Number.isFinite(yTop)||!Number.isFinite(yBottom)||yBottom<0||yTop>root.clientHeight)return;
+          const node=document.createElement('div');
+          node.className='zone-band '+(z.kind==='SUPPORT'?'support':'resistance');
+          node.style.top=Math.max(0,yTop)+'px';
+          node.style.height=Math.max(2,Math.min(root.clientHeight,yBottom)-Math.max(0,yTop))+'px';
+          node.textContent=(z.kind==='SUPPORT'?'SUPPORT':'RESIST')+
+            ' '+Number(z.low).toFixed(2)+'–'+Number(z.high).toFixed(2);
+          zoneRoot.appendChild(node);
+        });
+      }
+      function scheduleZones(){
+        if(zoneQueued)return;
+        zoneQueued=true;
+        requestAnimationFrame(drawZones);
+      }
+      chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleZones);
+      root.addEventListener('wheel',scheduleZones,{passive:true});
+      root.addEventListener('touchmove',scheduleZones,{passive:true});
 
       if(Number.isFinite(data.strike)){
         main.createPriceLine({price:data.strike,color:'#ff3b5c',lineWidth:2,lineStyle:LC.LineStyle.Dashed,axisLabelVisible:true,title:'STRIKE'});
@@ -163,7 +228,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
         s.setData(o.points);
       });
 
-      const viewKey='gold-kalshi-view-1m';
+      const viewKey='gold-kalshi-view-'+data.timeframe+'-'+data.ticker;
       let savedView=null;
       try{savedView=JSON.parse(localStorage.getItem(viewKey)||'null');}catch(_){}
       let viewReady=false;
@@ -193,7 +258,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
           }
           chart.timeScale().setVisibleLogicalRange({from:to-savedView.span,to});
         }else{defaultView();}
-        requestAnimationFrame(()=>{viewReady=true;chart.timeScale().subscribeVisibleLogicalRangeChange(saveView);});
+        requestAnimationFrame(()=>{viewReady=true;chart.timeScale().subscribeVisibleLogicalRangeChange(saveView);scheduleZones();});
       }
       requestAnimationFrame(()=>requestAnimationFrame(setInitialView));
       document.getElementById('reset-view').addEventListener('click',()=>{
@@ -202,7 +267,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
         saveView(chart.timeScale().getVisibleLogicalRange());
       });
       window.addEventListener('pagehide',()=>saveView(chart.timeScale().getVisibleLogicalRange()));
-      new ResizeObserver(()=>{if(root.clientWidth>0)chart.applyOptions({width:root.clientWidth});}).observe(root);
+      new ResizeObserver(()=>{if(root.clientWidth>0){chart.applyOptions({width:root.clientWidth,height:root.clientHeight});scheduleZones();}}).observe(root);
 
       let panStartX=null;
       let panStartRange=null;
