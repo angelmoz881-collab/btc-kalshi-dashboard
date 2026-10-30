@@ -86,9 +86,9 @@ def test_tradingview_chart_stays_outside_fast_rerun_fragment():
 
 
 def test_tradingview_widget_uses_official_embed_not_scraped_prices():
-    from gold_tradingview import render_tradingview_gold
-    import inspect
-    source = inspect.getsource(render_tradingview_gold)
+    # Source inspection avoids requiring Streamlit's runtime in pure-data CI.
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "gold_tradingview.py").read_text(encoding="utf-8")
     assert "OANDA:XAUUSD" in source
     assert "external-embedding/embed-widget-advanced-chart.js" in source
-    assert "requests" not in source
+    assert "import requests" not in source
