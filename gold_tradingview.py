@@ -4,13 +4,58 @@ TradingView's official widget supplies its own XAU/USD quotes and user controls.
 The bot's Kalshi signals MUST continue to use authenticated Pyth candles/quotes.
 """
 import json
+import math
+import time
+from datetime import datetime, timezone
+
+import requests
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _gold_spot_quote():
+    """Independent spot quote for visual diagnostics ONLY; never for settlement."""
+    response = requests.get("https://api.gold-api.com/price/XAU", timeout=7)
+    response.raise_for_status()
+    item = response.json()
+    price = float(item["price"])
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("Invalid spot gold price")
+    raw_stamp = item.get("updatedAt")
+    if not raw_stamp:
+        raise ValueError("Missing provider update time")
+    updated = datetime.fromisoformat(str(raw_stamp).replace("Z", "+00:00"))
+    if updated.tzinfo is None:
+        raise ValueError("Unzoned provider update time")
+    age = time.time() - updated.timestamp()
+    if age < -60 or age > 120:
+        raise ValueError("Spot quote is stale or has an invalid timestamp")
+    return price, max(0, age), updated.strftime("%H:%M:%S UTC")
+
+
+def render_spot_quote_panel():
+    """Refresh independently of the TradingView embed and the main app's trading loop."""
+    try:
+        price, age, stamp = _gold_spot_quote()
+    except (requests.RequestException, KeyError, ValueError, TypeError, OverflowError) as exc:
+        st.caption("Independent spot quote unavailable: " + str(exc))
+        return
+    st.metric("Independent XAU/USD spot quote · display only", f"${price:,.2f}",
+              help="Gold-API spot reference. Not the Pyth/Kalshi settlement feed and not used by the prediction or automatic-order engine.")
+    st.caption(f"Gold-API updated {stamp} · checked age {age:.0f}s · not a trade signal")
+
+
+_gold_quote_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+if _gold_quote_fragment is not None:
+    render_spot_quote_panel = _gold_quote_fragment(run_every=30)(render_spot_quote_panel)
+
+
 def render_tradingview_gold():
     st.markdown("### Gold live chart · TradingView")
+    render_spot_quote_panel()
     st.caption(
         "OANDA:XAUUSD spot gold · TradingView-hosted visual chart. "
         "Select 1m / 5m / 15m / Daily / Weekly inside the chart. "
