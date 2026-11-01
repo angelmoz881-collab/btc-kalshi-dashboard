@@ -3972,10 +3972,13 @@ def render_independent_btc_chart():
                       });
                       if(next.length<2) throw new Error('Insufficient distinct candles');
               // Recalculate support/resistance using new completed 1-minute bars.
-              if(data.timeframe==='1m'){
-                const levels=calculateLevels(next);
-                if(levels) setLevels(levels.support,levels.resistance);
-              }
+              const minuteBars=raw.map(row=>({
+                time:Number(row[0]),low:Number(row[1]),high:Number(row[2]),
+                open:Number(row[3]),close:Number(row[4])
+              })).filter(b=>[b.time,b.low,b.high,b.open,b.close].every(Number.isFinite))
+                .sort((a,b)=>a.time-b.time);
+              const levels=calculateLevels(minuteBars);
+              if(levels) setLevels(levels.support,levels.resistance);
                       // Preserve the user's current zoom/pan even when the chart data rolls over.
                       const previous=chart.timeScale().getVisibleLogicalRange();
                       const old=data.bars;
