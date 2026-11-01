@@ -3946,32 +3946,106 @@ def render_independent_btc_chart():
           }, {passive:true});
         
           
-                  // Fetch only new public market data; never rerun Streamlit to repaint candles.
-                  const bucketSec=({'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600})[data.timeframe]||60;
-                  const historyMinutes=300;
-                  async function pollCandles(){
-                    if(polling || document.hidden) return;
-                    polling=true;
-                    try{
-                      const response=await fetch('https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60', {cache:'no-store'});
-                      if(!response.ok) throw new Error('Coinbase candles HTTP '+response.status);
-                      const raw=await response.json();
-                      if(!Array.isArray(raw) || raw.length<2) throw new Error('No new candle data');
-                      const buckets=new Map();
-                      for(const row of raw){
-                        const ts=Number(row[0]),low=Number(row[1]),high=Number(row[2]),open=Number(row[3]),close=Number(row[4]);
-                        if(![ts,low,high,open,close].every(Number.isFinite)) continue;
-                        const t=Math.floor(ts/bucketSec)*bucketSec;
-                        if(!buckets.has(t)) buckets.set(t,[]);
-                        buckets.get(t).push({time:ts,open,high,low,close});
-                      }
-                      const next=[...buckets.entries()].sort((a,b)=>a[0]-b[0]).map(([t,items])=>{
-                        items.sort((a,b)=>a.time-b.time);
-                        return {time:t,open:items[0].open,high:Math.max(...items.map(x=>x.high)),
-                          low:Math.min(...items.map(x=>x.low)),close:items[items.length-1].close};
-                      });
-                      if(next.length<2) throw new Error('Insufficient distinct candles');
-              // Recalculate support/resistance using new completed 1-minute bars.
+                  // Browser-owned market updates: ticks redraw the forming candle without
+          // a Streamlit rerun. REST candles reconcile history less frequently.
+          const bucketSec=({'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600})[data.timeframe]||60;
+          const statusNode=document.getElementById('status');
+          let liveSocket=null, reconnectTimer=null, closedByPage=false;
+          let lastTickSeconds=0, lastTickPrice=null;
+          function status(message){statusNode.textContent='COINBASE BTC/USD · '+data.timeframe+' · '+message;}
+          function redrawOverlays(){
+            emaSeries.forEach((series,i)=>{
+              const period=i===0?5:15, alpha=2/(period+1);
+              let average=null;
+              const points=data.bars.map(b=>{
+                average=average===null?b.close:alpha*b.close+(1-alpha)*average;
+                return {time:b.time,value:average};
+              });
+              series.setData(points);
+            });
+          }
+          function updateFromTrade(price,timestamp){
+            if(!Number.isFinite(price)||price<=0||!Number.isFinite(timestamp)) return;
+            const t=Math.floor(timestamp/bucketSec)*bucketSec;
+            const bars=data.bars;
+            const last=bars[bars.length-1];
+            if(!last||t<last.time) return;
+            const newBucket=t>last.time;
+            const previous=newBucket?chart.timeScale().getVisibleLogicalRange():null;
+            const oldCount=bars.length;
+            if(newBucket){
+              const next={time:t,open:last.close,high:Math.max(last.close,price),
+                low:Math.min(last.close,price),close:price};
+              bars.push(next);
+              if(bars.length>300) bars.shift();
+              // setData only on a new bucket. update() keeps the chart/zoom intact.
+              main.setData(data.style==='Candles'?bars:bars.map(b=>({time:b.time,value:b.close})));
+              if(previous){
+                const span=previous.to-previous.from;
+                const viewingLatest=previous.to>=oldCount-0.5;
+                const shifted=bars.length===oldCount?1:0;
+                const to=viewingLatest?previous.to+1-shifted:previous.to-shifted;
+                if(span>0) chart.timeScale().setVisibleLogicalRange({from:to-span,to});
+              }
+            }else{
+              last.high=Math.max(last.high,price);
+              last.low=Math.min(last.low,price);
+              last.close=price;
+              main.update(data.style==='Candles'?last:{time:t,value:price});
+            }
+            redrawOverlays();
+            if(newBucket) saveView(chart.timeScale().getVisibleLogicalRange());
+            lastTickPrice=price;
+            lastTickSeconds=timestamp;
+            status('LIVE · $'+price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}));
+          }
+          function connectLive(){
+            if(closedByPage || (liveSocket && (liveSocket.readyState===0||liveSocket.readyState===1))) return;
+            try{
+              const socket=new WebSocket('wss://ws-feed.exchange.coinbase.com');
+              liveSocket=socket;
+              socket.onopen=()=>{
+                socket.send(JSON.stringify({type:'subscribe',product_ids:['BTC-USD'],channels:['ticker']}));
+                status('CONNECTED · awaiting ticks');
+              };
+              socket.onmessage=event=>{
+                try{
+                  const msg=JSON.parse(event.data);
+                  if(msg.type!=='ticker'||msg.product_id!=='BTC-USD') return;
+                  const p=Number(msg.price), t=Date.parse(msg.time)/1000;
+                  updateFromTrade(p,t);
+                }catch(_){}
+              };
+              socket.onerror=()=>{status('RECONNECTING');};
+              socket.onclose=()=>{
+                liveSocket=null;
+                if(!closedByPage){
+                  status('RECONNECTING');
+                  clearTimeout(reconnectTimer);
+                  reconnectTimer=setTimeout(connectLive,3000);
+                }
+              };
+            }catch(_){
+              status('RECONNECTING');
+              reconnectTimer=setTimeout(connectLive,5000);
+            }
+          }
+          async function pollCandles(){
+            if(polling || document.hidden) return;
+            polling=true;
+            try{
+              // Fetch recent closed candles to synchronize the bars after missing ticks.
+              const controller=new AbortController();
+              const timeout=setTimeout(()=>controller.abort(),10000);
+              let raw;
+              try{
+                const response=await fetch(
+                  'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60',
+                  {cache:'no-store',signal:controller.signal});
+                if(!response.ok) throw new Error('Candle HTTP '+response.status);
+                raw=await response.json();
+              }finally{clearTimeout(timeout);}
+              if(!Array.isArray(raw)||raw.length<2) throw new Error('Candle history unavailable');
               const minuteBars=raw.map(row=>({
                 time:Number(row[0]),low:Number(row[1]),high:Number(row[2]),
                 open:Number(row[3]),close:Number(row[4])
@@ -3979,37 +4053,69 @@ def render_independent_btc_chart():
                 .sort((a,b)=>a.time-b.time);
               const levels=calculateLevels(minuteBars);
               if(levels) setLevels(levels.support,levels.resistance);
-                      // Preserve the user's current zoom/pan even when the chart data rolls over.
-                      const previous=chart.timeScale().getVisibleLogicalRange();
-                      const old=data.bars;
-                      const wasAtEnd=previous && previous.to >= old.length-0.5;
-                      const anchor=previous && old[Math.min(old.length-1,Math.max(0,Math.floor(previous.to)))];
-                      const span=previous ? previous.to-previous.from : 0;
-                      const rightGap=previous ? previous.to-(old.length-1) : 0;
-                      data.bars=next;
-                      const display=data.style==='Candles'?next:next.map(b=>({time:b.time,value:b.close}));
-                      main.setData(display);
-                      emaSeries.forEach((series,i)=>{
-                        const span=i===0?5:15, alpha=2/(span+1);let value=null;
-                        const points=next.map(b=>{value=value===null?b.close:alpha*b.close+(1-alpha)*value;return {time:b.time,value};});
-                        series.setData(points);
-                      });
-                      if(previous && span>0){
-                        let to=next.length-1+rightGap;
-                        if(!wasAtEnd && anchor){
-                          const idx=next.findIndex(b=>b.time===anchor.time);
-                          if(idx>=0) to=idx+(previous.to-Math.floor(previous.to));
-                        }
-                        chart.timeScale().setVisibleLogicalRange({from:to-span,to});
-                      }
-                      document.getElementById('status').textContent='COINBASE BTC/USD · '+data.timeframe+' · LIVE';
-                      saveView(chart.timeScale().getVisibleLogicalRange());
-                    }catch(e){
-                      document.getElementById('status').textContent='COINBASE BTC/USD · reconnecting';
-                    }finally{polling=false;}
-                  }
-                  setInterval(pollCandles,2000);
-                  root.addEventListener('contextmenu',e=>e.preventDefault());
+              const grouped=new Map();
+              for(const b of minuteBars){
+                const t=Math.floor(b.time/bucketSec)*bucketSec;
+                if(!grouped.has(t)) grouped.set(t,{time:t,open:b.open,high:b.high,low:b.low,close:b.close});
+                else{
+                  const bar=grouped.get(t);
+                  bar.high=Math.max(bar.high,b.high);
+                  bar.low=Math.min(bar.low,b.low);
+                  bar.close=b.close;
+                }
+              }
+              const snapshot=[...grouped.values()].sort((a,b)=>a.time-b.time);
+              if(snapshot.length<2) return;
+              const live=data.bars[data.bars.length-1];
+              // Do not overwrite a fresher WebSocket tick with delayed REST candles.
+              if(live && lastTickSeconds>0){
+                const liveBucket=Math.floor(lastTickSeconds/bucketSec)*bucketSec;
+                const restLast=snapshot[snapshot.length-1];
+                if(restLast.time===liveBucket){
+                  restLast.high=Math.max(restLast.high,live.high);
+                  restLast.low=Math.min(restLast.low,live.low);
+                  restLast.close=lastTickPrice;
+                }else if(restLast.time<liveBucket){
+                  snapshot.push({...live});
+                }
+              }
+              const visible=chart.timeScale().getVisibleLogicalRange();
+              const old=data.bars;
+              const span=visible?visible.to-visible.from:null;
+              const atEnd=visible&&visible.to>=old.length-0.5;
+              const anchor=visible&&old[Math.max(0,Math.min(old.length-1,Math.floor(visible.to)))];
+              const fraction=visible?visible.to-Math.floor(visible.to):0;
+              data.bars=snapshot.slice(-300);
+              main.setData(data.style==='Candles'?data.bars:
+                data.bars.map(b=>({time:b.time,value:b.close})));
+              redrawOverlays();
+              if(visible && span>0){
+                let to=data.bars.length-1+(visible.to-(old.length-1));
+                if(!atEnd && anchor){
+                  const index=data.bars.findIndex(b=>b.time===anchor.time);
+                  if(index>=0) to=index+fraction;
+                }
+                chart.timeScale().setVisibleLogicalRange({from:to-span,to});
+              }
+              saveView(chart.timeScale().getVisibleLogicalRange());
+            }catch(err){
+              // WebSocket ticks continue even when the browser blocks REST (CORS).
+              if(!lastTickSeconds) status('WAITING FOR FEED');
+            }finally{polling=false;}
+          }
+          connectLive();
+          pollCandles();
+          setInterval(pollCandles,30000);
+          setInterval(()=>{
+            if(!document.hidden && lastTickSeconds && Date.now()/1000-lastTickSeconds>20)
+              status('STALE · reconnecting');
+            if(!document.hidden && (!liveSocket||liveSocket.readyState>1)) connectLive();
+          },5000);
+          window.addEventListener('pagehide',()=>{
+            closedByPage=true;clearTimeout(reconnectTimer);
+            if(liveSocket) liveSocket.close();
+          });
+          root.addEventListener('contextmenu',e=>e.preventDefault());
         } catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
         </script></body></html>"""
         chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
