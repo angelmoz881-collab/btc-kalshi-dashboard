@@ -3641,7 +3641,10 @@ def render_independent_btc_chart():
                 kalshi_data=kalshi_snapshot(market_ticker)
             except (requests.RequestException, ValueError, KeyError, TypeError):
                 pass
-        engine = {}
+        # Restore the same completed-candle support/resistance model used by
+        # the live signal panel (without requiring the Kalshi trade tape).
+        levels = analyze_buyer_seller_pressure(candles, tape=None, stale=False)
+        engine = {"buyer_seller_levels": levels}
         st.markdown("### 📈 BTC live chart · independent refresh")
         timeframe = st.radio("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True, label_visibility="collapsed", key="candle_size_compact")
         with st.expander("⚙️ Chart options", expanded=False):
@@ -3718,8 +3721,8 @@ def render_independent_btc_chart():
             "visible": visible_count,
             "strike": strike_value,
             "reference": None,
-            "support": None,
-            "resistance": None,
+            "support": levels.get("support"),
+            "resistance": levels.get("resistance"),
         }, allow_nan=False)
         chart_html = r"""<!doctype html><html><head>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
@@ -3784,17 +3787,65 @@ def render_independent_btc_chart():
             });
           }
         
-          // Independent BTC spot levels. Distinct from the Kalshi settlement strike.
-          if (Number.isFinite(data.support)) main.createPriceLine({
-            price:data.support,color:'#38d9a5',lineWidth:1,
-            lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'SUPPORT'
-          });
-          if (Number.isFinite(data.resistance) &&
-              (!Number.isFinite(data.support) || Math.abs(data.resistance-data.support)>0.01))
-            main.createPriceLine({
-              price:data.resistance,color:'#fbbf24',lineWidth:1,
-              lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'RESISTANCE'
+          // Persist price lines and update their positions without recreating the chart.
+          let supportLine=null, resistanceLine=null;
+          function setLevels(support,resistance){
+            if(supportLine){main.removePriceLine(supportLine);supportLine=null;}
+            if(resistanceLine){main.removePriceLine(resistanceLine);resistanceLine=null;}
+            if(Number.isFinite(support)) supportLine=main.createPriceLine({
+              price:support,color:'#38d9a5',lineWidth:2,
+              lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'SUPPORT'
             });
+            if(Number.isFinite(resistance) &&
+               (!Number.isFinite(support)||Math.abs(resistance-support)>0.01))
+              resistanceLine=main.createPriceLine({
+                price:resistance,color:'#fbbf24',lineWidth:2,
+                lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'RESISTANCE'
+              });
+          }
+          setLevels(data.support,data.resistance);
+
+          // Mirror the Python closed-1m-candle swing/range level algorithm.
+          // No guessed levels on missing/stale candles; avoid using forming bars.
+          function calculateLevels(rows){
+            const now=Math.floor(Date.now()/1000);
+            const closed=rows.filter(b=>b.time+60<=now).slice(-180);
+            if(closed.length<54 || now-closed[closed.length-1].time>245)
+              return null;
+            const tr=closed.map((b,i)=>{
+              const prior=i?closed[i-1].close:b.close;
+              return Math.max(b.high-b.low,Math.abs(b.high-prior),Math.abs(b.low-prior));
+            }).slice(-14).sort((a,b)=>a-b);
+            const atr=(tr[6]+tr[7])/2;
+            if(!Number.isFinite(atr)||atr<=0) return null;
+            const pivots=closed.slice(0,-1), price=closed[closed.length-1].close;
+            const margin=Math.max(atr*.30,price*.00003);
+            const lows=[], highs=[];
+            for(let i=2;i<pivots.length-2;i++){
+              if(pivots[i].high>=Math.max(pivots[i-2].high,pivots[i-1].high) &&
+                 pivots[i].high>Math.max(pivots[i+1].high,pivots[i+2].high)) highs.push(pivots[i].high);
+              if(pivots[i].low<=Math.min(pivots[i-2].low,pivots[i-1].low) &&
+                 pivots[i].low<Math.min(pivots[i+1].low,pivots[i+2].low)) lows.push(pivots[i].low);
+            }
+            const recent=pivots.slice(-20);
+            const upper=Math.max(...recent.map(x=>x.high));
+            const lower=Math.min(...recent.map(x=>x.low));
+            const supports=lows.filter(x=>x<=price+margin);
+            const resistances=highs.filter(x=>x>=price-margin);
+            if(price>upper+margin){
+              supports.push(upper);
+              const r=resistances.filter(x=>x>price+margin);
+              return {support:Math.max(...supports),resistance:r.length?Math.min(...r):null};
+            }
+            if(price<lower-margin){
+              resistances.push(lower);
+              const s=supports.filter(x=>x<price-margin);
+              return {support:s.length?Math.max(...s):null,resistance:Math.min(...resistances)};
+            }
+            supports.push(lower);resistances.push(upper);
+            return {support:Math.max(...supports.filter(x=>x<=price+margin)),
+                    resistance:Math.min(...resistances.filter(x=>x>=price-margin))};
+          }
         
           const emaSeries=data.overlays.map(o=>{
             const series=chart.addLineSeries({color:o.color,lineWidth:1,lastValueVisible:false,priceLineVisible:false});
@@ -3920,6 +3971,11 @@ def render_independent_btc_chart():
                           low:Math.min(...items.map(x=>x.low)),close:items[items.length-1].close};
                       });
                       if(next.length<2) throw new Error('Insufficient distinct candles');
+              // Recalculate support/resistance using new completed 1-minute bars.
+              if(data.timeframe==='1m'){
+                const levels=calculateLevels(next);
+                if(levels) setLevels(levels.support,levels.resistance);
+              }
                       // Preserve the user's current zoom/pan even when the chart data rolls over.
                       const previous=chart.timeScale().getVisibleLogicalRange();
                       const old=data.bars;
