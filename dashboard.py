@@ -3951,6 +3951,7 @@ def render_independent_btc_chart():
           const bucketSec=({'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600})[data.timeframe]||60;
           const statusNode=document.getElementById('status');
           let liveSocket=null, reconnectTimer=null, closedByPage=false;
+          let polling=false, lastHistorySync=0, lastHistoryError='';
           let lastTickSeconds=0, lastTickPrice=null;
           function status(message){statusNode.textContent='COINBASE BTC/USD · '+data.timeframe+' · '+message;}
           function redrawOverlays(){
@@ -3969,7 +3970,8 @@ def render_independent_btc_chart():
             const t=Math.floor(timestamp/bucketSec)*bucketSec;
             const bars=data.bars;
             const last=bars[bars.length-1];
-            if(!last||t<last.time) return;
+            // Ignore duplicated/out-of-order ticker messages; don't rewrite a newer close.
+            if(!last||t<last.time||timestamp<lastTickSeconds) return;
             const newBucket=t>last.time;
             const previous=newBucket?chart.timeScale().getVisibleLogicalRange():null;
             const oldCount=bars.length;
@@ -3978,8 +3980,8 @@ def render_independent_btc_chart():
                 low:Math.min(last.close,price),close:price};
               bars.push(next);
               if(bars.length>300) bars.shift();
-              // setData only on a new bucket. update() keeps the chart/zoom intact.
-              main.setData(data.style==='Candles'?bars:bars.map(b=>({time:b.time,value:b.close})));
+              // update() appends a new candle without resetting the complete series.
+              main.update(data.style==='Candles'?next:{time:t,value:price});
               if(previous){
                 const span=previous.to-previous.from;
                 const viewingLatest=previous.to>=oldCount-0.5;
@@ -4065,27 +4067,37 @@ def render_independent_btc_chart():
                 }
               }
               const snapshot=[...grouped.values()].sort((a,b)=>a.time-b.time);
-              if(snapshot.length<2) return;
-              const live=data.bars[data.bars.length-1];
-              // Do not overwrite a fresher WebSocket tick with delayed REST candles.
-              if(live && lastTickSeconds>0){
-                const liveBucket=Math.floor(lastTickSeconds/bucketSec)*bucketSec;
-                const restLast=snapshot[snapshot.length-1];
-                if(restLast.time===liveBucket){
-                  restLast.high=Math.max(restLast.high,live.high);
-                  restLast.low=Math.min(restLast.low,live.low);
-                  restLast.close=lastTickPrice;
-                }else if(restLast.time<liveBucket){
-                  snapshot.push({...live});
+              if(snapshot.length<2) throw new Error('Insufficient historical candles');
+              // Merge by candle timestamp. Preserve old history, since Coinbase REST
+              // may only return a shorter window (especially on 15m/1h charts).
+              // Keep the most recent ticker close instead of reverting to delayed REST.
+              const merged=new Map(data.bars.map(b=>[b.time,{...b}]));
+              const liveBucket=lastTickSeconds>0
+                ?Math.floor(lastTickSeconds/bucketSec)*bucketSec:null;
+              for(const bar of snapshot){
+                const prior=merged.get(bar.time);
+                if(bar.time===liveBucket && prior){
+                  merged.set(bar.time,{
+                    ...bar, high:Math.max(bar.high,prior.high),
+                    low:Math.min(bar.low,prior.low),close:lastTickPrice
+                  });
+                }else if(bar.time!==liveBucket){
+                  merged.set(bar.time,bar);
+                }else{
+                  merged.set(bar.time,bar);
                 }
               }
+              const reconciled=[...merged.values()].sort((a,b)=>a.time-b.time).slice(-300);
+              if(reconciled.length<2) throw new Error('Insufficient reconciled candles');
               const visible=chart.timeScale().getVisibleLogicalRange();
               const old=data.bars;
               const span=visible?visible.to-visible.from:null;
               const atEnd=visible&&visible.to>=old.length-0.5;
               const anchor=visible&&old[Math.max(0,Math.min(old.length-1,Math.floor(visible.to)))];
               const fraction=visible?visible.to-Math.floor(visible.to):0;
-              data.bars=snapshot.slice(-300);
+              data.bars=reconciled;
+              lastHistorySync=Date.now();
+              lastHistoryError='';
               main.setData(data.style==='Candles'?data.bars:
                 data.bars.map(b=>({time:b.time,value:b.close})));
               redrawOverlays();
@@ -4100,7 +4112,8 @@ def render_independent_btc_chart():
               saveView(chart.timeScale().getVisibleLogicalRange());
             }catch(err){
               // WebSocket ticks continue even when the browser blocks REST (CORS).
-              if(!lastTickSeconds) status('WAITING FOR FEED');
+              lastHistoryError=String(err && err.message || err);
+              if(!lastTickSeconds) status('HISTORY UNAVAILABLE · waiting for live ticks');
             }finally{polling=false;}
           }
           connectLive();
