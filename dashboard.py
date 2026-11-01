@@ -2945,6 +2945,7 @@ def _render_live_dashboard_inner():
         st.caption("This is a probabilistic BTC price-action forecast, not a guaranteed future price or trade instruction. It uses candles, volume, momentum, volatility and historical analogs only.")
 
         st.caption("📈 BTC chart refreshes independently above the live signal panel.")
+        strike_value = extract_strike(kalshi_data)
         refresh_label = refresh_mode.replace(" · ", " ")
         if strike_value is not None:
             side_text = "ABOVE" if price >= strike_value else "BELOW"
