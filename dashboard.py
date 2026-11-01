@@ -2944,260 +2944,7 @@ def _render_live_dashboard_inner():
             st.caption("Candle read: " + " · ".join(reasons[:4]))
         st.caption("This is a probabilistic BTC price-action forecast, not a guaranteed future price or trade instruction. It uses candles, volume, momentum, volatility and historical analogs only.")
 
-        timeframe = st.radio("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True, label_visibility="collapsed", key="candle_size_compact")
-        with st.expander("⚙️ Chart options", expanded=False):
-            window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
-            show_ema = st.toggle("Show EMA 5 / 15", value=True)
-            chart_style = st.radio("Chart type", ["Candles", "Line"], horizontal=True)
-        minutes = {"15m": 15, "30m": 30, "1h": 60, "3h": 180, "6h": 360}[window]
-        candle_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}[timeframe]
-        # Coinbase timestamps are already UTC datetime values. Preserve those
-        # timestamps, remove duplicate buckets, then resample OHLC properly.
-        source = candles.copy()
-        source["time"] = pd.to_datetime(source["time"], utc=True, errors="coerce")
-        for col in ("open", "high", "low", "close", "volume"):
-            source[col] = pd.to_numeric(source[col], errors="coerce")
-        source = source.dropna(subset=["time", "open", "high", "low", "close"])
-        source = source.sort_values("time").drop_duplicates("time", keep="last")
-        if candle_minutes > 1:
-            source = (source.set_index("time")
-                      .resample(f"{candle_minutes}min", label="left", closed="left")
-                      .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-                      .dropna(subset=["open", "high", "low", "close"])
-                      .reset_index())
-        # Keep history available for panning; the initial view is set in JS.
-        view = source.tail(300).copy()
-
-        # Convert timestamps to real UNIX *seconds* in a way that does not depend on
-        # pandas' internal datetime resolution (ns/us/ms/s). Newer pandas builds can
-        # preserve a non-nanosecond dtype, so dividing astype("int64") by 1e9 can
-        # collapse many candles onto the same timestamp and make the chart appear empty.
-        def _unix_seconds(value):
-            ts = pd.Timestamp(value)
-            if ts.tzinfo is None:
-                ts = ts.tz_localize("UTC")
-            else:
-                ts = ts.tz_convert("UTC")
-            return int(ts.timestamp())
-
-        view["epoch"] = view["time"].map(_unix_seconds).astype("int64")
-        view = view.sort_values("epoch").drop_duplicates("epoch", keep="last")
-        bars = [{"time": int(r.epoch), "open": float(r.open), "high": float(r.high),
-                 "low": float(r.low), "close": float(r.close)} for r in view.itertuples()]
-        if not bars:
-            st.error("No valid BTC candles were received. Try reloading the dashboard.")
-            st.stop()
-        if len(bars) < 10:
-            st.warning(f"Only {len(bars)} distinct {timeframe} candles received; displaying available data.")
-        line = [{"time": b["time"], "value": b["close"]} for b in bars]
-        ema5 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=5, adjust=False).mean())]
-        ema15 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=15, adjust=False).mean())]
-        visible_count = max(2, min(len(bars), max(1, minutes // candle_minutes)))
-        # Lightweight Charts handles native two-finger scaling and one-finger panning.
-        # Pass unique, strictly ascending UNIX timestamps (seconds, not milliseconds).
-        clean_bars = sorted({b["time"]: b for b in bars}.values(), key=lambda b: b["time"])
-        if len(clean_bars) < 2:
-            st.error("At least two distinct candles are required to draw the chart.")
-            st.stop()
-        closes = pd.Series([b["close"] for b in clean_bars], dtype="float64")
-        overlays = []
-        for span, color in ((5, "#fbbf24"), (15, "#a78bfa")):
-            avg = closes.ewm(span=span, adjust=False).mean()
-            overlays.append({"color": color, "points": [
-                {"time": b["time"], "value": float(v)} for b, v in zip(clean_bars, avg)
-            ]})
-        # Chart the verified target directly from the selected Kalshi market.
-        # Do not depend on a model prediction existing before showing the line.
-        strike_value = extract_strike(kalshi_data)
-
-        chart_data = json.dumps({
-            "bars": clean_bars,
-            "line": [{"time": b["time"], "value": b["close"]} for b in clean_bars],
-            "overlays": overlays if show_ema else [],
-            "style": chart_style,
-            "timeframe": timeframe,
-            "visible": visible_count,
-            "strike": strike_value,
-            "reference": float(engine.get("reference_price")) if engine.get("reference_price") is not None else None,
-            "support": (engine.get("buyer_seller_levels") or {}).get("support"),
-            "resistance": (engine.get("buyer_seller_levels") or {}).get("resistance"),
-        }, allow_nan=False)
-        chart_html = r"""<!doctype html><html><head>
-        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-        <style>
-        html,body{margin:0;background:#0b0b11;color:#d9e3f1;font-family:system-ui;overflow:hidden}
-        #frame{position:relative;width:100%;height:300px;overflow:hidden}
-        #chart{width:100%;height:300px;touch-action:none;overscroll-behavior:contain}
-        #status{position:absolute;top:9px;left:12px;pointer-events:none;background:#120e16d9;
-          border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
-        #reset-view{position:absolute;top:9px;right:70px;z-index:3;background:#211925;color:#d9e3f1;border:1px solid #56303a;border-radius:6px;padding:5px 8px;cursor:pointer}
-        #error{color:#ff9eaa;padding:15px;display:none}
-        </style></head><body>
-        <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">COINBASE BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
-        <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
-        <script>
-        const data=__PAYLOAD__;
-        const root=document.getElementById('chart');
-        const error=document.getElementById('error');
-        try {
-          if(!window.LightweightCharts) throw new Error('Chart library unavailable.');
-          const LC=window.LightweightCharts;
-          const chart=LC.createChart(root,{
-            width:root.clientWidth,height:300,
-            layout:{background:{type:'solid',color:'#0b0b11'},textColor:'#b9c9df'},
-            grid:{vertLines:{color:'#251c27'},horzLines:{color:'#251c27'}},
-            rightPriceScale:{borderColor:'#51303b',scaleMargins:{top:.08,bottom:.12}},
-            timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#51303b',
-              barSpacing:8,minBarSpacing:2,rightOffset:3,lockVisibleTimeRangeOnResize:true},
-            crosshair:{mode:LC.CrosshairMode.Magnet},
-            handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:false,vertTouchDrag:false},
-            handleScale:{axisPressedMouseMove:false,mouseWheel:false,pinch:true},
-            kineticScroll:{touch:true,mouse:false}
-          });
-          const main=data.style==='Candles'
-            ?chart.addCandlestickSeries({upColor:'#34d399',downColor:'#fb7185',borderVisible:false,
-              wickUpColor:'#34d399',wickDownColor:'#fb7185'})
-            :chart.addLineSeries({color:'#60a5fa',lineWidth:2});
-          main.setData(data.style==='Candles'?data.bars:data.line);
-
-          // Kalshi strike line. It stays fixed while the BTC candles pan/zoom so a
-          // crossing is immediately visible on the chart.
-          if (Number.isFinite(data.strike)) {
-            main.createPriceLine({
-              price:data.strike,
-              color:'#ff3b5c',
-              lineWidth:2,
-              lineStyle:LC.LineStyle.Dashed,
-              axisLabelVisible:true,
-              title:'STRIKE'
-            });
-          }
-          if (Number.isFinite(data.reference)) {
-            main.createPriceLine({
-              price:data.reference,
-              color:'#60a5fa',
-              lineWidth:1,
-              lineStyle:LC.LineStyle.Dotted,
-              axisLabelVisible:true,
-              title:'BRTI PROXY'
-            });
-          }
-
-          // Independent BTC spot levels. Distinct from the Kalshi settlement strike.
-          if (Number.isFinite(data.support)) main.createPriceLine({
-            price:data.support,color:'#38d9a5',lineWidth:1,
-            lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'SUPPORT'
-          });
-          if (Number.isFinite(data.resistance) &&
-              (!Number.isFinite(data.support) || Math.abs(data.resistance-data.support)>0.01))
-            main.createPriceLine({
-              price:data.resistance,color:'#fbbf24',lineWidth:1,
-              lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'RESISTANCE'
-            });
-
-          data.overlays.forEach(o=>{
-            const series=chart.addLineSeries({color:o.color,lineWidth:1,
-              lastValueVisible:false,priceLineVisible:false});series.setData(o.points);
-          });
-          const viewKey='btc-kalshi-view-'+data.timeframe;
-          // Read before chart layout/resize events can overwrite the previous view.
-          let savedView=null;
-          try { savedView=JSON.parse(localStorage.getItem(viewKey)||'null'); } catch(_) {}
-          let viewReady=false;
-          const validView=v=>v && Number.isFinite(v.span) && v.span>0 && Number.isFinite(v.rightOffset);
-          function defaultView(){
-            const n=data.bars.length;
-            const visible=Math.min(n,Math.max(3,data.visible));
-            chart.timeScale().setVisibleLogicalRange({from:n-visible-1,to:n+2});
-          }
-          function saveView(r){
-            if(!viewReady || !r || !Number.isFinite(r.from) || !Number.isFinite(r.to) || r.to<=r.from) return;
-            const anchorIndex=Math.max(0,Math.min(data.bars.length-1,Math.floor(r.to)));
-            try {
-              localStorage.setItem(viewKey,JSON.stringify({
-                span:r.to-r.from,rightOffset:(data.bars.length-1)-r.to,
-                anchorTime:data.bars[anchorIndex].time,anchorOffset:r.to-anchorIndex,
-                followLatest:r.to>=data.bars.length-1
-              }));
-            } catch(_) {}
-          }
-          function setInitialView(){
-            if(validView(savedView)){
-              let to=(data.bars.length-1)-savedView.rightOffset;
-              // Keep historical candles in place when the rolling data window moves.
-              if(savedView.followLatest===false && Number.isFinite(savedView.anchorTime) && Number.isFinite(savedView.anchorOffset)){
-                const index=data.bars.findIndex(b=>b.time===savedView.anchorTime);
-                if(index>=0) to=index+savedView.anchorOffset;
-              }
-              chart.timeScale().setVisibleLogicalRange({from:to-savedView.span,to});
-            } else {
-              defaultView();
-            }
-            // Subscribe only after restoration: initial layout must never save defaults.
-            requestAnimationFrame(()=>{
-              viewReady=true;
-              chart.timeScale().subscribeVisibleLogicalRangeChange(saveView);
-            });
-          }
-          requestAnimationFrame(()=>requestAnimationFrame(setInitialView));
-          document.getElementById('reset-view').addEventListener('click',()=>{
-            if(!viewReady) return;
-            defaultView();
-            saveView(chart.timeScale().getVisibleLogicalRange());
-          });
-          window.addEventListener('pagehide',()=>saveView(chart.timeScale().getVisibleLogicalRange()));
-          new ResizeObserver(()=>{
-            if(root.clientWidth>0) chart.applyOptions({width:root.clientWidth});
-          }).observe(root);
-
-          // Mobile controls: custom one-finger horizontal panning + native two-finger pinch.
-          // Android browsers inside Streamlit iframes can swallow Lightweight Charts' built-in
-          // one-finger drag, so we pan the logical time range ourselves.
-          let panStartX=null;
-          let panStartRange=null;
-          let panMoved=false;
-          root.addEventListener('touchstart', e => {
-            if (e.touches.length===1) {
-              panStartX=e.touches[0].clientX;
-              const r=chart.timeScale().getVisibleLogicalRange();
-              panStartRange=r ? {from:r.from,to:r.to} : null;
-              panMoved=false;
-            } else {
-              panStartX=null;
-              panStartRange=null;
-            }
-          }, {passive:true});
-
-          root.addEventListener('touchmove', e => {
-            if (e.touches.length!==1 || panStartX===null || !panStartRange) return;
-            e.preventDefault();
-            const dx=e.touches[0].clientX-panStartX;
-            if (Math.abs(dx)>3) panMoved=true;
-            const barsVisible=Math.max(1, panStartRange.to-panStartRange.from);
-            const pxPerBar=Math.max(2, root.clientWidth/barsVisible);
-            const shift=-dx/pxPerBar;
-            chart.timeScale().setVisibleLogicalRange({
-              from:panStartRange.from+shift,
-              to:panStartRange.to+shift
-            });
-          }, {passive:false});
-
-          root.addEventListener('touchend', e => {
-            if (e.touches.length===0) {
-              panStartX=null;
-              panStartRange=null;
-            }
-          }, {passive:true});
-          root.addEventListener('touchcancel', () => {
-            panStartX=null;
-            panStartRange=null;
-          }, {passive:true});
-
-          root.addEventListener('contextmenu',e=>e.preventDefault());
-        } catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
-        </script></body></html>"""
-        chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
-        components.html(chart_html, height=308, scrolling=False)
+        st.caption("📈 BTC chart refreshes independently above the live signal panel.")
         refresh_label = refresh_mode.replace(" · ", " ")
         if strike_value is not None:
             side_text = "ABOVE" if price >= strike_value else "BELOW"
@@ -3877,6 +3624,340 @@ def _render_live_dashboard_inner():
     **Validation target:** keep collecting settled contracts and watch held-out Brier score, calibration, direction hit rate, and fee/slippage-adjusted paper results. The learner only receives weight when out-of-sample probability accuracy improves.
     """)
     st.caption(f"Last dashboard update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} • Data may be delayed.")
+
+
+# Persistent browser-side BTC chart, intentionally outside the refreshing signal fragment.
+# A fragment repaint cannot destroy this iframe or reset its touch/zoom state.
+def render_independent_btc_chart():
+    try:
+        candles = get_candles(60)
+        if candles is None or len(candles)<10:
+            st.warning("BTC chart waiting for candles.")
+            return
+        kalshi_data = None
+        if market_ticker:
+            try:
+                kalshi_data=kalshi_snapshot(market_ticker)
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                pass
+        engine = {}
+        st.markdown("### 📈 BTC live chart · independent refresh")
+        timeframe = st.radio("Candle size", ["1m", "5m", "15m", "30m", "1h"], index=0, horizontal=True, label_visibility="collapsed", key="candle_size_compact")
+        with st.expander("⚙️ Chart options", expanded=False):
+            window = st.selectbox("Show history", ["15m", "30m", "1h", "3h", "6h"], index=2)
+            show_ema = st.toggle("Show EMA 5 / 15", value=True)
+            chart_style = st.radio("Chart type", ["Candles", "Line"], horizontal=True)
+        minutes = {"15m": 15, "30m": 30, "1h": 60, "3h": 180, "6h": 360}[window]
+        candle_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}[timeframe]
+        # Coinbase timestamps are already UTC datetime values. Preserve those
+        # timestamps, remove duplicate buckets, then resample OHLC properly.
+        source = candles.copy()
+        source["time"] = pd.to_datetime(source["time"], utc=True, errors="coerce")
+        for col in ("open", "high", "low", "close", "volume"):
+            source[col] = pd.to_numeric(source[col], errors="coerce")
+        source = source.dropna(subset=["time", "open", "high", "low", "close"])
+        source = source.sort_values("time").drop_duplicates("time", keep="last")
+        if candle_minutes > 1:
+            source = (source.set_index("time")
+                      .resample(f"{candle_minutes}min", label="left", closed="left")
+                      .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+                      .dropna(subset=["open", "high", "low", "close"])
+                      .reset_index())
+        # Keep history available for panning; the initial view is set in JS.
+        view = source.tail(300).copy()
+        
+        # Convert timestamps to real UNIX *seconds* in a way that does not depend on
+        # pandas' internal datetime resolution (ns/us/ms/s). Newer pandas builds can
+        # preserve a non-nanosecond dtype, so dividing astype("int64") by 1e9 can
+        # collapse many candles onto the same timestamp and make the chart appear empty.
+        def _unix_seconds(value):
+            ts = pd.Timestamp(value)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            return int(ts.timestamp())
+        
+        view["epoch"] = view["time"].map(_unix_seconds).astype("int64")
+        view = view.sort_values("epoch").drop_duplicates("epoch", keep="last")
+        bars = [{"time": int(r.epoch), "open": float(r.open), "high": float(r.high),
+                 "low": float(r.low), "close": float(r.close)} for r in view.itertuples()]
+        if not bars:
+            st.error("No valid BTC candles were received. Try reloading the dashboard.")
+            st.stop()
+        if len(bars) < 10:
+            st.warning(f"Only {len(bars)} distinct {timeframe} candles received; displaying available data.")
+        line = [{"time": b["time"], "value": b["close"]} for b in bars]
+        ema5 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=5, adjust=False).mean())]
+        ema15 = [{"time": int(t), "value": float(v)} for t, v in zip(view["epoch"], view["close"].ewm(span=15, adjust=False).mean())]
+        visible_count = max(2, min(len(bars), max(1, minutes // candle_minutes)))
+        # Lightweight Charts handles native two-finger scaling and one-finger panning.
+        # Pass unique, strictly ascending UNIX timestamps (seconds, not milliseconds).
+        clean_bars = sorted({b["time"]: b for b in bars}.values(), key=lambda b: b["time"])
+        if len(clean_bars) < 2:
+            st.error("At least two distinct candles are required to draw the chart.")
+            st.stop()
+        closes = pd.Series([b["close"] for b in clean_bars], dtype="float64")
+        overlays = []
+        for span, color in ((5, "#fbbf24"), (15, "#a78bfa")):
+            avg = closes.ewm(span=span, adjust=False).mean()
+            overlays.append({"color": color, "points": [
+                {"time": b["time"], "value": float(v)} for b, v in zip(clean_bars, avg)
+            ]})
+        # Chart the verified target directly from the selected Kalshi market.
+        # Do not depend on a model prediction existing before showing the line.
+        strike_value = extract_strike(kalshi_data)
+        
+        chart_data = json.dumps({
+            "bars": clean_bars,
+            "line": [{"time": b["time"], "value": b["close"]} for b in clean_bars],
+            "overlays": overlays if show_ema else [],
+            "style": chart_style,
+            "timeframe": timeframe,
+            "visible": visible_count,
+            "strike": strike_value,
+            "reference": None,
+            "support": None,
+            "resistance": None,
+        }, allow_nan=False)
+        chart_html = r"""<!doctype html><html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+        <style>
+        html,body{margin:0;background:#0b0b11;color:#d9e3f1;font-family:system-ui;overflow:hidden}
+        #frame{position:relative;width:100%;height:300px;overflow:hidden}
+        #chart{width:100%;height:300px;touch-action:none;overscroll-behavior:contain}
+        #status{position:absolute;top:9px;left:12px;pointer-events:none;background:#120e16d9;
+          border:1px solid #56303a;border-radius:8px;padding:6px 9px;font-size:12px;z-index:2}
+        #reset-view{position:absolute;top:9px;right:70px;z-index:3;background:#211925;color:#d9e3f1;border:1px solid #56303a;border-radius:6px;padding:5px 8px;cursor:pointer}
+        #error{color:#ff9eaa;padding:15px;display:none}
+        </style></head><body>
+        <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">COINBASE BTC/USD · __TIMEFRAME__</div><div id="chart"></div><div id="error"></div></div>
+        <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+        <script>
+        const data=__PAYLOAD__;
+                // This iframe lives outside Streamlit's live fragment and polls independently.
+                let polling=false;
+        const root=document.getElementById('chart');
+        const error=document.getElementById('error');
+        try {
+          if(!window.LightweightCharts) throw new Error('Chart library unavailable.');
+          const LC=window.LightweightCharts;
+          const chart=LC.createChart(root,{
+            width:root.clientWidth,height:300,
+            layout:{background:{type:'solid',color:'#0b0b11'},textColor:'#b9c9df'},
+            grid:{vertLines:{color:'#251c27'},horzLines:{color:'#251c27'}},
+            rightPriceScale:{borderColor:'#51303b',scaleMargins:{top:.08,bottom:.12}},
+            timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#51303b',
+              barSpacing:8,minBarSpacing:2,rightOffset:3,lockVisibleTimeRangeOnResize:true},
+            crosshair:{mode:LC.CrosshairMode.Magnet},
+            handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:false,vertTouchDrag:false},
+            handleScale:{axisPressedMouseMove:false,mouseWheel:false,pinch:true},
+            kineticScroll:{touch:true,mouse:false}
+          });
+          const main=data.style==='Candles'
+            ?chart.addCandlestickSeries({upColor:'#34d399',downColor:'#fb7185',borderVisible:false,
+              wickUpColor:'#34d399',wickDownColor:'#fb7185'})
+            :chart.addLineSeries({color:'#60a5fa',lineWidth:2});
+          main.setData(data.style==='Candles'?data.bars:data.line);
+        
+          // Kalshi strike line. It stays fixed while the BTC candles pan/zoom so a
+          // crossing is immediately visible on the chart.
+          if (Number.isFinite(data.strike)) {
+            main.createPriceLine({
+              price:data.strike,
+              color:'#ff3b5c',
+              lineWidth:2,
+              lineStyle:LC.LineStyle.Dashed,
+              axisLabelVisible:true,
+              title:'STRIKE'
+            });
+          }
+          if (Number.isFinite(data.reference)) {
+            main.createPriceLine({
+              price:data.reference,
+              color:'#60a5fa',
+              lineWidth:1,
+              lineStyle:LC.LineStyle.Dotted,
+              axisLabelVisible:true,
+              title:'BRTI PROXY'
+            });
+          }
+        
+          // Independent BTC spot levels. Distinct from the Kalshi settlement strike.
+          if (Number.isFinite(data.support)) main.createPriceLine({
+            price:data.support,color:'#38d9a5',lineWidth:1,
+            lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'SUPPORT'
+          });
+          if (Number.isFinite(data.resistance) &&
+              (!Number.isFinite(data.support) || Math.abs(data.resistance-data.support)>0.01))
+            main.createPriceLine({
+              price:data.resistance,color:'#fbbf24',lineWidth:1,
+              lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'RESISTANCE'
+            });
+        
+          data.overlays.forEach(o=>{
+            const series=chart.addLineSeries({color:o.color,lineWidth:1,
+              lastValueVisible:false,priceLineVisible:false});series.setData(o.points);
+          });
+          const viewKey='btc-kalshi-view-'+data.timeframe;
+          // Read before chart layout/resize events can overwrite the previous view.
+          let savedView=null;
+          try { savedView=JSON.parse(localStorage.getItem(viewKey)||'null'); } catch(_) {}
+          let viewReady=false;
+          const validView=v=>v && Number.isFinite(v.span) && v.span>0 && Number.isFinite(v.rightOffset);
+          function defaultView(){
+            const n=data.bars.length;
+            const visible=Math.min(n,Math.max(3,data.visible));
+            chart.timeScale().setVisibleLogicalRange({from:n-visible-1,to:n+2});
+          }
+          function saveView(r){
+            if(!viewReady || !r || !Number.isFinite(r.from) || !Number.isFinite(r.to) || r.to<=r.from) return;
+            const anchorIndex=Math.max(0,Math.min(data.bars.length-1,Math.floor(r.to)));
+            try {
+              localStorage.setItem(viewKey,JSON.stringify({
+                span:r.to-r.from,rightOffset:(data.bars.length-1)-r.to,
+                anchorTime:data.bars[anchorIndex].time,anchorOffset:r.to-anchorIndex,
+                followLatest:r.to>=data.bars.length-1
+              }));
+            } catch(_) {}
+          }
+          function setInitialView(){
+            if(validView(savedView)){
+              let to=(data.bars.length-1)-savedView.rightOffset;
+              // Keep historical candles in place when the rolling data window moves.
+              if(savedView.followLatest===false && Number.isFinite(savedView.anchorTime) && Number.isFinite(savedView.anchorOffset)){
+                const index=data.bars.findIndex(b=>b.time===savedView.anchorTime);
+                if(index>=0) to=index+savedView.anchorOffset;
+              }
+              chart.timeScale().setVisibleLogicalRange({from:to-savedView.span,to});
+            } else {
+              defaultView();
+            }
+            // Subscribe only after restoration: initial layout must never save defaults.
+            requestAnimationFrame(()=>{
+              viewReady=true;
+              chart.timeScale().subscribeVisibleLogicalRangeChange(saveView);
+            });
+          }
+          requestAnimationFrame(()=>requestAnimationFrame(setInitialView));
+          document.getElementById('reset-view').addEventListener('click',()=>{
+            if(!viewReady) return;
+            defaultView();
+            saveView(chart.timeScale().getVisibleLogicalRange());
+          });
+          window.addEventListener('pagehide',()=>saveView(chart.timeScale().getVisibleLogicalRange()));
+          new ResizeObserver(()=>{
+            if(root.clientWidth>0) chart.applyOptions({width:root.clientWidth});
+          }).observe(root);
+        
+          // Mobile controls: custom one-finger horizontal panning + native two-finger pinch.
+          // Android browsers inside Streamlit iframes can swallow Lightweight Charts' built-in
+          // one-finger drag, so we pan the logical time range ourselves.
+          let panStartX=null;
+          let panStartRange=null;
+          let panMoved=false;
+          root.addEventListener('touchstart', e => {
+            if (e.touches.length===1) {
+              panStartX=e.touches[0].clientX;
+              const r=chart.timeScale().getVisibleLogicalRange();
+              panStartRange=r ? {from:r.from,to:r.to} : null;
+              panMoved=false;
+            } else {
+              panStartX=null;
+              panStartRange=null;
+            }
+          }, {passive:true});
+        
+          root.addEventListener('touchmove', e => {
+            if (e.touches.length!==1 || panStartX===null || !panStartRange) return;
+            e.preventDefault();
+            const dx=e.touches[0].clientX-panStartX;
+            if (Math.abs(dx)>3) panMoved=true;
+            const barsVisible=Math.max(1, panStartRange.to-panStartRange.from);
+            const pxPerBar=Math.max(2, root.clientWidth/barsVisible);
+            const shift=-dx/pxPerBar;
+            chart.timeScale().setVisibleLogicalRange({
+              from:panStartRange.from+shift,
+              to:panStartRange.to+shift
+            });
+          }, {passive:false});
+        
+          root.addEventListener('touchend', e => {
+            if (e.touches.length===0) {
+              panStartX=null;
+              panStartRange=null;
+            }
+          }, {passive:true});
+          root.addEventListener('touchcancel', () => {
+            panStartX=null;
+            panStartRange=null;
+          }, {passive:true});
+        
+          
+                  // Fetch only new public market data; never rerun Streamlit to repaint candles.
+                  const bucketSec=({'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600})[data.timeframe]||60;
+                  const historyMinutes=300;
+                  async function pollCandles(){
+                    if(polling || document.hidden) return;
+                    polling=true;
+                    try{
+                      const response=await fetch('https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60', {cache:'no-store'});
+                      if(!response.ok) throw new Error('Coinbase candles HTTP '+response.status);
+                      const raw=await response.json();
+                      if(!Array.isArray(raw) || raw.length<2) throw new Error('No new candle data');
+                      const buckets=new Map();
+                      for(const row of raw){
+                        const ts=Number(row[0]),low=Number(row[1]),high=Number(row[2]),open=Number(row[3]),close=Number(row[4]);
+                        if(![ts,low,high,open,close].every(Number.isFinite)) continue;
+                        const t=Math.floor(ts/bucketSec)*bucketSec;
+                        if(!buckets.has(t)) buckets.set(t,[]);
+                        buckets.get(t).push({time:ts,open,high,low,close});
+                      }
+                      const next=[...buckets.entries()].sort((a,b)=>a[0]-b[0]).map(([t,items])=>{
+                        items.sort((a,b)=>a.time-b.time);
+                        return {time:t,open:items[0].open,high:Math.max(...items.map(x=>x.high)),
+                          low:Math.min(...items.map(x=>x.low)),close:items[items.length-1].close};
+                      });
+                      if(next.length<2) throw new Error('Insufficient distinct candles');
+                      // Preserve the user's current zoom/pan even when the chart data rolls over.
+                      const previous=chart.timeScale().getVisibleLogicalRange();
+                      const old=data.bars;
+                      const wasAtEnd=previous && previous.to >= old.length-0.5;
+                      const anchor=previous && old[Math.min(old.length-1,Math.max(0,Math.floor(previous.to)))];
+                      const span=previous ? previous.to-previous.from : 0;
+                      const rightGap=previous ? previous.to-(old.length-1) : 0;
+                      data.bars=next;
+                      const display=data.style==='Candles'?next:next.map(b=>({time:b.time,value:b.close}));
+                      main.setData(display);
+                      emaSeries.forEach((series,i)=>{
+                        const span=i===0?5:15, alpha=2/(span+1);let value=null;
+                        const points=next.map(b=>{value=value===null?b.close:alpha*b.close+(1-alpha)*value;return {time:b.time,value};});
+                        series.setData(points);
+                      });
+                      if(previous && span>0){
+                        let to=next.length-1+rightGap;
+                        if(!wasAtEnd && anchor){
+                          const idx=next.findIndex(b=>b.time===anchor.time);
+                          if(idx>=0) to=idx+(previous.to-Math.floor(previous.to));
+                        }
+                        chart.timeScale().setVisibleLogicalRange({from:to-span,to});
+                      }
+                      document.getElementById('status').textContent='COINBASE BTC/USD · '+data.timeframe+' · LIVE';
+                      saveView(chart.timeScale().getVisibleLogicalRange());
+                    }catch(e){
+                      document.getElementById('status').textContent='COINBASE BTC/USD · reconnecting';
+                    }finally{polling=false;}
+                  }
+                  setInterval(pollCandles,2000);
+                  root.addEventListener('contextmenu',e=>e.preventDefault());
+        } catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
+        </script></body></html>"""
+        chart_html = chart_html.replace("__PAYLOAD__", chart_data).replace("__TIMEFRAME__", timeframe)
+        components.html(chart_html, height=308, scrolling=False)
+    except Exception as exc:
+        st.warning(f"BTC chart feed temporarily unavailable: {type(exc).__name__}")
+
+render_independent_btc_chart()
 
 
 @_fragment(run_every=live_run_every)
