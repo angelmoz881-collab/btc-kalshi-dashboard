@@ -3795,9 +3795,9 @@ def render_independent_btc_chart():
               lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'RESISTANCE'
             });
         
-          data.overlays.forEach(o=>{
-            const series=chart.addLineSeries({color:o.color,lineWidth:1,
-              lastValueVisible:false,priceLineVisible:false});series.setData(o.points);
+          const emaSeries=data.overlays.map(o=>{
+            const series=chart.addLineSeries({color:o.color,lineWidth:1,lastValueVisible:false,priceLineVisible:false});
+            series.setData(o.points);return series;
           });
           const viewKey='btc-kalshi-view-'+data.timeframe;
           // Read before chart layout/resize events can overwrite the previous view.
