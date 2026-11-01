@@ -2264,13 +2264,13 @@ with st.sidebar:
     if manual_ticker:
         market_ticker = manual_ticker
     refresh_mode = st.selectbox(
-        "Live update speed",
-        ["Fast · 3s", "Ultra · 2s", "Balanced · 5s", "Paused"],
-        index=0,
-        help="Fast mode refreshes the live dashboard without reloading the whole page. Ultra is more responsive but makes more API requests.",
+        "Analysis update speed",
+        ["Fast · 5s", "Balanced · 10s", "Eco · 15s", "Paused"],
+        index=1,
+        help="Predictions/whale analysis update in their own fragment. BTC spot and Kalshi quotes have separate refresh schedules; the chart uses a browser WebSocket.",
     )
-    live_run_every = {"Fast · 3s": 3, "Ultra · 2s": 2, "Balanced · 5s": 5, "Paused": None}[refresh_mode]
-    st.caption("BTC, Kalshi quotes/order book, whale trades and signals use the selected live interval. Countdown still updates every second.")
+    live_run_every = {"Fast · 5s": 5, "Balanced · 10s": 10, "Eco · 15s": 15, "Paused": None}[refresh_mode]
+    st.caption("Independent updates: BTC chart on WebSocket ticks; spot strip every 2s; Kalshi quotes every 4s; models at the selected interval. Countdown updates each second.")
     st.markdown("---")
     st.markdown("**Signal controls**")
     min_edge = st.slider("Minimum model edge (percentage points)", 1, 20, 5)
@@ -3625,6 +3625,63 @@ def _render_live_dashboard_inner():
     **Validation target:** keep collecting settled contracts and watch held-out Brier score, calibration, direction hit rate, and fee/slippage-adjusted paper results. The learner only receives weight when out-of-sample probability accuracy improves.
     """)
     st.caption(f"Last dashboard update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} • Data may be delayed.")
+
+
+# Independent fast panels. Each fragment redraws only its own region;
+# slow model inference, manual page navigation and the candle chart are untouched.
+@_fragment(run_every=2)
+def render_independent_spot_strip():
+    try:
+        spot = get_spot_price()
+        st.session_state["_fast_spot_last_good"] = (spot, time.time())
+        spot_note = "Coinbase spot · 2s updates"
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        last = st.session_state.get("_fast_spot_last_good")
+        if not last:
+            st.caption("BTC spot reconnecting · independent of prediction updates")
+            return
+        spot, ts = last
+        spot_note = f"Last BTC spot quote {int(max(0, time.time()-ts))}s ago · reconnecting"
+    st.markdown(
+        '<div class="market-strip"><div><small>LIVE BTC / USD</small>'
+        f'<strong>${spot:,.2f}</strong><span>{html.escape(spot_note)}</span>'
+        '</div><div><small>DATA SOURCE</small><strong>COINBASE</strong>'
+        '<span>Direct spot ticker</span></div>'
+        '<div><small>REFRESH</small><strong>2s</strong>'
+        '<span>Independent Streamlit fragment</span></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+@_fragment(run_every=4)
+def render_independent_kalshi_quotes():
+    # Read active ticker as of this fragment's execution, not from the sidebar
+    # selection captured at the last full-script run. The analysis auto-rolls it.
+    ticker = st.session_state.get("btc_active_ticker") or market_ticker
+    if not ticker:
+        st.caption("Kalshi live quotes · waiting for confirmed BTC15M ticker")
+        return
+    try:
+        snapshot = kalshi_snapshot(ticker)
+        st.session_state["_fast_kalshi_last_good"] = (ticker, snapshot, time.time())
+        quote_note = "Live market snapshot"
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        last = st.session_state.get("_fast_kalshi_last_good")
+        if not last or last[0] != ticker:
+            st.caption("Kalshi quotes reconnecting · previous market prices not reused")
+            return
+        snapshot = last[1]
+        quote_note = f"Stale quotes · {int(max(0, time.time()-last[2]))}s old"
+    cols = st.columns(4)
+    cols[0].metric("YES buy", show_price(snapshot.get("yes_ask")))
+    cols[1].metric("YES sell", show_price(snapshot.get("yes_bid")))
+    cols[2].metric("NO buy", show_price(snapshot.get("no_ask")))
+    cols[3].metric("NO sell", show_price(snapshot.get("no_bid")))
+    st.caption(f"Kalshi BTC15M · {ticker} · {quote_note} · independent 4s refresh")
+
+
+render_independent_spot_strip()
+render_independent_kalshi_quotes()
 
 
 # Persistent browser-side BTC chart, intentionally outside the refreshing signal fragment.
