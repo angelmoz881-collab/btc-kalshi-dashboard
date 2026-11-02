@@ -68,6 +68,27 @@ class TestScalpEngine(unittest.TestCase):
                               400, history=history)
         self.assertEqual(blocked["status"], "WAIT")
 
+    def test_opposing_spot_pressure_blocks_entry_watch(self):
+        import time
+        now = time.time()
+        history = [{"t": now - 25, "yes_bid": 52}, {"t": now, "yes_bid": 55}]
+        watched = entry_watch(
+            book(), 60, .80, {}, 400, history=history,
+            pressure={"bias": "SELLERS", "strength": "STRONG"},
+        )
+        self.assertEqual(watched["status"], "WAIT")
+        self.assertIn("pressure", watched["reason"].lower())
+
+    def test_opposing_spot_pressure_warns_cash_out(self):
+        result = review_open_position(
+            position(), book(yes_bid=51), 55, {}, 300, now=1100,
+            target_cents=10,
+            pressure={"bias": "SELLERS", "strength": "STRONG"},
+        )
+        self.assertTrue(result["actionable"])
+        self.assertGreater(result["net_cents"], 0)
+        self.assertEqual(result["status"], "CASH OUT SOON")
+
     def test_profit_target_is_net_after_fees_and_slippage(self):
         result = review_open_position(position(), book(yes_bid=55), 50, {}, 300,
                                       slippage_cents=1, target_cents=5, now=1100)
