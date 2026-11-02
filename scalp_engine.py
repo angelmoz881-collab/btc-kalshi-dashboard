@@ -82,7 +82,7 @@ def quote_trend(history, side, now=None):
 
 
 def entry_watch(snapshot, score, candle_agreement, reversal, remaining_sec,
-                history=None, stale=False, minimum_depth=5):
+                history=None, stale=False, minimum_depth=5, pressure=None):
     """Separate, experimental near-term scalp WATCH; NOT an execution order."""
     result = {"status": "WAIT", "side": None, "reason": "No verified short-horizon entry edge",
               "validated": False}
@@ -102,6 +102,12 @@ def entry_watch(snapshot, score, candle_agreement, reversal, remaining_sec,
         result["reason"] = "Momentum and completed-candle confirmation too weak"
         return result
     side = "yes" if score > 0 else "no"
+    # Spot aggressive executions can veto chasing against emerging pressure.
+    # Absence of tape never manufactures a same-side confirmation.
+    flow_side = (pressure or {}).get("bias")
+    if flow_side in ("BUYERS", "SELLERS") and flow_side != ("BUYERS" if side == "yes" else "SELLERS"):
+        result["reason"] = "BTC executed trade pressure opposes this scalp side"
+        return result
     opposing = "DOWN" if side == "yes" else "UP"
     rev = reversal or {}
     if rev.get("direction") == opposing and (_number(rev.get("score")) or 0) >= 50:
@@ -130,7 +136,7 @@ def entry_watch(snapshot, score, candle_agreement, reversal, remaining_sec,
 def review_open_position(position, snapshot, score, reversal, remaining_sec,
                          history=None, stale=False, slippage_cents=1.0,
                          target_cents=4.0, trail_cents=2.0, stop_cents=8.0,
-                         max_hold_sec=180.0, now=None):
+                         max_hold_sec=180.0, now=None, pressure=None):
     """Conservative manual cash-out warning and modeled net proceeds for FULL size.
 
     Position: ticker, side, quantity, entry_price_cents, entry_fee_cents, opened_at,
@@ -190,12 +196,15 @@ def review_open_position(position, snapshot, score, reversal, remaining_sec,
     reversal_against = rev.get("direction") == opposing and (_number(rev.get("score")) or 0) >= 50
     quote_delta = quote_trend(history, side, now)
     bid_falling = quote_delta is not None and quote_delta <= -1.0
-    warning = score_fading or directional_score <= 10 or reversal_against or bid_falling
+    pressure_against = ((pressure or {}).get("bias") == ("SELLERS" if side == "yes" else "BUYERS")
+                        and (pressure or {}).get("strength") in ("MODERATE", "STRONG"))
+    warning = score_fading or directional_score <= 10 or reversal_against or bid_falling or pressure_against
     reasons = []
     if score_fading: reasons.append("entry momentum weakening")
     if directional_score <= 10: reasons.append("directional support weak")
     if reversal_against: reasons.append("opposing reversal clues")
     if bid_falling: reasons.append(f"sell bid {quote_delta:+.1f}¢ vs recent history")
+    if pressure_against: reasons.append("opposing BTC aggressive trade pressure building")
     if not reasons: reasons.append("profit/risk thresholds monitored")
     out.update(net_cents=net, net_total_dollars=net_total / 100.0,
                exit_bid_cents=bid, best_bid_cents=exit_book["best_bid"],
@@ -214,7 +223,7 @@ def review_open_position(position, snapshot, score, reversal, remaining_sec,
     elif remain <= 75:
         status = "EXIT WINDOW CLOSING"
         reason = "Less than 75 seconds remain; no reliable time to recover before the contract closes"
-    elif net > 0 and (bid_falling or reversal_against or directional_score < 0):
+    elif net > 0 and (bid_falling or reversal_against or directional_score < 0 or pressure_against):
         status = "CASH OUT SOON"
         reason = "Positive net at visible bids but adverse early warning: " + ", ".join(reasons)
     elif net > 0 and net >= 0.6 * target and warning:
