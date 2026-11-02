@@ -36,7 +36,7 @@ def marketable_entry(snapshot, side, quantity=1):
 def paper_step(state, ticker, snapshot, watch, score, reversal, remaining_sec,
                history, stale=False, now=None, slippage_cents=1,
                target_cents=5, trail_cents=2, stop_cents=8,
-               max_hold_sec=180):
+               max_hold_sec=180, pressure=None):
     """A single deterministic research tick. Return state, event; NO real orders.
 
     Quote-derived paper buys only after two separate confirmed watches at least
@@ -57,6 +57,7 @@ def paper_step(state, ticker, snapshot, watch, score, reversal, remaining_sec,
             active, snapshot, score, reversal, remaining_sec, history=history,
             stale=stale, slippage_cents=slippage_cents, target_cents=target_cents,
             trail_cents=trail_cents, stop_cents=stop_cents, max_hold_sec=max_hold_sec, now=now,
+            pressure=pressure,
         )
         state["exit_review"] = report
         if report.get("actionable"):
