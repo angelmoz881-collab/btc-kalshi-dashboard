@@ -12,6 +12,7 @@ import streamlit as st
 from arena_core import analyze_arena
 from candle_possible import candle_possible_signal
 from buyer_seller_levels import analyze_buyer_seller_pressure
+from scalp_pressure import merge_spot_tape, spot_pressure_radar
 from kalshi_btc_discovery import discover_btc_markets, live_btc_market, HOSTS
 from kalshi_btc_strike import kalshi_btc_target, same_contract_target
 from candle_calibration import train_candle_calibrator, apply_candle_calibration
@@ -2717,6 +2718,11 @@ def _render_live_dashboard_inner():
         whale_error = None
     except (requests.RequestException, ValueError) as exc:
         whale_trades, buyer_seller_tape, whale_error = [], [], str(exc)
+    # Merge distinct Coinbase prints across refreshes (do not double count IDs).
+    spot_tape_history = merge_spot_tape(
+        st.session_state.get("scalp_spot_tape", []), buyer_seller_tape, now=time.time()
+    )
+    st.session_state["scalp_spot_tape"] = spot_tape_history
     try:
         chain_count, chain_vsize = blockchain_activity()
         chain_error = None
@@ -2754,7 +2760,13 @@ def _render_live_dashboard_inner():
     engine["candle_only_15m"] = candle_forecast
     # Separate short-horizon BTC spot radar, independent of Kalshi quote and strike.
     engine["buyer_seller_levels"] = analyze_buyer_seller_pressure(
-        candles, buyer_seller_tape, stale=(candle_feed_stale or spot_feed_stale)
+        candles, spot_tape_history, stale=(candle_feed_stale or spot_feed_stale)
+    )
+    # Independent BTC spot radar: Kalshi bids confirm but do not pick direction.
+    engine["scalp_pressure"] = spot_pressure_radar(
+        spot_tape_history, structure=engine["buyer_seller_levels"],
+        snapshot=kalshi_data, quote_history=quote_history,
+        stale=(candle_feed_stale or spot_feed_stale or whale_error is not None)
     )
 
     # A genuinely independent "POSSIBLE ABOVE/BELOW" view. Only BTC OHLCV,
@@ -2792,6 +2804,7 @@ def _render_live_dashboard_inner():
         kalshi_data, engine.get("scalp_score"), candle_engine.get("agreement"),
         reversal, engine.get("remaining_sec"), history=quote_history,
         stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
+        pressure=engine["scalp_pressure"],
     )
     # Live positions are reconstructed directly from REAL Kalshi buy/sell fills.
     # In unconnected mode, build a separate one-contract hypothetical paper
@@ -2807,7 +2820,7 @@ def _render_live_dashboard_inner():
             quote_history, stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
             slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
             trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
-            max_hold_sec=scalp_max_hold,
+            max_hold_sec=scalp_max_hold, pressure=engine["scalp_pressure"],
         )
         st.session_state["auto_paper_scalp"] = auto_paper_state
         scalp_position = auto_paper_state.get("position")
@@ -2831,7 +2844,7 @@ def _render_live_dashboard_inner():
             stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
             slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
             trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
-            max_hold_sec=scalp_max_hold,
+            max_hold_sec=scalp_max_hold, pressure=engine["scalp_pressure"],
         )
         if scalp_exit.get("actionable") and is_live_position:
             st.session_state["scalp_live_peak"] = scalp_exit["peak_net_cents"]
@@ -3345,6 +3358,41 @@ def _render_live_dashboard_inner():
         st.caption("Auto-entry watch and early-exit guidance. Never places a real order.")
         if active_ticker:
             st.caption(f"Watching: {active_ticker}")
+        # This spot pressure radar is independent from entry/expiry decisions.
+        radar = engine.get("scalp_pressure") or {}
+        st.markdown("#### BTC buying vs. selling pressure · early radar")
+        if radar.get("bias") == "BUYERS":
+            st.success("🟢 " + radar["status"] + " · " + radar["strength"] + " observed flow")
+        elif radar.get("bias") == "SELLERS":
+            st.warning("🔴 " + radar["status"] + " · " + radar["strength"] + " observed flow")
+        else:
+            st.info("⚪ " + radar.get("status", "COLLECTING FLOW"))
+        flow_a, flow_b, flow_c = st.columns(3)
+        buy_usd, sell_usd = radar.get("buy_notional"), radar.get("sell_notional")
+        buy_share = radar.get("buy_share")
+        flow_a.metric("Aggressive BTC buys · 20s", f"${buy_usd:,.0f}" if buy_usd is not None else "—")
+        flow_b.metric("Aggressive BTC sells · 20s", f"${sell_usd:,.0f}" if sell_usd is not None else "—")
+        flow_c.metric("Buy share of observed flow", f"{buy_share:.0f}%" if buy_share is not None else "—")
+        st.caption(
+            f"{radar.get('reason', 'Waiting for trades')} · "
+            f"{radar.get('recent_count', 0)} executed BTC trades in 20s · "
+            "Capped notional reduces single-trade distortion. Buy share is NOT a probability of future buys."
+        )
+        if radar.get("acceleration") is not None:
+            st.caption(
+                f"20s vs prior 60s: flow imbalance shifted {radar['acceleration'] * 100:+.0f} percentage points"
+                + (f" · trade pace {radar['pace_ratio']:.1f}× previous" if radar.get("pace_ratio") is not None else "")
+            )
+        confirmation = radar.get("kalshi_confirmation", "PENDING")
+        if confirmation == "OPPOSING":
+            st.warning("Kalshi sell-side bids are moving against spot pressure; this is not an entry.")
+        elif confirmation == "CONFIRMING":
+            st.caption(f"Kalshi order-bid confirmation: {radar.get('quote_move_cents', 0):+.1f}¢")
+        else:
+            st.caption("Kalshi bid follow-through: " + confirmation.lower() + " · early radar is not an entry signal.")
+        st.caption("Possible next 30–90s direction is an UNVALIDATED heuristic based on past trades and candles. "
+                   "There is no reliable way to know how many traders will buy or sell next. "
+                   "ENTRY WATCH separately checks quotes, depth, spread and reversal risk.")
         if kalshi_data:
             a, b, c, d = st.columns(4)
             a.metric("YES buy", show_price(kalshi_data.get("yes_ask")))
