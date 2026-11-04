@@ -69,6 +69,7 @@ def spot_pressure_radar(tape, structure=None, snapshot=None, quote_history=None,
               "prior_count": 0, "pace_ratio": None, "kalshi_confirmation": "PENDING",
               "quote_move_cents": None, "spot_move_bps": None,
               "priced_trades": 0, "absorption_warning": False,
+              "absorbed_side": None,
               "horizon": "next 30–90s (unvalidated)"}
     if stale:
         result.update(status="DATA STALE", reason="BTC trade or candle feed unavailable")
@@ -143,7 +144,7 @@ def spot_pressure_radar(tape, structure=None, snapshot=None, quote_history=None,
                   and abs(current) >= .35 and price_move * sign <= -1.5)
     if divergence:
         result.update(status="FLOW/PRICE DIVERGENCE · WAIT",
-                      absorption_warning=True,
+                      absorption_warning=True, absorbed_side=direction,
                       reason="Aggressive " + ("buying" if sign > 0 else "selling") +
                              " dominates, but BTC trade prices move the opposite way; possible absorption")
     elif abs(current) < .20:
