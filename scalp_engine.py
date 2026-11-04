@@ -102,6 +102,11 @@ def entry_watch(snapshot, score, candle_agreement, reversal, remaining_sec,
         result["reason"] = "Momentum and completed-candle confirmation too weak"
         return result
     side = "yes" if score > 0 else "no"
+    # Divergent execution prices or conflicting price structure override a
+    # momentum-only watch. Missing tape data is never treated as confirmation.
+    if (pressure or {}).get("status") in ("FLOW/PRICE DIVERGENCE · WAIT", "CONFLICT · WAIT"):
+        result["reason"] = "BTC spot flow/price divergence or structural conflict; wait for resolution"
+        return result
     # Spot aggressive executions can veto chasing against emerging pressure.
     # Absence of tape never manufactures a same-side confirmation.
     flow_side = (pressure or {}).get("bias")
@@ -196,15 +201,18 @@ def review_open_position(position, snapshot, score, reversal, remaining_sec,
     reversal_against = rev.get("direction") == opposing and (_number(rev.get("score")) or 0) >= 50
     quote_delta = quote_trend(history, side, now)
     bid_falling = quote_delta is not None and quote_delta <= -1.0
-    pressure_against = ((pressure or {}).get("bias") == ("SELLERS" if side == "yes" else "BUYERS")
-                        and (pressure or {}).get("strength") in ("MODERATE", "STRONG"))
+    pressure_against = (((pressure or {}).get("bias") == ("SELLERS" if side == "yes" else "BUYERS")
+                         and (pressure or {}).get("strength") in ("MODERATE", "STRONG"))
+                        or ((pressure or {}).get("absorption_warning") is True
+                            and (pressure or {}).get("absorbed_side") ==
+                            ("BUYERS" if side == "yes" else "SELLERS")))
     warning = score_fading or directional_score <= 10 or reversal_against or bid_falling or pressure_against
     reasons = []
     if score_fading: reasons.append("entry momentum weakening")
     if directional_score <= 10: reasons.append("directional support weak")
     if reversal_against: reasons.append("opposing reversal clues")
     if bid_falling: reasons.append(f"sell bid {quote_delta:+.1f}¢ vs recent history")
-    if pressure_against: reasons.append("opposing BTC aggressive trade pressure building")
+    if pressure_against: reasons.append("opposing or absorbed BTC aggressive trade pressure")
     if not reasons: reasons.append("profit/risk thresholds monitored")
     out.update(net_cents=net, net_total_dollars=net_total / 100.0,
                exit_bid_cents=bid, best_bid_cents=exit_book["best_bid"],

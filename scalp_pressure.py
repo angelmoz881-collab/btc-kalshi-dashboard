@@ -38,8 +38,19 @@ def merge_spot_tape(previous, incoming, now=None, keep_seconds=100):
                 not 0 <= now - when <= keep_seconds or
                 not math.isfinite(amount) or amount <= 0):
             continue
+        # Keep the execution price for tape/price divergence. Older callers may
+        # omit it; never substitute the latest spot quote for historical prints.
+        try:
+            px = float(row.get("price"))
+            if not math.isfinite(px) or px <= 0:
+                px = None
+        except (TypeError, ValueError, OverflowError):
+            px = None
+        previous_price = unique.get(trade_id, {}).get("price")
         unique[trade_id] = {"id": trade_id, "aggressor": side,
                             "notional": amount, "time": row["time"]}
+        if px is not None or previous_price is not None:
+            unique[trade_id]["price"] = px if px is not None else previous_price
     return sorted(unique.values(), key=lambda r: _timestamp(r["time"]))[-2500:]
 
 
@@ -56,7 +67,10 @@ def spot_pressure_radar(tape, structure=None, snapshot=None, quote_history=None,
               "imbalance": None, "previous_imbalance": None, "acceleration": None,
               "buy_notional": None, "sell_notional": None, "recent_count": 0,
               "prior_count": 0, "pace_ratio": None, "kalshi_confirmation": "PENDING",
-              "quote_move_cents": None, "horizon": "next 30–90s (unvalidated)"}
+              "quote_move_cents": None, "spot_move_bps": None,
+              "priced_trades": 0, "absorption_warning": False,
+              "absorbed_side": None,
+              "horizon": "next 30–90s (unvalidated)"}
     if stale:
         result.update(status="DATA STALE", reason="BTC trade or candle feed unavailable")
         return result
@@ -70,7 +84,13 @@ def spot_pressure_radar(tape, structure=None, snapshot=None, quote_history=None,
         except (TypeError, ValueError):
             continue
         if when is not None and 0 <= now - when <= 80 and math.isfinite(amount) and amount > 0:
-            rows.append((now - when, str(r["aggressor"]), amount))
+            try:
+                price = float(r.get("price"))
+                if not math.isfinite(price) or price <= 0:
+                    price = None
+            except (TypeError, ValueError, OverflowError):
+                price = None
+            rows.append((now - when, str(r["aggressor"]), amount, price))
     recent = [r for r in rows if r[0] <= 20]
     prior = [r for r in rows if 20 < r[0] <= 80]
     result["recent_count"], result["prior_count"] = len(recent), len(prior)
@@ -93,6 +113,16 @@ def spot_pressure_radar(tape, structure=None, snapshot=None, quote_history=None,
     result.update(buy_notional=buy, sell_notional=sell, imbalance=current,
                   buy_share=100 * buy / (buy + sell), previous_imbalance=previous,
                   acceleration=delta, pace_ratio=pace)
+    # Executed flow alone cannot tell whether aggressive buyers actually moved
+    # BTC higher. Compare *same-window* exchange trade prices, not delayed 1m
+    # candles or Kalshi YES/NO quotes. Require enough time coverage and prints.
+    priced = sorted((r for r in recent if r[3] is not None),
+                    key=lambda r: r[0], reverse=True)
+    result["priced_trades"] = len(priced)
+    if len(priced) >= 12 and priced[0][0] - priced[-1][0] >= 8:
+        oldest = sum(r[3] for r in priced[:3]) / 3
+        newest = sum(r[3] for r in priced[-3:]) / 3
+        result["spot_move_bps"] = 10000 * (newest / oldest - 1)
     structural = None
     if isinstance(structure, dict) and structure.get("status") != "UNAVAILABLE":
         try:
@@ -106,7 +136,18 @@ def spot_pressure_radar(tape, structure=None, snapshot=None, quote_history=None,
     aligned = structural is not None and structural * sign >= .25
     conflicted = structural is not None and structural * sign <= -.40
     advancing = delta is not None and delta * sign >= .12
-    if abs(current) < .20:
+    # Strong market buying into a falling trade price (or selling into a
+    # rising one) may indicate absorption, not directional control. This is a
+    # risk veto, NOT proof that a reversal or hidden order is present.
+    price_move = result["spot_move_bps"]
+    divergence = (price_move is not None and len(priced) >= 20
+                  and abs(current) >= .35 and price_move * sign <= -1.5)
+    if divergence:
+        result.update(status="FLOW/PRICE DIVERGENCE · WAIT",
+                      absorption_warning=True, absorbed_side=direction,
+                      reason="Aggressive " + ("buying" if sign > 0 else "selling") +
+                             " dominates, but BTC trade prices move the opposite way; possible absorption")
+    elif abs(current) < .20:
         result.update(status="MIXED FLOW", reason="Executed buy/sell pressure is close to balanced")
     elif conflicted:
         result.update(status="CONFLICT · WAIT", reason="Spot executions oppose closed-candle structure")

@@ -91,4 +91,8 @@ def test_tradingview_widget_uses_official_embed_not_scraped_prices():
     source = (root / "gold_tradingview.py").read_text(encoding="utf-8")
     assert "OANDA:XAUUSD" in source
     assert "external-embedding/embed-widget-advanced-chart.js" in source
-    assert "import requests" not in source
+    # A separate Gold-API display quote may use requests. What must remain
+    # forbidden is scraping TradingView quotes for the model or chart widget.
+    assert 'requests.get("https://www.tradingview.com' not in source
+    assert 'requests.get("https://s3.tradingview.com' not in source
+    assert "Not the Pyth/Kalshi settlement feed" in source
