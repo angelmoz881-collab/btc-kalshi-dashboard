@@ -6,9 +6,12 @@ from scalp_pressure import merge_spot_tape, spot_pressure_radar
 NOW = 1_800_000_000.0
 
 
-def trade(n, age, side, notional=100.0):
-    return {"id": str(n), "aggressor": side, "notional": notional,
-            "time": datetime.fromtimestamp(NOW - age, timezone.utc).isoformat()}
+def trade(n, age, side, notional=100.0, price=None):
+    row = {"id": str(n), "aggressor": side, "notional": notional,
+           "time": datetime.fromtimestamp(NOW - age, timezone.utc).isoformat()}
+    if price is not None:
+        row["price"] = price
+    return row
 
 
 class ScalpPressureTests(unittest.TestCase):
@@ -17,6 +20,46 @@ class ScalpPressureTests(unittest.TestCase):
                 trade(4, -3, "buy")]
         result = merge_spot_tape([trade(1, 2, "buy")], data, now=NOW)
         self.assertEqual([r["id"] for r in result], ["2", "1"])
+
+    def test_execution_price_is_preserved_across_cached_replays(self):
+        original = trade(42, 3, "buy", price=123.45)
+        without_price = trade(42, 3, "buy")
+        merged = merge_spot_tape([original], [without_price], now=NOW)
+        self.assertEqual(merged[0]["price"], 123.45)
+
+    def test_heavy_buying_with_falling_execution_price_is_not_bullish(self):
+        tape = [trade(i, i * .5, "buy", price=100.0 + i * .008)
+                for i in range(35)]
+        result = spot_pressure_radar(tape, now=NOW)
+        self.assertEqual(result["status"], "FLOW/PRICE DIVERGENCE · WAIT")
+        self.assertEqual(result["bias"], "UNCLEAR")
+        self.assertTrue(result["absorption_warning"])
+        self.assertEqual(result["absorbed_side"], "BUYERS")
+        self.assertLess(result["spot_move_bps"], -1.5)
+
+    def test_heavy_selling_with_rising_execution_price_is_not_bearish(self):
+        tape = [trade(i, i * .5, "sell", price=100.0 - i * .008)
+                for i in range(35)]
+        result = spot_pressure_radar(tape, now=NOW)
+        self.assertEqual(result["status"], "FLOW/PRICE DIVERGENCE · WAIT")
+        self.assertEqual(result["bias"], "UNCLEAR")
+        self.assertEqual(result["absorbed_side"], "SELLERS")
+        self.assertGreater(result["spot_move_bps"], 1.5)
+
+    def test_buying_with_rising_trade_price_remains_observed_buy_pressure(self):
+        tape = [trade(i, i * .5, "buy", price=100.0 - i * .008)
+                for i in range(35)]
+        result = spot_pressure_radar(tape, now=NOW)
+        self.assertEqual(result["bias"], "BUYERS")
+        self.assertFalse(result["absorption_warning"])
+        self.assertGreater(result["spot_move_bps"], 1.5)
+
+    def test_no_divergence_without_sufficient_price_history(self):
+        tape = [trade(i, i * .4, "buy", price=100.0 + i * .01 if i < 3 else None)
+                for i in range(35)]
+        result = spot_pressure_radar(tape, now=NOW)
+        self.assertIsNone(result["spot_move_bps"])
+        self.assertFalse(result["absorption_warning"])
 
     def test_strong_buy_pressure_without_kalshi_confirmation(self):
         tape = [trade(i, i * .55, "buy") for i in range(35)] + [
