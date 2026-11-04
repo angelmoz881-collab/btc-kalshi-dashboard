@@ -2501,6 +2501,7 @@ def _render_live_dashboard_inner():
                         "aggressor": aggressor, "notional": notional,
                         "id": str(t.get("trade_id") or ""),
                         "time": str(t.get("time") or ""),
+                        "price": px,
                     })
             except (KeyError, ValueError, TypeError):
                 pass
@@ -3366,7 +3367,10 @@ def _render_live_dashboard_inner():
         elif radar.get("bias") == "SELLERS":
             st.warning("🔴 " + radar["status"] + " · " + radar["strength"] + " observed flow")
         else:
-            st.info("⚪ " + radar.get("status", "COLLECTING FLOW"))
+            if radar.get("absorption_warning"):
+                st.warning("⚠️ " + radar.get("status", "FLOW/PRICE DIVERGENCE · WAIT"))
+            else:
+                st.info("⚪ " + radar.get("status", "COLLECTING FLOW"))
         flow_a, flow_b, flow_c = st.columns(3)
         buy_usd, sell_usd = radar.get("buy_notional"), radar.get("sell_notional")
         buy_share = radar.get("buy_share")
@@ -3382,6 +3386,12 @@ def _render_live_dashboard_inner():
             st.caption(
                 f"20s vs prior 60s: flow imbalance shifted {radar['acceleration'] * 100:+.0f} percentage points"
                 + (f" · trade pace {radar['pace_ratio']:.1f}× previous" if radar.get("pace_ratio") is not None else "")
+            )
+        if radar.get("spot_move_bps") is not None:
+            st.caption(
+                f"BTC execution-price change over the recent tape: {radar['spot_move_bps']:+.2f} bps "
+                f"({radar.get('priced_trades', 0)} priced trades). "
+                "Opposite price movement during heavy aggressive flow can indicate absorption."
             )
         confirmation = radar.get("kalshi_confirmation", "PENDING")
         if confirmation == "OPPOSING":
