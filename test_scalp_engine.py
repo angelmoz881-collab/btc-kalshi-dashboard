@@ -79,6 +79,27 @@ class TestScalpEngine(unittest.TestCase):
         self.assertEqual(watched["status"], "WAIT")
         self.assertIn("pressure", watched["reason"].lower())
 
+    def test_spot_flow_price_divergence_blocks_entry_watch(self):
+        watched = entry_watch(
+            book(), 60, .80, {}, 400,
+            pressure={"status": "FLOW/PRICE DIVERGENCE · WAIT", "bias": "UNCLEAR",
+                      "absorption_warning": True, "absorbed_side": "BUYERS"},
+        )
+        self.assertEqual(watched["status"], "WAIT")
+        self.assertIn("divergence", watched["reason"].lower())
+
+    def test_absorbed_buy_flow_warns_existing_yes_position(self):
+        result = review_open_position(
+            position(), book(yes_bid=51), 55, {}, 300, now=1100,
+            target_cents=10,
+            pressure={"status": "FLOW/PRICE DIVERGENCE · WAIT",
+                      "bias": "UNCLEAR", "absorption_warning": True,
+                      "absorbed_side": "BUYERS"},
+        )
+        self.assertTrue(result["actionable"])
+        self.assertGreater(result["net_cents"], 0)
+        self.assertEqual(result["status"], "CASH OUT SOON")
+
     def test_opposing_spot_pressure_warns_cash_out(self):
         result = review_open_position(
             position(), book(yes_bid=51), 55, {}, 300, now=1100,
