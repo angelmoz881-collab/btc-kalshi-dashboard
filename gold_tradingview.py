@@ -58,6 +58,7 @@ def render_tradingview_gold():
     render_spot_quote_panel()
     st.caption(
         "OANDA:XAUUSD spot gold · TradingView-hosted visual chart. "
+        "Automatic TradingView pivot support/resistance levels are enabled. "
         "Select 1m / 5m / 15m / Daily / Weekly inside the chart. "
         "This is NOT the Kalshi/Pyth settlement feed and is NOT used to calculate trades."
     )
@@ -79,6 +80,9 @@ def render_tradingview_gold():
         "save_image": False,
         "calendar": False,
         "withdateranges": True,
+        # TradingView computes these pivot S/R levels from OANDA spot data;
+        # they are not reused as Kalshi/Pyth execution levels.
+        "studies": ["PivotPointsStandard@tv-basicstudies"],
         "support_host": "https://www.tradingview.com",
     }
     html = (
