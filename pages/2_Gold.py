@@ -75,7 +75,7 @@ _replace_once(
     }), height=280, use_container_width=True)
     st.caption("Pyth XAU/USD is used for current strike distance when authenticated. If unavailable, GC=F is shown only as a temporary research proxy; DEMO/LIVE auto-orders remain blocked.")
 ''',
-'''    with st.expander("Pyth/Kalshi analysis chart · strike and support/resistance zones", expanded=False):
+'''    with st.expander("Pyth/Kalshi analysis chart · strike and support/resistance lines", expanded=True):
         from gold_trader_chart import render_gold_trader_chart
         render_gold_trader_chart(
             candles,
