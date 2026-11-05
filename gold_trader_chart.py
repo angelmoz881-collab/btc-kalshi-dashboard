@@ -25,6 +25,59 @@ def _unix_seconds(value):
         return None
 
 
+def _support_resistance_lines(bars, zones, max_per_side=2):
+    """Same-source chart levels from historical zones and confirmed swing points.
+
+    The most recent bar can still be forming; it is excluded from pivot tests.
+    Levels are descriptive reference prices, not guaranteed reversals.
+    """
+    if len(bars) < 7:
+        return []
+    last = float(bars[-1]["close"])
+    candidates = []
+    for zone in (zones or []):
+        kind = str(zone.get("kind", "")).upper()
+        low, high = _safe_float(zone.get("low")), _safe_float(zone.get("high"))
+        if kind not in ("SUPPORT", "RESISTANCE") or low is None or high is None or low > high:
+            continue
+        candidates.append((kind, (low + high) / 2, "zone"))
+
+    closed = bars[:-1]
+    for i in range(2, len(closed) - 2):
+        bar = closed[i]
+        neighbors = closed[i - 2:i] + closed[i + 1:i + 3]
+        if all(bar["low"] < other["low"] for other in neighbors):
+            candidates.append(("SUPPORT", float(bar["low"]), "pivot"))
+        if all(bar["high"] > other["high"] for other in neighbors):
+            candidates.append(("RESISTANCE", float(bar["high"]), "pivot"))
+
+    # Completed recent-bar extrema supply a fallback when few pivots exist.
+    recent = closed[-60:]
+    if recent:
+        candidates.extend([
+            ("SUPPORT", min(float(b["low"]) for b in recent), "range"),
+            ("RESISTANCE", max(float(b["high"]) for b in recent), "range"),
+        ])
+
+    tolerance = max(0.15, last * 0.00006)
+    selected = []
+    for kind, prefix in (("SUPPORT", "S"), ("RESISTANCE", "R")):
+        side = [(price, origin) for k, price, origin in candidates
+                if k == kind and math.isfinite(price)
+                and (price < last if kind == "SUPPORT" else price > last)]
+        side.sort(key=lambda item: (abs(item[0] - last), 0 if item[1] == "zone" else 1))
+        unique = []
+        for price, origin in side:
+            if all(abs(price - earlier[0]) >= tolerance for earlier in unique):
+                unique.append((price, origin))
+            if len(unique) >= max_per_side:
+                break
+        for index, (price, origin) in enumerate(unique, 1):
+            selected.append({"kind": kind, "label": f"{prefix}{index}",
+                             "price": round(price, 2), "origin": origin})
+    return selected
+
+
 def render_gold_expiry_timer(expiry, ticker="gold"):
     """Browser-clocked Kalshi countdown that does not depend on Streamlit rerun cadence."""
     expiry_ts = _unix_seconds(expiry)
@@ -135,6 +188,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
     # Lightweight Charts v4 expects chronologically ordered, unique marker times.
     marker_points = list({m["time"]: m for m in marker_points}.values())
     marker_points.sort(key=lambda m: m["time"])
+    sr_lines = _support_resistance_lines(bars, (structure or {}).get("zones", []))
     payload = json.dumps({
         "bars": bars,
         "overlays": overlays,
@@ -145,6 +199,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
         "ticker": str(ticker or "KXGOLD15M"),
         "timeframe": timeframe,
         "zones": (structure or {}).get("zones", []),
+        "sr_lines": sr_lines,
         "markers": marker_points,
     }, allow_nan=False)
 
@@ -164,7 +219,7 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
       font-size:10px;font-weight:700;line-height:12px;padding-left:4px;opacity:.85;white-space:nowrap}
     .zone-band.support{border-color:#20a67e;background:rgba(20,150,100,.12);color:#78e8c1}
     .zone-band.resistance{border-color:#d19a35;background:rgba(211,154,53,.12);color:#f4cd70}
-    @media(max-width:650px){#frame,#chart{height:340px}.zone-band{font-size:9px}}
+    @media(max-width:650px){#frame,#chart{height:400px}.zone-band{font-size:9px}}
 
     </style></head><body>
     <div id="frame"><button id="reset-view" type="button">Reset view</button><div id="status">GOLD · 1M · __TICKER__</div><div id="chart"></div><div id="zone-bands"></div><div id="error"></div></div>
@@ -223,6 +278,17 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
       if(Number.isFinite(data.reference)){
         main.createPriceLine({price:data.reference,color:'#60a5fa',lineWidth:1,lineStyle:LC.LineStyle.Dotted,axisLabelVisible:true,title:'PYTH XAU'});
       }
+      // Price-scale support/resistance lines reappear on each refresh and
+      // track the candles during pan and pinch zoom.
+      data.sr_lines.forEach(level=>{
+        if(!Number.isFinite(level.price))return;
+        const support=level.kind==='SUPPORT';
+        main.createPriceLine({
+          price:level.price,color:support?'#22c55e':'#f59e0b',
+          lineWidth:level.label.endsWith('1')?2:1,
+          lineStyle:LC.LineStyle.Dashed,axisLabelVisible:true,title:level.label
+        });
+      });
       data.overlays.forEach(o=>{
         const s=chart.addLineSeries({color:o.color,lineWidth:1,lastValueVisible:false,priceLineVisible:false});
         s.setData(o.points);
@@ -293,9 +359,16 @@ def render_gold_trader_chart(candles, strike=None, current_ref=None, ticker=None
     }catch(e){error.style.display='block';error.textContent='Chart error: '+e.message;}
     </script></body></html>"""
     chart_html = chart_html.replace("__PAYLOAD__", payload).replace("__TICKER__", str(ticker or "KXGOLD15M"))
-    components.html(chart_html, height=308, scrolling=False)
+    components.html(chart_html, height=425, scrolling=False)
 
     latest_close = float(bars[-1]["close"])
+    supports = ", ".join(f"{v['label']} USD {v['price']:,.2f}" for v in sr_lines if v["kind"] == "SUPPORT")
+    resistances = ", ".join(f"{v['label']} USD {v['price']:,.2f}" for v in sr_lines if v["kind"] == "RESISTANCE")
+    st.caption(
+        f"🟢 Support: {supports or 'No level below price'}"
+        f"  ·  🟠 Resistance: {resistances or 'No level above price'}"
+        "  ·  Historical same-source levels, not guaranteed reversals."
+    )
     if strike_value is not None and is_pyth_history:
         side = "ABOVE" if latest_close >= strike_value else "BELOW"
         ref_text = ""
