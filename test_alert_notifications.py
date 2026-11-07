@@ -1,9 +1,8 @@
 """Regression tests for optional notifications; no external network calls."""
 import unittest
 
-import requests
 
-from alert_notifications import build_signal_alerts, pick_new_alert, send_telegram_message
+from alert_notifications import build_signal_alerts, pick_new_alert
 
 
 class NotificationTests(unittest.TestCase):
@@ -84,23 +83,17 @@ class NotificationTests(unittest.TestCase):
         second, _ = pick_new_alert(exit_events, state, now=101)
         self.assertEqual(second["title"], "STOP LOSS REVIEW")
 
-    def test_telegram_success_and_failure_no_raw_error(self):
-        requests_seen = []
-        class OK:
-            def raise_for_status(self):
-                return None
-            def json(self):
-                return {"ok": True}
-        def fake_post(url, data, timeout):
-            requests_seen.append((url, data, timeout))
-            return OK()
-        self.assertTrue(send_telegram_message("bot-key", "chat123", "signal", post=fake_post))
-        self.assertEqual(requests_seen[0][1]["chat_id"], "chat123")
-        self.assertEqual(requests_seen[0][2], 3)
-        def failing_post(url, data, timeout):
-            raise requests.RequestException("invalid credentials")
-        # The caller treats network errors as generic failures without printing secrets.
-        self.assertFalse(send_telegram_message("bot-key", "chat123", "signal", post=failing_post))
+    def test_notifications_never_need_a_phone_connector(self):
+        import inspect
+        import alert_notifications
+        source = inspect.getsource(alert_notifications)
+        self.assertNotIn("telegram", source.lower())
+        self.assertNotIn("requests.post", source)
+        alerts = build_signal_alerts("TEST", pressure={
+            "status": "BUYING PRESSURE BUILDING", "strength": "STRONG"
+        })
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["title"], "BUYERS PRESSURE BUILDING")
 
 
 if __name__ == "__main__":
