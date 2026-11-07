@@ -1,6 +1,8 @@
 """Regression tests for optional notifications; no external network calls."""
 import unittest
 
+import requests
+
 from alert_notifications import build_signal_alerts, pick_new_alert, send_telegram_message
 
 
@@ -45,7 +47,7 @@ class NotificationTests(unittest.TestCase):
             reversal={"status": "POSSIBLE REVERSAL DOWN", "direction": "DOWN", "score": 60},
         )
         self.assertEqual({x["kind"] for x in alerts}, {"pressure", "reversal"})
-        self.assertIn("Possible", alerts[0]["detail"])
+        self.assertIn("Strong buys", alerts[0]["detail"])
         self.assertIn("Not a guaranteed turn", alerts[1]["detail"])
 
     def test_one_alert_per_episode_and_rearm_after_disappearance(self):
@@ -96,10 +98,9 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(requests_seen[0][1]["chat_id"], "chat123")
         self.assertEqual(requests_seen[0][2], 3)
         def failing_post(url, data, timeout):
-            raise RuntimeError("invalid credentials")
-        # Unexpected failures must never leak a secret through Streamlit; caller
-        # treats all transport failures as a generic delivery error.
-        self.assertFalse(send_telegram_message("", "chat123", "signal", post=failing_post))
+            raise requests.RequestException("invalid credentials")
+        # The caller treats network errors as generic failures without printing secrets.
+        self.assertFalse(send_telegram_message("bot-key", "chat123", "signal", post=failing_post))
 
 
 if __name__ == "__main__":
