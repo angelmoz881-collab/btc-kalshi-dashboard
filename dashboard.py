@@ -18,7 +18,7 @@ from kalshi_btc_strike import kalshi_btc_target, same_contract_target
 from candle_calibration import train_candle_calibrator, apply_candle_calibration
 from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_position
 from auto_scalp import paper_step, marketable_entry
-from alert_notifications import build_signal_alerts, pick_new_alert, send_telegram_message
+from alert_notifications import build_signal_alerts, pick_new_alert
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
 import json
 import html
@@ -2308,47 +2308,15 @@ with st.sidebar:
                    "KALSHI_READ_PRIVATE_KEY and SCALP_VIEW_PASSWORD in Streamlit Secrets.")
     st.caption("Signals and automatic SIMULATED tracking work without a Kalshi key.")
     st.markdown("---")
-    with st.expander("🔔 Alerts · phone and in-app", expanded=False):
-        alerts_in_app = st.checkbox("In-app popup alerts", value=True, key="alerts_in_app")
+    with st.expander("🔔 In-app signal alerts", expanded=False):
+        alerts_in_app = st.checkbox("Show popup and status alerts", value=True, key="alerts_in_app")
         alerts_exit = st.checkbox("Cash-out / stop-loss / liquidity", value=True, key="alerts_exit")
         alerts_entry = st.checkbox("Scalp entry watches", value=True, key="alerts_entry")
         alerts_market = st.checkbox("Strong BTC pressure / reversals", value=True, key="alerts_market")
-        if st.button("Test popup alert", key="test_popup_alert"):
-            st.toast("🔔 Test alert · popups are working", icon="🔔")
-        _telegram_token = _secret("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-        _telegram_chat = _secret("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
-        _telegram_guard = _secret("ALERTS_PASSWORD") or os.environ.get("ALERTS_PASSWORD")
-        _telegram_ready = bool(_telegram_token and _telegram_chat and _telegram_guard)
-        alerts_phone = False
-        if _telegram_ready:
-            _telegram_password_input = st.text_input(
-                "Unlock Telegram phone alerts", type="password",
-                key="telegram_unlock_password",
-                help="Required because the dashboard might be publicly accessible."
-            )
-            _telegram_unlocked = bool(_telegram_password_input) and hmac.compare_digest(
-                str(_telegram_password_input), str(_telegram_guard)
-            )
-            if _telegram_unlocked:
-                alerts_phone = st.checkbox("Send phone alerts through Telegram", value=False,
-                                           key="alerts_phone")
-                if st.button("Send test Telegram alert", key="test_telegram_alert"):
-                    _sent = send_telegram_message(
-                        _telegram_token, _telegram_chat,
-                        "🔔 BTC/Kalshi test alert: Telegram notifications are connected. "
-                        "No trade was placed."
-                    )
-                    if _sent:
-                        st.success("Test sent. Check your Telegram chat.")
-                    else:
-                        st.error("Telegram delivery failed. Check your chat ID, bot token, and /start message.")
-            else:
-                st.caption("Enter your alert password to enable phone delivery.")
-        else:
-            st.caption("Telegram optional: configure TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID "
-                       "and ALERTS_PASSWORD in Streamlit Secrets (see ALERTS_SETUP.md).")
-        st.caption("Alerts run only while the BTC dashboard is open and actively refreshing. "
-                   "They do not run in the background when Streamlit is asleep or the app is closed.")
+        if st.button("Test in-app alert", key="test_popup_alert"):
+            st.toast("🔔 Test alert · in-app notifications are working", icon="🔔")
+        st.caption("Alerts appear in the app while this dashboard is open and updating. "
+                   "No Telegram, phone setup, or external messages required.")
     st.caption("Exit fees are estimates until verified. No trades are automatically placed.")
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
 
@@ -2914,23 +2882,26 @@ def _render_live_dashboard_inner():
     if alerts_market:
         _enabled_kinds.update(("pressure", "reversal"))
     _alert_events = [item for item in _alert_events if item["kind"] in _enabled_kinds]
-    if alerts_in_app or alerts_phone:
+    if alerts_in_app:
         _fresh_alert, _alert_state = pick_new_alert(
             _alert_events, st.session_state.get("signal_alert_history")
         )
         st.session_state["signal_alert_history"] = _alert_state
         if _fresh_alert:
-            if alerts_in_app:
-                st.toast(_fresh_alert["title"] + " · " + _fresh_alert["source"],
-                         icon=_fresh_alert["icon"])
-            if alerts_phone:
-                _delivered = send_telegram_message(
-                    _telegram_token, _telegram_chat, _fresh_alert["message"]
-                )
-                if not _delivered:
-                    st.toast("Telegram delivery failed; review 🔔 Alerts setup.", icon="⚠️")
+            # Same short Streamlit popup style as the existing Scalp warnings.
+            st.toast(
+                _fresh_alert["title"] + " · " + _fresh_alert["source"],
+                icon=_fresh_alert["icon"],
+            )
+            _log = list(st.session_state.get("signal_alert_log", []))
+            _log.append({
+                "at": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+                "ticker": _fresh_alert["ticker"],
+                "title": _fresh_alert["title"],
+                "source": _fresh_alert["source"],
+            })
+            st.session_state["signal_alert_log"] = _log[-20:]
     else:
-        # Do not queue a catch-up flood while alerts are turned off.
         st.session_state.pop("signal_alert_history", None)
 
     # Automatically journal one snapshot in each time bucket (max six per market).
@@ -2948,6 +2919,41 @@ def _render_live_dashboard_inner():
         key="dashboard_section_compact",
     )
 
+
+    # One compact headline visible above every BTC tab; the full analysis
+    # remains below, unchanged. Only existing confirmed/watch statuses appear.
+    if alerts_in_app:
+        if _alert_events:
+            _headline = _alert_events[0]
+            _headline_text = (
+                _headline["icon"] + " " + _headline["title"]
+                + " · " + _headline["source"]
+            )
+            if _headline["kind"] == "exit":
+                if _headline["title"] in ("STOP LOSS REVIEW", "LIQUIDITY WARNING", "DATA STALE"):
+                    st.error(_headline_text)
+                else:
+                    st.warning(_headline_text)
+            elif _headline["kind"] == "entry":
+                st.success(_headline_text + " · research watch only")
+            else:
+                st.warning(_headline_text + " · market warning, not a trade")
+            # Keep the signal short so mobile users can react without reading
+            # dozens of indicators; expansion remains optional.
+            if len(_alert_events) > 1:
+                st.caption("Also: " + " · ".join(a["title"] for a in _alert_events[1:3]))
+        else:
+            st.caption("🔔 No new entry, pressure, reversal or position warnings.")
+        _recent_for_contract = [
+            item for item in st.session_state.get("signal_alert_log", [])
+            if item.get("ticker") == active_ticker
+        ]
+        if _recent_for_contract:
+            with st.expander("🔔 Recent signal alerts", expanded=False):
+                for item in reversed(_recent_for_contract[-6:]):
+                    st.caption(
+                        item["at"] + " · " + item["title"] + " · " + item["source"]
+                    )
 
     if selected_page == "📈 CHART":
         if scalp_exit:
