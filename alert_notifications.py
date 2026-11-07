@@ -1,15 +1,12 @@
-"""Small, opt-in alerts for existing BTC/Kalshi research signals.
+"""In-app alerts for existing BTC/Kalshi research signals.
 
-This module does NOT create signals, place orders, or watch the market on its
-own. Dashboard polling must be running for alerts to be evaluated/sent.
+This module does NOT create trading signals, place orders or run a background
+monitor. The Streamlit dashboard must be open and polling to show alerts.
 """
 from __future__ import annotations
 
 import math
 import time
-
-import requests
-
 
 EXIT_ALERTS = {
     "TAKE PROFIT": ("💰", 0),
@@ -153,22 +150,3 @@ def pick_new_alert(events, state=None, now=None, global_gap_sec=12):
                       "global_last": global_last}
 
 
-def send_telegram_message(bot_token, chat_id, message, post=None):
-    """Best-effort Telegram delivery. NEVER return/log credentials or raw URLs."""
-    if not bot_token or not chat_id or not message:
-        return False
-    sender = post or requests.post
-    try:
-        response = sender(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data={"chat_id": str(chat_id), "text": str(message)[:4096],
-                  "disable_web_page_preview": "true"},
-            timeout=3,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return isinstance(payload, dict) and payload.get("ok") is True
-    except (requests.RequestException, ValueError, TypeError):
-        # Some HTTP errors contain the Bot API URL (and thus the secret token).
-        # Swallow them rather than surfacing raw exception details in the app.
-        return False
