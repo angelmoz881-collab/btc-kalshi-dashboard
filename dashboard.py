@@ -934,8 +934,8 @@ def _weighted_quantile(values, weights, q):
 def empirical_analog_probability(history, current_price, strike, remaining_min):
     """Nearest-regime empirical probability of finishing above the strike.
 
-    We compare the current 5m/15m momentum, realized volatility and EMA gap with
-    prior minutes, then inspect what BTC did over the same remaining horizon.
+    Inputs are native 15-minute BTC candles. Compare the current 5/15-bar
+    momentum, realized volatility and EMA gap with prior 15-minute regimes.
     This is intentionally non-parametric and returns its effective sample size.
     """
     if history is None or len(history) < 240 or strike is None or current_price <= 0:
@@ -1937,7 +1937,8 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     reasons = []
     r5 = float(c.iloc[-1]/c.iloc[-6]-1) if len(c)>=6 else 0.0
     r15 = float(c.iloc[-1]/c.iloc[-16]-1) if len(c)>=16 else 0.0
-    mom_scale = max(float(r1.tail(30).std())*math.sqrt(15), .0006)
+    # Returns are already 15-minute returns; the target horizon is one bar.
+    mom_scale = max(float(r1.tail(30).std()), .0006)
     momentum_unit = float(np.tanh((.60*r5+.40*r15)/mom_scale))
     score += 1.05*momentum_unit
     if abs(momentum_unit)>.18:
@@ -2004,7 +2005,8 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     p_up = float(np.clip(p_up,.05,.95))
 
     # Expected 15m return distribution. Prefer empirical analog quantiles; fall back to realized vol.
-    sigma15 = max(float(r1.tail(45).std())*math.sqrt(15), atr_pct*math.sqrt(15/14), .0005)
+    # One native 15-minute return is the forecast horizon.
+    sigma15 = max(float(r1.tail(45).std()), atr_pct, .0005)
     if analog and all(np.isfinite(analog[k]) for k in ("q10","q50","q90")):
         q10,q50,q90 = float(analog["q10"]),float(analog["q50"]),float(analog["q90"])
         expected_ret = float(.60*analog["q50"]+.40*((p_up-.5)*2*sigma15*.70))
