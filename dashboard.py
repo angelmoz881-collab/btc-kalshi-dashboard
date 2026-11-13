@@ -2812,7 +2812,7 @@ def _render_live_dashboard_inner():
     engine["candle_possible"] = apply_candle_calibration(
         candle_possible_signal(
             price, target_hint, engine.get("remaining_sec"),
-            candle_forecast, candle_engine, candle_stat, candle_analog,
+            candle_forecast, candle_15m_context, candle_stat, candle_analog,
             stale=(candle_feed_stale or spot_feed_stale),
         ),
         candle_calibrator,
