@@ -748,8 +748,10 @@ def get_candles(granularity=60):
         return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
     # Coinbase Exchange candles supports at most 300 buckets per request.
+    # Request the full 300-bar window at the selected candle interval.
+    interval_minutes = max(1, int(granularity) // 60)
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start = end - pd.Timedelta(minutes=299)
+    start = end - pd.Timedelta(minutes=interval_minutes * 299)
     params = {"granularity": granularity, "start": start.isoformat(), "end": end.isoformat()}
     response = HTTP.get(f"{COINBASE}/products/BTC-USD/candles",
                             params=params, headers=HEADERS, timeout=15)
@@ -762,7 +764,7 @@ def get_candles(granularity=60):
     # alternate public Advanced Trade candles feed before showing an error.
     # Kraken provides public BTC/USD minute OHLC history without credentials.
     kr = HTTP.get("https://api.kraken.com/0/public/OHLC",
-                      params={"pair": "XBTUSD", "interval": 1}, timeout=15)
+                      params={"pair": "XBTUSD", "interval": interval_minutes}, timeout=15)
     kr.raise_for_status()
     body = kr.json()
     if body.get("error"):
@@ -774,7 +776,7 @@ def get_candles(granularity=60):
     fallback = [[row[0], row[3], row[2], row[1], row[4], row[6]] for row in pairs[0]]
     df = normalize(fallback)
     if len(df) < 30:
-        raise ValueError(f"Candle feeds returned only {len(df)} distinct minutes")
+        raise ValueError(f"Candle feeds returned only {len(df)} distinct candles")
     return df.tail(300).reset_index(drop=True)
 
 
@@ -956,7 +958,8 @@ def empirical_analog_probability(history, current_price, strike, remaining_min):
     ema15 = c.ewm(span=15, adjust=False).mean()
     feat["ema_gap"] = ema5 / ema15 - 1.0
 
-    horizon = int(np.clip(round(float(remaining_min)), 1, 15))
+    # Native 15-minute bars: one forward bar is the contract horizon.
+    horizon = 1
     future_ret = c.shift(-horizon) / c - 1.0
     candidates = feat.iloc[:-horizon].copy()
     candidates["future_ret"] = future_ret.iloc[:-horizon]
@@ -992,7 +995,7 @@ def empirical_analog_probability(history, current_price, strike, remaining_min):
         "prob": float(np.clip(p, .01, .99)),
         "effective_n": eff_n,
         "se": se,
-        "horizon_min": horizon,
+        "horizon_min": horizon * 15,
         "required_return": required,
         "q10": _weighted_quantile(y, w, .10),
         "q50": _weighted_quantile(y, w, .50),
@@ -1259,13 +1262,11 @@ def parametric_strike_probability(history, current_price, strike, remaining_min)
     tail30 = lr.tail(30)
     tail120 = lr.tail(min(120, len(lr)))
     sigma = float(max(tail30.std(ddof=1), .65 * tail120.std(ddof=1), 1e-6))
-    # Drift is aggressively shrunk because minute-level BTC drift is noisy.
+    # Each observation is a native 15-minute return; keep drift and volatility
+    # on that same scale and express time-to-expiry as a fraction of one bar.
     ewma_mu = float(lr.ewm(span=20, adjust=False).mean().iloc[-1])
     mu = float(np.clip(ewma_mu * .20, -0.20*sigma, 0.20*sigma))
-    # Kalshi settles on the average BRTI during the final minute. For periods
-    # earlier than that, the average behaves roughly like a price observed near
-    # the midpoint of that final minute rather than the exact expiry tick.
-    h = max(float(remaining_min) - .50, .20)
+    h = max((float(remaining_min) - .50) / 15.0, .03)
     mean = mu * h
     sigma_h = sigma * math.sqrt(h)
     threshold = math.log(float(strike) / float(current_price))
@@ -1861,7 +1862,8 @@ def _candle_forecast_analogs(history, horizon=15):
     feat["vol_ratio"] = (v/vol_med).clip(0, 5)/5
     feat["trend30"] = ema15/ema30 - 1
 
-    horizon = int(np.clip(horizon, 5, 30))
+    # Native 15-minute bars: compare the current setup with the next 15-minute bar.
+    horizon = 1
     future_ret = c.shift(-horizon)/c - 1
     pool = feat.iloc[:-horizon].copy()
     pool["future_ret"] = future_ret.iloc[:-horizon]
@@ -1908,7 +1910,8 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     Whale trades, Kalshi order flow/prices and blockchain data are deliberately excluded.
     The output is probabilistic; confidence measures evidence agreement, not certainty.
     """
-    df = resample_ohlcv(frame, 1)
+    # Input is a native 15-minute OHLCV feed.
+    df = resample_ohlcv(frame, 15)
     if len(df) < 45:
         return {"direction":"UNCERTAIN","p_up":.5,"p_down":.5,"confidence":0.0,
                 "confidence_label":"LOW","reason":"Not enough candle history","horizon_min":15}
@@ -2395,6 +2398,11 @@ def _render_live_dashboard_inner():
     candle_feed_stale = False
     try:
         candles = get_candles(60)
+        # Separate native 15-minute feed drives BTC directional predictability.
+        candles_15m = get_candles(900)
+        if len(candles_15m) < 45:
+            raise ValueError(f"Only {len(candles_15m)} native 15-minute candles returned")
+        st.session_state["_last_good_candles_15m"] = candles_15m.copy()
         if len(candles) < 10:
             raise ValueError(f"Only {len(candles)} candles returned")
         st.session_state["_last_good_candles"] = candles.copy()
@@ -2403,6 +2411,9 @@ def _render_live_dashboard_inner():
         fallback = st.session_state.get("_last_good_candles")
         if isinstance(fallback, pd.DataFrame) and len(fallback) >= 10:
             candles = fallback.copy()
+            candles_15m = st.session_state.get("_last_good_candles_15m")
+            if not isinstance(candles_15m, pd.DataFrame) or len(candles_15m) < 45:
+                candles_15m = resample_ohlcv(candles, 15)
             candle_feed_stale = True
         else:
             st.warning("BTC feed is temporarily reconnecting. The dashboard will retry automatically.")
@@ -2765,7 +2776,14 @@ def _render_live_dashboard_inner():
 
     target_hint = extract_strike(kalshi_data)
     candle_engine = multi_timeframe_candle_intelligence(candles, target_hint)
-    candle_forecast = candle_only_15m_forecast(candles, outcome_history, candle_engine)
+    # Predictability is intentionally isolated to the native 15-minute chart.
+    candle_15m_intel = analyze_candle_timeframe(candles_15m, 15, target_hint)
+    candle_15m_context = {
+        "outcome_score": float(candle_15m_intel.get("score", 0.0)),
+        "agreement": 1.0 if candle_15m_intel.get("quality") == "HIGH" else
+                     0.65 if candle_15m_intel.get("quality") == "MEDIUM" else 0.35,
+    }
+    candle_forecast = candle_only_15m_forecast(candles_15m, candles_15m, candle_15m_context)
     hourly_forecast = hourly_price_forecast(candles, outcome_history, hours=6)
     engine = research_signals(candles, kalshi_data, whale_trades, candle_engine,
                               outcome_history, brti_proxy, proxy_samples, learning_model)
@@ -2786,10 +2804,10 @@ def _render_live_dashboard_inner():
     # In particular, DO NOT reuse engine["prob_above"], flow probabilities,
     # order-book bids, whale pressure or the multi-venue benchmark proxy here.
     candle_stat = parametric_strike_probability(
-        candles, price, target_hint, engine.get("remaining_sec", 0) / 60.0
+        candles_15m, price, target_hint, engine.get("remaining_sec", 0) / 60.0
     )
     candle_analog = empirical_analog_probability(
-        outcome_history, price, target_hint, engine.get("remaining_sec", 0) / 60.0
+        candles_15m, price, target_hint, engine.get("remaining_sec", 0) / 60.0
     )
     engine["candle_possible"] = apply_candle_calibration(
         candle_possible_signal(
