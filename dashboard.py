@@ -1813,8 +1813,8 @@ def _rsi(series, period=14):
     return out.fillna(50.0)
 
 
-def _candle_forecast_analogs(history, horizon=15):
-    """Find similar historical candle/momentum regimes and inspect the next 15m return.
+def _candle_forecast_analogs(history, horizon=60):
+    """Find similar historical candle/momentum regimes and inspect the next 60m return.
 
     This model intentionally uses BTC OHLCV only. No Kalshi price, order book, whale
     trades, blockchain flow or settlement target is allowed into these features.
@@ -1862,11 +1862,11 @@ def _candle_forecast_analogs(history, horizon=15):
     feat["vol_ratio"] = (v/vol_med).clip(0, 5)/5
     feat["trend30"] = ema15/ema30 - 1
 
-    # Native 15-minute bars: compare the current setup with the next 15-minute bar.
-    horizon = 1
-    future_ret = c.shift(-horizon)/c - 1
-    pool = feat.iloc[:-horizon].copy()
-    pool["future_ret"] = future_ret.iloc[:-horizon]
+    # Native 15-minute bars: four bars make the requested next-hour horizon.
+    horizon_bars = max(1, int(round(float(horizon) / 15.0)))
+    future_ret = c.shift(-horizon_bars)/c - 1
+    pool = feat.iloc[:-horizon_bars].copy()
+    pool["future_ret"] = future_ret.iloc[:-horizon_bars]
     pool = pool.dropna()
     current = feat.iloc[-1]
     if pool.empty or current.isna().any():
@@ -1905,7 +1905,7 @@ def _candle_forecast_analogs(history, horizon=15):
 
 
 def candle_only_15m_forecast(frame, history=None, candle_intel=None):
-    """15-minute BTC direction/range forecast using only candles, volume and price indicators.
+    """Next-hour BTC direction/range forecast using native 15-minute candles, volume and indicators.
 
     Whale trades, Kalshi order flow/prices and blockchain data are deliberately excluded.
     The output is probabilistic; confidence measures evidence agreement, not certainty.
@@ -1914,7 +1914,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     df = resample_ohlcv(frame, 15)
     if len(df) < 45:
         return {"direction":"UNCERTAIN","p_up":.5,"p_down":.5,"confidence":0.0,
-                "confidence_label":"LOW","reason":"Not enough candle history","horizon_min":15}
+                "confidence_label":"LOW","reason":"Not enough candle history","horizon_min":60}
     c = df["close"].astype(float)
     o = df["open"].astype(float)
     h = df["high"].astype(float)
@@ -1937,7 +1937,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     reasons = []
     r5 = float(c.iloc[-1]/c.iloc[-6]-1) if len(c)>=6 else 0.0
     r15 = float(c.iloc[-1]/c.iloc[-16]-1) if len(c)>=16 else 0.0
-    # Returns are already 15-minute returns; the target horizon is one bar.
+    # Returns are 15-minute bars; the target horizon is four bars (60 minutes).
     mom_scale = max(float(r1.tail(30).std()), .0006)
     momentum_unit = float(np.tanh((.60*r5+.40*r15)/mom_scale))
     score += 1.05*momentum_unit
@@ -1995,7 +1995,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     # Convert bounded evidence to a probability, then blend with historical analogs.
     heuristic_p = _logistic(1.15*score)
     analog_source = history if history is not None and len(history)>=300 else df
-    analog = _candle_forecast_analogs(analog_source,15)
+    analog = _candle_forecast_analogs(analog_source,60)
     if analog:
         analog_w = float(np.clip(.28 + .20*(analog["effective_n"]/150), .28, .48))
         p_up = (1-analog_w)*heuristic_p + analog_w*analog["p_up"]
@@ -2004,15 +2004,15 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
         p_up = heuristic_p
     p_up = float(np.clip(p_up,.05,.95))
 
-    # Expected 15m return distribution. Prefer empirical analog quantiles; fall back to realized vol.
-    # One native 15-minute return is the forecast horizon.
-    sigma15 = max(float(r1.tail(45).std()), atr_pct, .0005)
+    # Expected 60m return distribution. Four 15m bars form the forecast horizon.
+    # Scale recent 15m volatility to one hour for the fallback range estimate.
+    sigma60 = max(float(r1.tail(45).std())*math.sqrt(4), atr_pct*math.sqrt(4), .001)
     if analog and all(np.isfinite(analog[k]) for k in ("q10","q50","q90")):
         q10,q50,q90 = float(analog["q10"]),float(analog["q50"]),float(analog["q90"])
-        expected_ret = float(.60*analog["q50"]+.40*((p_up-.5)*2*sigma15*.70))
+        expected_ret = float(.60*analog["q50"]+.40*((p_up-.5)*2*sigma60*.70))
     else:
-        expected_ret = float((p_up-.5)*2*sigma15*.70)
-        q10,q50,q90 = expected_ret-1.28*sigma15,expected_ret,expected_ret+1.28*sigma15
+        expected_ret = float((p_up-.5)*2*sigma60*.70)
+        q10,q50,q90 = expected_ret-1.28*sigma60,expected_ret,expected_ret+1.28*sigma60
     range_low = price*(1+q10)
     range_high = price*(1+q90)
     expected_price = price*(1+expected_ret)
@@ -2047,7 +2047,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
 
     return {
         "direction":direction,"p_up":p_up,"p_down":1-p_up,"confidence":confidence,
-        "confidence_label":confidence_label,"horizon_min":15,"price":price,
+        "confidence_label":confidence_label,"horizon_min":60,"price":price,
         "expected_price":float(expected_price),"expected_return":float(expected_ret),
         "range_low":float(min(range_low,range_high)),"range_high":float(max(range_low,range_high)),
         "invalidation":float(invalidation),"reversal_risk":reversal_risk,
