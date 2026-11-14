@@ -1863,7 +1863,7 @@ def _candle_forecast_analogs(history, horizon=60):
     feat["trend30"] = ema15/ema30 - 1
 
     # Native 15-minute bars: four bars make the requested next-hour horizon.
-    horizon_bars = max(1, int(round(float(horizon) / 15.0)))
+    horizon_bars = max(1, int(math.ceil(float(horizon) / 15.0)))
     future_ret = c.shift(-horizon_bars)/c - 1
     pool = feat.iloc[:-horizon_bars].copy()
     pool["future_ret"] = future_ret.iloc[:-horizon_bars]
@@ -1905,16 +1905,20 @@ def _candle_forecast_analogs(history, horizon=60):
 
 
 def candle_only_15m_forecast(frame, history=None, candle_intel=None):
-    """Next-hour BTC direction/range forecast using native 15-minute candles, volume and indicators.
+    """Forecast from the latest reading to the next clock-hour boundary using 15-minute candles.
 
     Whale trades, Kalshi order flow/prices and blockchain data are deliberately excluded.
     The output is probabilistic; confidence measures evidence agreement, not certainty.
     """
-    # Input is a native 15-minute OHLCV feed.
+    # Forecast only the remainder of the current clock hour (e.g. 5:34 -> 6:00),
+    # not a rolling 60 minutes from now. UTC has the same minute boundary.
+    now_utc = datetime.now(timezone.utc)
+    horizon_min = max(1.0, 60.0 - now_utc.minute - now_utc.second/60.0)
+    horizon_bars = max(1, int(math.ceil(horizon_min/15.0)))
     df = resample_ohlcv(frame, 15)
     if len(df) < 45:
         return {"direction":"UNCERTAIN","p_up":.5,"p_down":.5,"confidence":0.0,
-                "confidence_label":"LOW","reason":"Not enough candle history","horizon_min":60}
+                "confidence_label":"LOW","reason":"Not enough candle history","horizon_min":horizon_min}
     c = df["close"].astype(float)
     o = df["open"].astype(float)
     h = df["high"].astype(float)
@@ -1937,7 +1941,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     reasons = []
     r5 = float(c.iloc[-1]/c.iloc[-6]-1) if len(c)>=6 else 0.0
     r15 = float(c.iloc[-1]/c.iloc[-16]-1) if len(c)>=16 else 0.0
-    # Returns are 15-minute bars; the target horizon is four bars (60 minutes).
+    # Momentum and trend inputs are read from the native 15-minute chart.
     mom_scale = max(float(r1.tail(30).std()), .0006)
     momentum_unit = float(np.tanh((.60*r5+.40*r15)/mom_scale))
     score += 1.05*momentum_unit
@@ -1995,7 +1999,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
     # Convert bounded evidence to a probability, then blend with historical analogs.
     heuristic_p = _logistic(1.15*score)
     analog_source = history if history is not None and len(history)>=300 else df
-    analog = _candle_forecast_analogs(analog_source,60)
+    analog = _candle_forecast_analogs(analog_source,horizon_min)
     if analog:
         analog_w = float(np.clip(.28 + .20*(analog["effective_n"]/150), .28, .48))
         p_up = (1-analog_w)*heuristic_p + analog_w*analog["p_up"]
@@ -2004,9 +2008,9 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
         p_up = heuristic_p
     p_up = float(np.clip(p_up,.05,.95))
 
-    # Expected 60m return distribution. Four 15m bars form the forecast horizon.
-    # Scale recent 15m volatility to one hour for the fallback range estimate.
-    sigma60 = max(float(r1.tail(45).std())*math.sqrt(4), atr_pct*math.sqrt(4), .001)
+    # Scale 15m volatility to the remaining fraction of this clock hour.
+    horizon_scale = math.sqrt(horizon_min/15.0)
+    sigma60 = max(float(r1.tail(45).std())*horizon_scale, atr_pct*horizon_scale, .0005)
     if analog and all(np.isfinite(analog[k]) for k in ("q10","q50","q90")):
         q10,q50,q90 = float(analog["q10"]),float(analog["q50"]),float(analog["q90"])
         expected_ret = float(.60*analog["q50"]+.40*((p_up-.5)*2*sigma60*.70))
@@ -2047,7 +2051,7 @@ def candle_only_15m_forecast(frame, history=None, candle_intel=None):
 
     return {
         "direction":direction,"p_up":p_up,"p_down":1-p_up,"confidence":confidence,
-        "confidence_label":confidence_label,"horizon_min":60,"price":price,
+        "confidence_label":confidence_label,"horizon_min":horizon_min,"price":price,
         "expected_price":float(expected_price),"expected_return":float(expected_ret),
         "range_low":float(min(range_low,range_high)),"range_high":float(max(range_low,range_high)),
         "invalidation":float(invalidation),"reversal_risk":reversal_risk,
