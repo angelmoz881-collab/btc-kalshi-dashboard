@@ -2947,7 +2947,10 @@ def _render_live_dashboard_inner():
         _ai_api_key = st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
     except Exception:
         _ai_api_key = os.environ.get("OPENAI_API_KEY", "")
-    _ai_model = os.environ.get("OPENAI_MODEL", "gpt-6")
+    try:
+        _ai_model = st.secrets.get("OPENAI_MODEL", "") or os.environ.get("OPENAI_MODEL", "gpt-6")
+    except Exception:
+        _ai_model = os.environ.get("OPENAI_MODEL", "gpt-6")
     _ai_cached = st.session_state.get("btc_ai_latest_call")
     _ai_now = time.time()
     _ai_force = bool(st.session_state.pop("btc_ai_force_refresh", False))
