@@ -734,6 +734,54 @@ def record_learning_snapshot(history, ticker, engine, candle_engine):
     save_learning_history(df)
     return df, True
 
+@st.cache_data(ttl=90, show_spinner=False)
+def get_extended_candles(granularity=900, hours=180):
+    """Fetch extended native BTC candle history in Coinbase-safe chunks."""
+    granularity = int(granularity)
+    hours = int(hours)
+    interval_minutes = max(1, granularity // 60)
+    target_bars = int(hours * 60 / interval_minutes)
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    intervals = []
+    remaining = target_bars
+    cursor_end = end
+    while remaining > 0:
+        size = min(290, remaining)
+        start = cursor_end - pd.Timedelta(minutes=interval_minutes * size)
+        intervals.append((start, cursor_end))
+        remaining -= size
+        cursor_end = start - pd.Timedelta(minutes=interval_minutes)
+
+    def fetch_interval(pair):
+        start, stop = pair
+        params = {"granularity": granularity, "start": start.isoformat(), "end": stop.isoformat()}
+        response = HTTP.get(f"{COINBASE}/products/BTC-USD/candles",
+                            params=params, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        rows = response.json()
+        df = pd.DataFrame(rows, columns=["time", "low", "high", "open", "close", "volume"])
+        if df.empty:
+            return df
+        for col in ("time", "low", "high", "open", "close", "volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["time", "low", "high", "open", "close"])
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+    chunks = []
+    with ThreadPoolExecutor(max_workers=min(4, len(intervals))) as pool:
+        for part in pool.map(fetch_interval, intervals):
+            if part is not None and not part.empty:
+                chunks.append(part)
+    if not chunks:
+        raise ValueError("Extended 15-minute BTC history is unavailable")
+    out = pd.concat(chunks, ignore_index=True)
+    out = out.drop_duplicates("time").sort_values("time").tail(target_bars).reset_index(drop=True)
+    if len(out) < target_bars:
+        raise ValueError(f"Only {len(out)} of {target_bars} requested historical candles returned")
+    return out
+
+
 @st.cache_data(ttl=2, show_spinner=False)
 def get_candles(granularity=60):
     """Get distinct UTC one-minute BTC candles; retry a bounded historical window."""
@@ -2405,13 +2453,12 @@ def _render_live_dashboard_inner():
     try:
         candles = get_candles(60)
         # Separate native 15-minute feed drives BTC directional predictability.
-        # Require at least 18 hours (72 complete 15-minute candles) before
-        # accepting this feed; the Coinbase request can return up to 300 bars.
-        candles_15m = get_candles(900)
-        if len(candles_15m) < 72:
+        # Load 180 hours (720 candles) using paginated Coinbase requests.
+        candles_15m = get_extended_candles(900, 180)
+        if len(candles_15m) < 720:
             raise ValueError(
                 f"Only {len(candles_15m)} native 15-minute candles returned; "
-                "need at least 72 candles (18 hours)"
+                "need at least 720 candles (180 hours)"
             )
         st.session_state["_last_good_candles_15m"] = candles_15m.copy()
         if len(candles) < 10:
