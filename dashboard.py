@@ -2405,9 +2405,14 @@ def _render_live_dashboard_inner():
     try:
         candles = get_candles(60)
         # Separate native 15-minute feed drives BTC directional predictability.
+        # Require at least 18 hours (72 complete 15-minute candles) before
+        # accepting this feed; the Coinbase request can return up to 300 bars.
         candles_15m = get_candles(900)
-        if len(candles_15m) < 45:
-            raise ValueError(f"Only {len(candles_15m)} native 15-minute candles returned")
+        if len(candles_15m) < 72:
+            raise ValueError(
+                f"Only {len(candles_15m)} native 15-minute candles returned; "
+                "need at least 72 candles (18 hours)"
+            )
         st.session_state["_last_good_candles_15m"] = candles_15m.copy()
         if len(candles) < 10:
             raise ValueError(f"Only {len(candles)} candles returned")
