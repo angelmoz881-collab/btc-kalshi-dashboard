@@ -20,6 +20,7 @@ from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_pos
 from auto_scalp import paper_step, marketable_entry
 from alert_notifications import build_signal_alerts, pick_new_alert
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
+from ai_analyst import request_ai_analysis
 import json
 import html
 import os
@@ -2940,6 +2941,50 @@ def _render_live_dashboard_inner():
                        scalp_exit["status"] if scalp_exit else scalp_watch["status"])
     engine["scalp_watch"] = scalp_watch
     engine["scalp_exit"] = scalp_exit
+
+    # Optional OpenAI analyst: independent, read-only and fixed to 15m inputs / 60m horizon.
+    try:
+        _ai_api_key = st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
+    except Exception:
+        _ai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    _ai_model = os.environ.get("OPENAI_MODEL", "gpt-6")
+    _ai_cached = st.session_state.get("btc_ai_latest_call")
+    _ai_now = time.time()
+    _ai_force = bool(st.session_state.pop("btc_ai_force_refresh", False))
+    _ai_context = {
+        "bot_15m_direction": candle_forecast.get("direction"),
+        "bot_15m_confidence": candle_forecast.get("confidence"),
+        "bot_15m_probability_up": candle_forecast.get("p_up"),
+        "15m_candle_bias": candle_15m_intel.get("bias"),
+        "15m_candle_quality": candle_15m_intel.get("quality"),
+        "15m_rsi": candle_forecast.get("rsi"),
+        "15m_reversal_risk": candle_forecast.get("reversal_risk"),
+        "scalp_pressure_context": str(engine.get("scalp_pressure", {}))[:1200],
+        "support_resistance_context": str(engine.get("buyer_seller_levels", {}))[:1000],
+        "existing_hourly_baseline": (hourly_forecast.get("rows") or [{}])[0],
+    }
+    _ai_bar_time = str(candles_15m.iloc[-1].get("time")) if len(candles_15m) else "missing"
+    _ai_should_refresh = (
+        _ai_force or not isinstance(_ai_cached, dict)
+        or _ai_cached.get("_bar_time") != _ai_bar_time
+        or _ai_now - float(_ai_cached.get("_cached_at", 0)) >= 60
+    )
+    if not _ai_api_key:
+        ai_call = {"status": "not_configured", "error": "Add OPENAI_API_KEY to Streamlit Secrets."}
+    elif _ai_should_refresh:
+        ai_call = request_ai_analysis(_ai_api_key, _ai_model, candles_15m, _ai_context)
+        ai_call["_bar_time"] = _ai_bar_time
+        ai_call["_cached_at"] = _ai_now
+        st.session_state["btc_ai_latest_call"] = ai_call
+        if ai_call.get("status") == "ok":
+            _ai_history = list(st.session_state.get("btc_ai_call_history", []))
+            if not _ai_history or _ai_history[-1].get("created_at_utc") != ai_call.get("created_at_utc"):
+                _ai_history.append(ai_call)
+            st.session_state["btc_ai_call_history"] = _ai_history[-50:]
+            if alerts_in_app and ai_call.get("direction") in ("UP", "DOWN") and ai_call.get("confidence", 0) >= 65:
+                st.toast("AI BTC " + ai_call["direction"] + " · " + str(round(ai_call["confidence"])) + "% confidence · 60m", icon="🤖")
+    else:
+        ai_call = _ai_cached
     engine["scalp_source"] = "KALSHI LIVE" if is_live_position else "SIMULATED"
     engine["paper_event"] = paper_event
     # Add notifications *after* the existing signal/exit decision. Alerts are
@@ -2989,7 +3034,7 @@ def _render_live_dashboard_inner():
     # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "⚡ SCALP", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "⚡ SCALP", "🏆 ARENA", "🤖 AI DESK", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -3031,7 +3076,81 @@ def _render_live_dashboard_inner():
                         item["at"] + " · " + item["title"] + " · " + item["source"]
                     )
 
-    if selected_page == "📈 CHART":
+    if selected_page == "🤖 AI DESK":
+        st.markdown("### 🤖 AI Trading Desk")
+        st.caption("OpenAI market analysis · 15-minute candles · fixed 60-minute horizon · read-only")
+        if st.button("Refresh AI analysis now", key="btc_ai_refresh"):
+            st.session_state["btc_ai_force_refresh"] = True
+            st.rerun()
+        if ai_call.get("status") == "not_configured":
+            st.warning("AI analysis is not connected yet. Add OPENAI_API_KEY under your app's Streamlit Secrets, then restart/redeploy the app.")
+            st.code('OPENAI_API_KEY = "your-private-api-key"\nOPENAI_MODEL = "gpt-6"', language="toml")
+            st.caption("Never paste your API key into chat or commit it to GitHub.")
+        elif ai_call.get("status") != "ok":
+            st.error(ai_call.get("error", "AI analysis is currently unavailable."))
+            st.caption("Your existing BTC bot signals continue working independently.")
+        else:
+            _ai_direction = ai_call.get("direction", "UNCERTAIN")
+            _ai_confidence = float(ai_call.get("confidence", 0))
+            _ai_price = ai_call.get("starting_price")
+            _ai_expected = ai_call.get("expected_price_60m")
+            if _ai_direction == "UP":
+                st.success("AI CALL: BUY BIAS / UP · research signal only")
+            elif _ai_direction == "DOWN":
+                st.error("AI CALL: SELL BIAS / DOWN · research signal only")
+            else:
+                st.warning("AI CALL: WAIT / UNCERTAIN · no clear directional edge")
+            _ai_m1, _ai_m2, _ai_m3 = st.columns(3)
+            _ai_m1.metric("Confidence", f"{_ai_confidence:.0f}%")
+            _ai_m2.metric("BTC now", f"${float(_ai_price):,.2f}" if _ai_price is not None else "—")
+            _ai_m3.metric("+60m estimate", f"${float(_ai_expected):,.2f}" if _ai_expected is not None else "—")
+            st.markdown("**Expected 60-minute range**")
+            st.write(
+                f"${float(ai_call['range_low_60m']):,.2f} – ${float(ai_call['range_high_60m']):,.2f}"
+                if ai_call.get("range_low_60m") is not None and ai_call.get("range_high_60m") is not None
+                else "Not available"
+            )
+            st.markdown("**Probability of UP**")
+            st.progress(float(ai_call.get("probability_up", 0.5)))
+            st.caption(f"UP {float(ai_call.get('probability_up', 0.5)):.0%} · DOWN {1-float(ai_call.get('probability_up', 0.5)):.0%}")
+            _ai_levels = [
+                ("Entry zone", "entry_zone_low", "entry_zone_high"),
+                ("Stop-loss reference", "stop_loss_reference", None),
+                ("Take profit 1", "take_profit_1", None),
+                ("Take profit 2", "take_profit_2", None),
+                ("Invalidation", "invalidation_level", None),
+            ]
+            for _label, _lo, _hi in _ai_levels:
+                _v = ai_call.get(_lo)
+                if _v is not None:
+                    _display = f"${float(_v):,.2f}"
+                    if _hi and ai_call.get(_hi) is not None:
+                        _display += f" – ${float(ai_call[_hi]):,.2f}"
+                    st.write(f"**{_label}:** {_display}")
+            st.markdown("**Why the AI made this call**")
+            for _reason in (ai_call.get("reasons") or []):
+                st.write("• " + str(_reason))
+            st.markdown("**Risks / invalidation factors**")
+            for _risk in (ai_call.get("risks") or []):
+                st.write("• " + str(_risk))
+            st.info(ai_call.get("summary", "No additional summary supplied."))
+            st.caption(
+                "Created: " + str(ai_call.get("created_at_utc", "—"))
+                + " · Target: " + str(ai_call.get("target_time_utc", "—"))
+                + " · Model: " + str(ai_call.get("model", _ai_model))
+            )
+            st.caption("AI calls are logged locally in data/ai_forecasts.jsonl with a 60-minute target for later scoring. No orders are placed.")
+            _history = st.session_state.get("btc_ai_call_history", [])
+            if _history:
+                with st.expander("Recent AI calls", expanded=False):
+                    for _old in reversed(_history[-10:]):
+                        st.write(
+                            str(_old.get("created_at_utc", ""))[:19]
+                            + " · " + str(_old.get("direction", "UNCERTAIN"))
+                            + " · " + str(round(float(_old.get("confidence", 0)))) + "%"
+                            + " · BTC " + str(_old.get("starting_price", "—"))
+                        )
+    elif selected_page == "📈 CHART":
         if scalp_exit:
             if scalp_exit.get("actionable"):
                 _scalp_note = (
