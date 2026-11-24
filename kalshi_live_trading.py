@@ -108,15 +108,23 @@ def _position_exposure_dollars(row):
 
 
 def _resting_buy_exposure_dollars(order):
-    action = str(order.get("action") or "").lower()
     status = str(order.get("status") or "").lower()
     remaining = dec(order.get("remaining_count_fp", order.get("remaining_count", order.get("count_fp"))))
-    if action != "buy" or status not in ("resting", "pending", "partially_filled", "partially_filled_resting"):
+    if status not in ("resting", "pending", "partially_filled", "partially_filled_resting"):
         return Decimal(0)
     if remaining is None or remaining <= 0:
         return Decimal(0)
+
+    action = str(order.get("action") or "").lower()
+    book_side = str(order.get("side") or "").lower()
+    # V1 uses action=buy and yes/no outcome side. V2 uses bid/ask on the YES
+    # book; a non-reduce-only ask opens a NO position and must also be reserved.
+    if action != "buy":
+        if book_side not in ("bid", "ask") or bool(order.get("reduce_only")):
+            return Decimal(0)
+
     price = None
-    for name in ("yes_price_dollars", "no_price_dollars", "price"):
+    for name in ("price", "yes_price_dollars", "no_price_dollars"):
         if order.get(name) is not None:
             price = _money(order.get(name))
             break
@@ -127,8 +135,14 @@ def _resting_buy_exposure_dollars(order):
                 break
     if price is None:
         raise ValueError("Cannot verify exposure for a resting buy order")
-    return remaining * price
 
+    if action == "buy":
+        outcome_side = str(order.get("outcome_side") or order.get("contract_side") or "").lower()
+        if outcome_side == "no" and order.get("no_price_dollars") is None and order.get("no_price") is None:
+            price = Decimal(1) - price
+    elif book_side == "ask":
+        price = Decimal(1) - price
+    return remaining * price
 
 def get_portfolio_snapshot(key_id, private_pem):
     """Fetch and validate equity, all unsettled positions and resting orders."""
