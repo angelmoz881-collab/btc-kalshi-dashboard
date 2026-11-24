@@ -2395,7 +2395,7 @@ with st.sidebar:
             st.toast("🔔 Test alert · in-app notifications are working", icon="🔔")
         st.caption("Alerts appear in the app while this dashboard is open and updating. "
                    "No Telegram, phone setup, or external messages required.")
-    st.caption("Exit fees are estimates until verified. No trades are automatically placed.")
+    st.caption("Exit fees are estimates until verified. Live orders are submitted only when the separate live scalp switch is armed.")
     st.caption("Signals are research estimates, not guaranteed predictions. Confirm market rules, expiry and fees.")
 
 # Streamlit fragments update only the live dashboard region instead of reloading the
@@ -2954,16 +2954,19 @@ def _render_live_dashboard_inner():
                             if executable_ask is None:
                                 live_order_event = "LIVE ENTRY BLOCKED · insufficient visible ask depth for the full order"
                             else:
+                                # Mark this contract before the network call. A timeout
+                                # can be ambiguous; never blindly duplicate an entry.
+                                st.session_state["live_scalp_last_order"] = {
+                                    "ticker": active_ticker, "side": live_side, "at": time.time(),
+                                    "order_id": None
+                                }
                                 response = submit_ioc_order(
                                     _trade_key_id, _trade_pem, active_ticker, live_side, "buy",
                                     executable_ask, quantity, reduce_only=False
                                 )
                                 filled = response.get("fill_count", "0")
                                 live_order_event = f"LIVE ENTRY SENT · {filled} filled / {quantity} requested · IOC remainder cancels"
-                                st.session_state["live_scalp_last_order"] = {
-                                    "ticker": active_ticker, "side": live_side, "at": time.time(),
-                                    "order_id": response.get("order_id")
-                                }
+                                st.session_state["live_scalp_last_order"]["order_id"] = response.get("order_id")
                         st.session_state["live_scalp_arming"] = None
                     except Exception:
                         live_order_event = "LIVE ENTRY BLOCKED · account risk check or Kalshi order request failed; verify account and key permissions"
