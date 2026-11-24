@@ -3043,6 +3043,7 @@ def _render_live_dashboard_inner():
                 _bot_entry.get("ticker") == scalp_position.get("ticker")
                 and str(_bot_entry.get("side") or "").lower() == str(scalp_position.get("side") or "").lower()
                 and float(_bot_entry.get("fill_count") or 0) > 0
+                and float(scalp_position.get("quantity") or 0) <= float(_bot_entry.get("fill_count") or 0) + 0.00001
             )
             if live_scalp_enabled and _bot_owned_position and _terminal_exit and not _exit_recent:
                 # Record before sending so an uncertain network timeout cannot
