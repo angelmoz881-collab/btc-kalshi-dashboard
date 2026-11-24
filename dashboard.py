@@ -2379,7 +2379,7 @@ with st.sidebar:
             key="arm_live_btc_scalp",
             help="When enabled, confirmed scalp watches may submit real Kalshi IOC orders. Allocation is capped at 20% of portfolio equity, including existing positions and resting buy orders."
         )
-        st.warning("LIVE TRADING CAN LOSE MONEY. The 20% cap limits allocated exposure; it does not limit losses to 20%. Disable the switch to stop new entries.")
+        st.warning("LIVE TRADING CAN LOSE MONEY. The 20% cap limits allocated exposure; it does not limit losses to 20%. Disabling this switch stops automatic live entries and exits; manage any open position manually.")
     elif not live_trade_configured:
         st.caption("Live execution requires KALSHI_TRADE_KEY_ID and KALSHI_TRADE_PRIVATE_KEY in server Secrets. The key must include read and write::trade scopes.")
     else:
@@ -2947,12 +2947,27 @@ def _render_live_dashboard_inner():
                         budget = available_scalp_budget(portfolio)
                         one_contract_ask = marketable_entry(kalshi_data, live_side, 1)
                         quantity = contracts_for_budget(budget, one_contract_ask) if one_contract_ask is not None else 0
+                        opposite_book = kalshi_data.get("no" if live_side == "yes" else "yes") or []
+                        visible_depth = sum(max(0.0, float(level[1])) for level in opposite_book
+                                            if len(level) >= 2)
+                        quantity = min(quantity, int(visible_depth))
+                        # Find the largest size whose depth-weighted ask plus fee reserve
+                        # still fits inside the remaining 20% allocation.
+                        low, high = 0, quantity
+                        while low < high:
+                            mid = (low + high + 1) // 2
+                            mid_vwap = marketable_entry(kalshi_data, live_side, mid)
+                            if mid_vwap is not None and mid * (mid_vwap / 100.0 + 0.03) <= float(budget):
+                                low = mid
+                            else:
+                                high = mid - 1
+                        quantity = low
                         if quantity < 1:
                             live_order_event = "LIVE ENTRY BLOCKED · no budget under the 20% cap or insufficient verified depth"
                         else:
                             executable_ask = marketable_entry(kalshi_data, live_side, quantity)
-                            if executable_ask is None:
-                                live_order_event = "LIVE ENTRY BLOCKED · insufficient visible ask depth for the full order"
+                            if executable_ask is None or quantity * (executable_ask / 100.0 + 0.03) > float(budget):
+                                live_order_event = "LIVE ENTRY BLOCKED · depth-weighted cost exceeds the 20% allocation"
                             else:
                                 # Mark this contract before the network call. A timeout
                                 # can be ambiguous; never blindly duplicate an entry.
