@@ -19,9 +19,10 @@ HEADERS = {"User-Agent": "BTC-Polymarket-5m-Research/1.0", "Accept": "applicatio
 def discover_polymarket_btc_5m():
     r = requests.get(f"{GAMMA}/events", params={"series_slug": SERIES, "closed": "false", "limit": 500, "order": "endDate", "ascending": "true"}, headers=HEADERS, timeout=8)
     r.raise_for_status()
+    events = r.json()
     now = datetime.now(timezone.utc).timestamp()
     active = []
-    for event in r.json() if isinstance(r.json(), list) else []:
+    for event in events if isinstance(events, list) else []:
         try:
             start = pd.Timestamp(event.get("eventStartTime") or event.get("startTime")).timestamp()
             end = pd.Timestamp(event.get("endDate")).timestamp()
