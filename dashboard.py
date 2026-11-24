@@ -2933,7 +2933,12 @@ def _render_live_dashboard_inner():
                     "ticker": active_ticker, "side": live_side, "since": time.time()
                 }
             elif time.time() - float(live_arm.get("since", time.time())) >= 2:
-                try:
+                _last_live_entry = st.session_state.get("live_scalp_last_order") or {}
+                if _last_live_entry.get("ticker") == active_ticker:
+                    live_order_event = "LIVE ENTRY HELD · one entry attempt already made for this 15-minute contract"
+                    st.session_state["live_scalp_arming"] = None
+                else:
+                    try:
                     # Re-read the account immediately before every entry. If any
                     # exposure field is missing or stale, the sizing function fails closed.
                     portfolio = get_portfolio_snapshot(_trade_key_id, _trade_pem)
@@ -2957,10 +2962,10 @@ def _render_live_dashboard_inner():
                                 "ticker": active_ticker, "side": live_side, "at": time.time(),
                                 "order_id": response.get("order_id")
                             }
-                    st.session_state["live_scalp_arming"] = None
-                except Exception:
-                    live_order_event = "LIVE ENTRY BLOCKED · account risk check or Kalshi order request failed; verify account and key permissions"
-                    st.session_state["live_scalp_arming"] = None
+                        st.session_state["live_scalp_arming"] = None
+                    except Exception:
+                        live_order_event = "LIVE ENTRY BLOCKED · account risk check or Kalshi order request failed; verify account and key permissions"
+                        st.session_state["live_scalp_arming"] = None
         else:
             st.session_state["live_scalp_arming"] = None
         scalp_position = None
@@ -3009,7 +3014,15 @@ def _render_live_dashboard_inner():
                 round(float(scalp_position.get("quantity", 0)), 5),
                 round(float(scalp_position.get("entry_price_cents", 0)), 5)
             )
-            if live_scalp_enabled and _terminal_exit and st.session_state.get("live_scalp_exit_attempt") != _exit_fingerprint:
+            _exit_attempt = st.session_state.get("live_scalp_exit_attempt") or {}
+            _exit_recent = (_exit_attempt.get("fingerprint") == _exit_fingerprint
+                            and time.time() - float(_exit_attempt.get("at", 0)) < 10)
+            if live_scalp_enabled and _terminal_exit and not _exit_recent:
+                # Record before sending so an uncertain network timeout cannot
+                # cause repeated orders on every Streamlit fragment refresh.
+                st.session_state["live_scalp_exit_attempt"] = {
+                    "fingerprint": _exit_fingerprint, "at": time.time()
+                }
                 try:
                     # Reduce-only IOC can never increase or reverse the holding.
                     _exit_price = float(scalp_exit["exit_bid_cents"])
@@ -3018,13 +3031,12 @@ def _render_live_dashboard_inner():
                         scalp_position["side"], "sell", _exit_price,
                         scalp_position["quantity"], reduce_only=True
                     )
-                    st.session_state["live_scalp_exit_attempt"] = _exit_fingerprint
                     live_order_event = (
                         "LIVE EXIT SENT · " + str(_exit_response.get("fill_count", "0"))
                         + " contracts filled · check Kalshi position for final fill status"
                     )
                 except Exception:
-                    live_order_event = "LIVE EXIT FAILED · no verified order confirmation; check Kalshi before retrying"
+                    live_order_event = "LIVE EXIT FAILED · check Kalshi order/position status before retrying"
     engine["scalp"] = ("COST UNKNOWN" if is_live_position and not account_position else
                        scalp_exit["status"] if scalp_exit else scalp_watch["status"])
     engine["scalp_watch"] = scalp_watch
