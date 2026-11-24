@@ -142,7 +142,7 @@ def _resting_buy_exposure_dollars(order):
     if action == "buy" and outcome_side == "no":
         # A legacy NO purchase's exposure is its NO price, not the YES price.
         pass
-    elif action != "buy" and book_side == "ask":
+    elif book_side == "ask" and outcome_side != "no":
         # A V2 ask opens NO exposure at the complement of the YES-book price.
         price = Decimal(1) - price
     return remaining * price
