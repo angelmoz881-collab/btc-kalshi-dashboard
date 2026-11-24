@@ -2939,29 +2939,29 @@ def _render_live_dashboard_inner():
                     st.session_state["live_scalp_arming"] = None
                 else:
                     try:
-                    # Re-read the account immediately before every entry. If any
-                    # exposure field is missing or stale, the sizing function fails closed.
-                    portfolio = get_portfolio_snapshot(_trade_key_id, _trade_pem)
-                    budget = available_scalp_budget(portfolio)
-                    one_contract_ask = marketable_entry(kalshi_data, live_side, 1)
-                    quantity = contracts_for_budget(budget, one_contract_ask) if one_contract_ask is not None else 0
-                    if quantity < 1:
-                        live_order_event = "LIVE ENTRY BLOCKED · no budget under the 20% cap or insufficient verified depth"
-                    else:
-                        executable_ask = marketable_entry(kalshi_data, live_side, quantity)
-                        if executable_ask is None:
-                            live_order_event = "LIVE ENTRY BLOCKED · insufficient visible ask depth for the full order"
+                        # Re-read the account immediately before every entry. If any
+                        # exposure field is missing, sizing fails closed.
+                        portfolio = get_portfolio_snapshot(_trade_key_id, _trade_pem)
+                        budget = available_scalp_budget(portfolio)
+                        one_contract_ask = marketable_entry(kalshi_data, live_side, 1)
+                        quantity = contracts_for_budget(budget, one_contract_ask) if one_contract_ask is not None else 0
+                        if quantity < 1:
+                            live_order_event = "LIVE ENTRY BLOCKED · no budget under the 20% cap or insufficient verified depth"
                         else:
-                            response = submit_ioc_order(
-                                _trade_key_id, _trade_pem, active_ticker, live_side, "buy",
-                                executable_ask, quantity, reduce_only=False
-                            )
-                            filled = response.get("fill_count", "0")
-                            live_order_event = f"LIVE ENTRY SENT · {filled} filled / {quantity} requested · IOC remainder cancels"
-                            st.session_state["live_scalp_last_order"] = {
-                                "ticker": active_ticker, "side": live_side, "at": time.time(),
-                                "order_id": response.get("order_id")
-                            }
+                            executable_ask = marketable_entry(kalshi_data, live_side, quantity)
+                            if executable_ask is None:
+                                live_order_event = "LIVE ENTRY BLOCKED · insufficient visible ask depth for the full order"
+                            else:
+                                response = submit_ioc_order(
+                                    _trade_key_id, _trade_pem, active_ticker, live_side, "buy",
+                                    executable_ask, quantity, reduce_only=False
+                                )
+                                filled = response.get("fill_count", "0")
+                                live_order_event = f"LIVE ENTRY SENT · {filled} filled / {quantity} requested · IOC remainder cancels"
+                                st.session_state["live_scalp_last_order"] = {
+                                    "ticker": active_ticker, "side": live_side, "at": time.time(),
+                                    "order_id": response.get("order_id")
+                                }
                         st.session_state["live_scalp_arming"] = None
                     except Exception:
                         live_order_event = "LIVE ENTRY BLOCKED · account risk check or Kalshi order request failed; verify account and key permissions"
