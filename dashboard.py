@@ -2982,6 +2982,7 @@ def _render_live_dashboard_inner():
                                 filled = response.get("fill_count", "0")
                                 live_order_event = f"LIVE ENTRY SENT · {filled} filled / {quantity} requested · IOC remainder cancels"
                                 st.session_state["live_scalp_last_order"]["order_id"] = response.get("order_id")
+                                st.session_state["live_scalp_last_order"]["fill_count"] = float(filled or 0)
                         st.session_state["live_scalp_arming"] = None
                     except Exception:
                         live_order_event = "LIVE ENTRY BLOCKED · account risk check or Kalshi order request failed; verify account and key permissions"
@@ -3037,7 +3038,13 @@ def _render_live_dashboard_inner():
             _exit_attempt = st.session_state.get("live_scalp_exit_attempt") or {}
             _exit_recent = (_exit_attempt.get("fingerprint") == _exit_fingerprint
                             and time.time() - float(_exit_attempt.get("at", 0)) < 10)
-            if live_scalp_enabled and _terminal_exit and not _exit_recent:
+            _bot_entry = st.session_state.get("live_scalp_last_order") or {}
+            _bot_owned_position = (
+                _bot_entry.get("ticker") == scalp_position.get("ticker")
+                and str(_bot_entry.get("side") or "").lower() == str(scalp_position.get("side") or "").lower()
+                and float(_bot_entry.get("fill_count") or 0) > 0
+            )
+            if live_scalp_enabled and _bot_owned_position and _terminal_exit and not _exit_recent:
                 # Record before sending so an uncertain network timeout cannot
                 # cause repeated orders on every Streamlit fragment refresh.
                 st.session_state["live_scalp_exit_attempt"] = {
