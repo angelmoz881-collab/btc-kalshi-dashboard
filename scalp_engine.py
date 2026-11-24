@@ -157,7 +157,7 @@ def review_open_position(position, snapshot, score, reversal, remaining_sec,
     entry = _number(position.get("entry_price_cents"))
     entry_fee = _number(position.get("entry_fee_cents"))
     remain = _number(remaining_sec)
-    if side not in ("yes", "no") or q is None or q < 1 or entry is None or not (0 < entry < 100):
+    if side not in ("yes", "no") or q is None or q <= 0 or entry is None or not (0 < entry < 100):
         out.update(status="INVALID POSITION", reason="Enter an actual filled side, size, and purchase price")
         return out
     if entry_fee is None or entry_fee < 0:
