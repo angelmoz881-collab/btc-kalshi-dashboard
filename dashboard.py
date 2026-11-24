@@ -2347,8 +2347,10 @@ with st.sidebar:
     scalp_slippage = st.slider("Extra exit slippage reserve (¢ per contract)", 0.0, 5.0, 1.0, step=.5, key="scalp_slippage")
     st.markdown("**Optional live Kalshi position sync**")
     st.caption("Read-only API access lets the bot discover fills automatically. No order placement.")
-    _sync_key_id = _secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
-    _sync_pem = _secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+    _sync_key_id = (_secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
+                    or _secret("KALSHI_TRADE_KEY_ID") or os.environ.get("KALSHI_TRADE_KEY_ID"))
+    _sync_pem = (_secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+                 or _secret("KALSHI_TRADE_PRIVATE_KEY") or os.environ.get("KALSHI_TRADE_PRIVATE_KEY"))
     _scalp_view_guard = _secret("SCALP_VIEW_PASSWORD") or os.environ.get("SCALP_VIEW_PASSWORD")
     kalshi_sync_configured = bool(_sync_key_id and _sync_pem and _scalp_view_guard)
     kalshi_sync_enabled = False
