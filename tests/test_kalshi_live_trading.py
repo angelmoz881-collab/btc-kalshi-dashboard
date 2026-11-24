@@ -54,6 +54,28 @@ class PortfolioCapTests(unittest.TestCase):
         self.assertEqual(bid, Decimal("4.00"))
         self.assertEqual(ask, Decimal("6.00"))
 
+    def test_current_v2_order_schema_counts_yes_bid_exposure(self):
+        exposure = live._resting_buy_exposure_dollars({
+            "status": "resting", "outcome_side": "yes", "book_side": "bid",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
+        })
+        self.assertEqual(exposure, Decimal("4.0000"))
+
+    def test_current_v2_order_schema_counts_no_ask_exposure(self):
+        exposure = live._resting_buy_exposure_dollars({
+            "status": "resting", "outcome_side": "no", "book_side": "ask",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
+        })
+        self.assertEqual(exposure, Decimal("6.0000"))
+
+    def test_unreadable_resting_order_exposure_fails_closed(self):
+        with self.assertRaises(ValueError):
+            live._resting_buy_exposure_dollars({
+                "status": "resting", "outcome_side": "yes", "book_side": "bid",
+                "remaining_count_fp": "10.00",
+            })
     def test_reduce_only_v2_exit_order_does_not_add_new_exposure(self):
         exposure = live._resting_buy_exposure_dollars({
             "status": "resting", "side": "ask", "remaining_count_fp": "10.00",
