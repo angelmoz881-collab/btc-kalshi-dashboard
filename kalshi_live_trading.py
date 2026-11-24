@@ -108,43 +108,35 @@ def _position_exposure_dollars(row):
 
 
 def _resting_buy_exposure_dollars(order):
+    """Reserve every resting order; reduce-only orders must be IOC and cannot rest."""
     status = str(order.get("status") or "").lower()
+    if status != "resting":
+        return Decimal(0)
     remaining = dec(order.get("remaining_count_fp", order.get("remaining_count", order.get("count_fp"))))
-    if status not in ("resting", "pending", "partially_filled", "partially_filled_resting"):
-        return Decimal(0)
     if remaining is None or remaining <= 0:
-        return Decimal(0)
-
-    action = str(order.get("action") or "").lower()
-    book_side = str(order.get("side") or "").lower()
-    # V1 uses action=buy and yes/no outcome side. V2 uses bid/ask on the YES
-    # book; a non-reduce-only ask opens a NO position and must also be reserved.
-    if action != "buy":
-        if book_side not in ("bid", "ask") or bool(order.get("reduce_only")):
-            return Decimal(0)
-
+        raise ValueError("Cannot verify remaining size of a resting order")
+    outcome = str(order.get("outcome_side") or order.get("contract_side") or "").lower()
+    legacy_side = str(order.get("side") or "").lower()
+    if outcome not in ("yes", "no"):
+        outcome = legacy_side if legacy_side in ("yes", "no") else ""
+    if outcome not in ("yes", "no"):
+        raise ValueError("Cannot verify directional exposure of a resting order")
+    # Current V2 order reads expose yes_price_dollars/no_price_dollars and
+    # outcome_side/book_side. The legacy API exposed price/action/side.
+    names = (outcome + "_price_dollars", outcome + "_price")
     price = None
-    outcome_side = str(order.get("outcome_side") or order.get("contract_side") or "").lower()
-    if action == "buy" and not outcome_side and book_side in ("yes", "no"):
-        outcome_side = book_side
-    if action == "buy" and outcome_side in ("yes", "no"):
-        names = (outcome_side + "_price_dollars", outcome_side + "_price")
-    else:
-        names = ("price", "yes_price_dollars", "yes_price")
     for name in names:
         if order.get(name) is not None:
-            raw = order.get(name)
-            price = _money(raw, cents=name.endswith("_price") and not name.endswith("_dollars"))
+            price = _money(order.get(name), cents=name.endswith("_price"))
             break
     if price is None:
-        raise ValueError("Cannot verify exposure for a resting buy order")
-
-    if action == "buy" and outcome_side == "no":
-        # A legacy NO purchase's exposure is its NO price, not the YES price.
-        pass
-    elif book_side == "ask" and outcome_side != "no":
-        # A V2 ask opens NO exposure at the complement of the YES-book price.
-        price = Decimal(1) - price
+        raw = order.get("price")
+        if raw is not None:
+            price = _money(raw, cents=dec(raw) is not None and dec(raw) > 1)
+            if outcome == "no" and legacy_side == "yes":
+                price = Decimal(1) - price
+    if price is None or price <= 0 or price > 1:
+        raise ValueError("Cannot verify price of a resting order")
     return remaining * price
 
 def get_portfolio_snapshot(key_id, private_pem):
