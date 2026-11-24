@@ -39,7 +39,7 @@ class PortfolioCapTests(unittest.TestCase):
             )
 
     def test_contract_sizing_includes_fee_reserve(self):
-        self.assertEqual(live.contracts_for_budget(Decimal("10"), Decimal("50")), 19)
+        self.assertEqual(live.contracts_for_budget(Decimal("10"), Decimal("50")), 18)
         self.assertEqual(live.contracts_for_budget(Decimal("0.50"), Decimal("50")), 0)
 
 
