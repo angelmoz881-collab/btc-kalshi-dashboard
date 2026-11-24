@@ -20,6 +20,7 @@ from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_pos
 from auto_scalp import paper_step, marketable_entry
 from alert_notifications import build_signal_alerts, pick_new_alert
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
+from kalshi_live_trading import (get_portfolio_snapshot, available_scalp_budget, contracts_for_budget, submit_ioc_order)
 from polymarket_btc_5m import render_polymarket_btc_5m
 import json
 import html
@@ -2364,6 +2365,23 @@ with st.sidebar:
     else:
         st.caption("To enable real fill tracking, configure KALSHI_READ_KEY_ID, "
                    "KALSHI_READ_PRIVATE_KEY and SCALP_VIEW_PASSWORD in Streamlit Secrets.")
+    _trade_key_id = _secret("KALSHI_TRADE_KEY_ID") or os.environ.get("KALSHI_TRADE_KEY_ID")
+    _trade_pem = _secret("KALSHI_TRADE_PRIVATE_KEY") or os.environ.get("KALSHI_TRADE_PRIVATE_KEY")
+    live_trade_configured = bool(_trade_key_id and _trade_pem)
+    live_scalp_enabled = False
+    st.markdown("**Live scalp execution · hard 20% portfolio cap**")
+    if live_trade_configured and kalshi_sync_enabled:
+        live_scalp_enabled = st.checkbox(
+            "ARM LIVE BTC SCALP ORDERS",
+            value=False,
+            key="arm_live_btc_scalp",
+            help="When enabled, confirmed scalp watches may submit real Kalshi IOC orders. Allocation is capped at 20% of portfolio equity, including existing positions and resting buy orders."
+        )
+        st.warning("LIVE TRADING CAN LOSE MONEY. The 20% cap limits allocated exposure; it does not limit losses to 20%. Disable the switch to stop new entries.")
+    elif not live_trade_configured:
+        st.caption("Live execution requires KALSHI_TRADE_KEY_ID and KALSHI_TRADE_PRIVATE_KEY in server Secrets. The key must include read and write::trade scopes.")
+    else:
+        st.caption("Unlock the private account view above before arming live execution.")
     st.caption("Signals and automatic SIMULATED tracking work without a Kalshi key.")
     st.markdown("---")
     with st.expander("🔔 In-app signal alerts", expanded=False):
@@ -2390,8 +2408,10 @@ if _fragment is None:
 @st.cache_data(ttl=3, show_spinner=False)
 def _read_btc_account_snapshot():
     """Only called after the user unlocks a server-side password gate."""
-    key_id = _secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
-    private_key = _secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+    key_id = (_secret("KALSHI_READ_KEY_ID") or os.environ.get("KALSHI_READ_KEY_ID")
+              or _secret("KALSHI_TRADE_KEY_ID") or os.environ.get("KALSHI_TRADE_KEY_ID"))
+    private_key = (_secret("KALSHI_READ_PRIVATE_KEY") or os.environ.get("KALSHI_READ_PRIVATE_KEY")
+                   or _secret("KALSHI_TRADE_PRIVATE_KEY") or os.environ.get("KALSHI_TRADE_PRIVATE_KEY"))
     rows = get_btc_open_positions(key_id, private_key)
     if not rows:
         return {"ticker": None, "position": None, "count": 0, "reason": "No open BTC15M holdings"}
@@ -2896,23 +2916,66 @@ def _render_live_dashboard_inner():
         pressure=engine["scalp_pressure"],
     )
     # Live positions are reconstructed directly from REAL Kalshi buy/sell fills.
-    # In unconnected mode, build a separate one-contract hypothetical paper
-    # position from two matching entry watches. PAPER must never look like LIVE.
+    # Live entries require two matching watches at least two seconds apart, fresh
+    # market data, a fresh account snapshot, and room beneath the portfolio-wide cap.
     is_live_position = bool(kalshi_sync_enabled and account_info.get("ticker"))
     paper_event = None
+    live_order_event = None
     if is_live_position:
         scalp_position = account_position
+    elif live_scalp_enabled and not (candle_feed_stale or spot_feed_stale or kalshi_stale) and active_ticker and kalshi_data:
+        live_arm = st.session_state.get("live_scalp_arming") or {}
+        live_side = str((scalp_watch or {}).get("side") or "").lower()
+        if (scalp_watch.get("status") == "WATCH " + live_side.upper()
+                and live_side in ("yes", "no") and engine.get("remaining_sec", 0) >= 150):
+            if live_arm.get("ticker") != active_ticker or live_arm.get("side") != live_side:
+                st.session_state["live_scalp_arming"] = {
+                    "ticker": active_ticker, "side": live_side, "since": time.time()
+                }
+            elif time.time() - float(live_arm.get("since", time.time())) >= 2:
+                try:
+                    # Re-read the account immediately before every entry. If any
+                    # exposure field is missing or stale, the sizing function fails closed.
+                    portfolio = get_portfolio_snapshot(_trade_key_id, _trade_pem)
+                    budget = available_scalp_budget(portfolio)
+                    one_contract_ask = marketable_entry(kalshi_data, live_side, 1)
+                    quantity = contracts_for_budget(budget, one_contract_ask) if one_contract_ask is not None else 0
+                    if quantity < 1:
+                        live_order_event = "LIVE ENTRY BLOCKED · no budget under the 20% cap or insufficient verified depth"
+                    else:
+                        executable_ask = marketable_entry(kalshi_data, live_side, quantity)
+                        if executable_ask is None:
+                            live_order_event = "LIVE ENTRY BLOCKED · insufficient visible ask depth for the full order"
+                        else:
+                            response = submit_ioc_order(
+                                _trade_key_id, _trade_pem, active_ticker, live_side, "buy",
+                                executable_ask, quantity, reduce_only=False
+                            )
+                            filled = response.get("fill_count", "0")
+                            live_order_event = f"LIVE ENTRY SENT · {filled} filled / {quantity} requested · IOC remainder cancels"
+                            st.session_state["live_scalp_last_order"] = {
+                                "ticker": active_ticker, "side": live_side, "at": time.time(),
+                                "order_id": response.get("order_id")
+                            }
+                    st.session_state["live_scalp_arming"] = None
+                except Exception:
+                    live_order_event = "LIVE ENTRY BLOCKED · account risk check or Kalshi order request failed; verify account and key permissions"
+                    st.session_state["live_scalp_arming"] = None
+        else:
+            st.session_state["live_scalp_arming"] = None
+        scalp_position = None
     else:
-        auto_paper_state, paper_event = paper_step(
-            auto_paper_state, active_ticker, kalshi_data, scalp_watch,
-            engine.get("scalp_score"), reversal, engine.get("remaining_sec"),
-            quote_history, stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
-            slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
-            trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
-            max_hold_sec=scalp_max_hold, pressure=engine["scalp_pressure"],
-        )
-        st.session_state["auto_paper_scalp"] = auto_paper_state
-        scalp_position = auto_paper_state.get("position")
+        if not live_scalp_enabled:
+            auto_paper_state, paper_event = paper_step(
+                auto_paper_state, active_ticker, kalshi_data, scalp_watch,
+                engine.get("scalp_score"), reversal, engine.get("remaining_sec"),
+                quote_history, stale=(candle_feed_stale or spot_feed_stale or kalshi_stale),
+                slippage_cents=scalp_slippage, target_cents=scalp_profit_target,
+                trail_cents=scalp_trailing_lock, stop_cents=scalp_max_loss,
+                max_hold_sec=scalp_max_hold, pressure=engine["scalp_pressure"],
+            )
+            st.session_state["auto_paper_scalp"] = auto_paper_state
+            scalp_position = auto_paper_state.get("position")
 
     scalp_exit = None
     if isinstance(scalp_position, dict) and scalp_position.get("ticker") == active_ticker:
@@ -2937,6 +3000,31 @@ def _render_live_dashboard_inner():
         )
         if scalp_exit.get("actionable") and is_live_position:
             st.session_state["scalp_live_peak"] = scalp_exit["peak_net_cents"]
+            _terminal_exit = scalp_exit.get("status") in (
+                "TAKE PROFIT", "PROTECT PROFIT", "CASH OUT SOON",
+                "STOP LOSS REVIEW", "EXIT WINDOW CLOSING", "TIME EXIT REVIEW"
+            )
+            _exit_fingerprint = (
+                scalp_position.get("ticker"), scalp_position.get("side"),
+                round(float(scalp_position.get("quantity", 0)), 5),
+                round(float(scalp_position.get("entry_price_cents", 0)), 5)
+            )
+            if live_scalp_enabled and _terminal_exit and st.session_state.get("live_scalp_exit_attempt") != _exit_fingerprint:
+                try:
+                    # Reduce-only IOC can never increase or reverse the holding.
+                    _exit_price = float(scalp_exit["exit_bid_cents"])
+                    _exit_response = submit_ioc_order(
+                        _trade_key_id, _trade_pem, scalp_position["ticker"],
+                        scalp_position["side"], "sell", _exit_price,
+                        scalp_position["quantity"], reduce_only=True
+                    )
+                    st.session_state["live_scalp_exit_attempt"] = _exit_fingerprint
+                    live_order_event = (
+                        "LIVE EXIT SENT · " + str(_exit_response.get("fill_count", "0"))
+                        + " contracts filled · check Kalshi position for final fill status"
+                    )
+                except Exception:
+                    live_order_event = "LIVE EXIT FAILED · no verified order confirmation; check Kalshi before retrying"
     engine["scalp"] = ("COST UNKNOWN" if is_live_position and not account_position else
                        scalp_exit["status"] if scalp_exit else scalp_watch["status"])
     engine["scalp_watch"] = scalp_watch
@@ -3499,7 +3587,14 @@ def _render_live_dashboard_inner():
 
     if selected_page == "⚡ SCALP":
         st.subheader("⚡ Automatic Scalp Signals")
-        st.caption("Auto-entry watch and early-exit guidance. Never places a real order.")
+        st.caption("Live mode submits IOC orders only when explicitly armed; otherwise the scalp remains simulated.")
+        if live_order_event:
+            if "FAILED" in live_order_event or "BLOCKED" in live_order_event:
+                st.error(live_order_event)
+            else:
+                st.success(live_order_event)
+        if live_scalp_enabled:
+            st.warning("LIVE EXECUTION ARMED · 20% portfolio-wide allocation ceiling · disable the sidebar switch to stop new entries")
         if active_ticker:
             st.caption(f"Watching: {active_ticker}")
         # This spot pressure radar is independent from entry/expiry decisions.
@@ -3563,8 +3658,10 @@ def _render_live_dashboard_inner():
                          str(account_info.get("reason") or "Check portfolio fills"))
         elif kalshi_sync_enabled:
             st.info("🔒 Read-only Kalshi sync connected · no open BTC15M position. Public entry signals and simulated tracking still operate.")
+        elif live_scalp_enabled:
+            st.info("LIVE SCALP ARMED · account is connected; entries still require two matching fresh watches and available allocation under the 20% cap.")
         else:
-            st.info("SIMULATED MODE · No Kalshi account connected. Quotes and estimated trades are not actual purchases or sales.")
+            st.info("SIMULATED MODE · No live scalp order will be submitted. Quotes and estimated trades are not actual purchases or sales.")
 
         _last_paper = auto_paper_state.get("last_closed")
         if scalp_exit:
