@@ -98,10 +98,12 @@ def _position_exposure_dollars(row):
     # documented market_exposure field is integer cents.
     for name in ("market_exposure_dollars", "position_cost_dollars", "total_cost_dollars"):
         if name in row:
-            return _money(row.get(name))
+            value = dec(row.get(name))
+            return abs(value) if value is not None else None
     for name in ("market_exposure", "position_cost", "total_cost", "event_exposure"):
         if name in row:
-            return _money(row.get(name), cents=True)
+            value = dec(row.get(name))
+            return abs(value) / 100 if value is not None else None
     return None
 
 
@@ -177,7 +179,7 @@ def available_scalp_budget(snapshot, fraction=MAX_SCALP_FRACTION):
     return max(Decimal(0), cap - committed)
 
 
-def contracts_for_budget(budget_dollars, price_cents, fee_buffer=Decimal("0.02")):
+def contracts_for_budget(budget_dollars, price_cents, fee_buffer=Decimal("0.03")):
     """Whole-contract sizing including a conservative per-contract fee reserve."""
     budget = dec(budget_dollars)
     price = dec(price_cents)
