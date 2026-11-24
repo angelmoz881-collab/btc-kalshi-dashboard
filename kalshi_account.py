@@ -129,63 +129,104 @@ def _fill_qty(fill):
 
 
 def reconstruct_position(market_position, fills, entry_score=None):
-    """Build cost-basis from documented fills, independently verify exchange shares.
+    """Rebuild the remaining net position from fills and verify it against Kalshi.
 
-    Only straightforward buys and sells of the owned contract are supported.
-    Opposite-side fills, missing fee data, and incomplete history cannot be
-    represented faithfully: return an unavailable basis rather than guess.
+    Kalshi fills can represent the opposite outcome when a trade reduces or
+    reverses an existing position (for example, sell-YES is NO exposure).
+    Net YES/NO lots against each other instead of rejecting every opposite-side
+    fill. Only a fully reconciled position with an actual remaining cost basis
+    is returned; incomplete history is never guessed.
     """
     ticker = str(market_position.get("ticker") or "")
     signed = _decimal(market_position.get("position_fp", market_position.get("position")))
     if signed is None or signed == 0 or not ticker.startswith("KXBTC15M-"):
         return None, "No supported open BTC 15m position"
-    side = "yes" if signed > 0 else "no"
-    wanted = abs(signed)
-    ordered = sorted((x for x in fills if str(x.get("ticker") or x.get("market_ticker")) == ticker),
-                     key=lambda x: (_fill_time(x) or 0, str(x.get("fill_id", ""))))
+
+    wanted_side = "yes" if signed > 0 else "no"
+    wanted_qty = abs(signed)
+    ordered = sorted(
+        (x for x in fills if str(x.get("ticker") or x.get("market_ticker")) == ticker),
+        key=lambda x: (_fill_time(x) or 0, str(x.get("fill_id") or x.get("trade_id") or "")),
+    )
     if not ordered:
         return None, "No fill history available for actual cost basis"
+
+    # Each lot is [outcome side, remaining quantity, fill price in cents,
+    # remaining entry fee in cents, fill timestamp].
     lots = []
     for item in ordered:
-        item_side = str(item.get("side") or item.get("outcome_side") or "").lower()
-        action = str(item.get("action") or "").lower()
         qty = _fill_qty(item)
-        fee = _decimal(item.get("fee_cost"))
+        fee_dollars = _decimal(item.get("fee_cost"))
         ts = _fill_time(item)
-        if item_side not in ("yes", "no") or action not in ("buy", "sell") or qty is None or qty <= 0:
-            return None, "Incomplete fill details: cost basis unavailable"
-        if item_side != side:
-            return None, "Opposite-side fills need reconciliation; cost basis unavailable"
-        if action == "buy":
-            price = _fill_side_price_cents(item, side)
-            if price is None or not (0 < price < 100):
-                return None, "Unknown executed fill price: cost basis unavailable"
-            if fee is None or fee < 0:
-                return None, "Missing actual buy fee: cost basis unavailable"
-            lots.append([qty, price, fee * 100, ts])
-        else:
-            left = qty
-            while left > 0 and lots:
-                lot = lots[0]
-                removal = min(left, lot[0])
-                fraction = removal / lot[0]
-                lot[2] *= (1 - fraction)
-                lot[0] -= removal
-                left -= removal
-                if lot[0] <= Decimal("0.00000001"):
-                    lots.pop(0)
-            if left > Decimal("0.00000001"):
-                return None, "Unmatched historical sale: cost basis unavailable"
-    held = sum((lot[0] for lot in lots), Decimal(0))
-    if abs(held - wanted) > Decimal("0.000001"):
+
+        # outcome_side is the canonical net exposure side in current Kalshi
+        # responses. Older responses can be normalized from side + action:
+        # buy-YES / sell-NO add YES; buy-NO / sell-YES add NO.
+        fill_side = str(item.get("outcome_side") or "").lower()
+        if fill_side not in ("yes", "no"):
+            raw_side = str(item.get("side") or "").lower()
+            action = str(item.get("action") or "").lower()
+            if raw_side in ("yes", "no") and action in ("buy", "sell"):
+                fill_side = (
+                    "yes" if (raw_side == "yes" and action == "buy")
+                    or (raw_side == "no" and action == "sell") else "no"
+                )
+            else:
+                book_side = str(item.get("book_side") or "").lower()
+                fill_side = "yes" if book_side == "bid" else "no" if book_side == "ask" else ""
+
+        if fill_side not in ("yes", "no") or qty is None or qty <= 0:
+            return None, "Incomplete fill direction or quantity: cost basis unavailable"
+
+        price = _fill_side_price_cents(item, fill_side)
+        if price is None or not (0 < price < 100):
+            return None, "Unknown executed fill price: cost basis unavailable"
+
+        # Net this fill against the oldest lots on the opposite outcome. This
+        # correctly models closes and reversals while retaining cost basis for
+        # only the contracts still held.
+        remaining = qty
+        opposite = "no" if fill_side == "yes" else "yes"
+        i = 0
+        while remaining > Decimal("0.00000001") and i < len(lots):
+            lot = lots[i]
+            if lot[0] != opposite:
+                i += 1
+                continue
+            removed = min(remaining, lot[1])
+            fraction_left = (lot[1] - removed) / lot[1]
+            lot[3] *= fraction_left
+            lot[1] -= removed
+            remaining -= removed
+            if lot[1] <= Decimal("0.00000001"):
+                lots.pop(i)
+            else:
+                i += 1
+
+        # Only a residual opening amount contributes to the current cost basis.
+        if remaining > Decimal("0.00000001"):
+            if fee_dollars is None or fee_dollars < 0:
+                return None, "Missing actual fee for remaining open fill: cost basis unavailable"
+            residual_fraction = remaining / qty
+            lots.append([
+                fill_side, remaining, price,
+                fee_dollars * 100 * residual_fraction, ts
+            ])
+
+    held_lots = [lot for lot in lots if lot[0] == wanted_side]
+    opposite_lots = [lot for lot in lots if lot[0] != wanted_side]
+    held = sum((lot[1] for lot in held_lots), Decimal(0))
+    other = sum((lot[1] for lot in opposite_lots), Decimal(0))
+    if other > Decimal("0.000001") or abs(held - wanted_qty) > Decimal("0.000001"):
         return None, "Fill history does not reconcile with the exchange position"
-    if not lots:
+    if not held_lots or held <= 0:
         return None, "No remaining bought lots"
-    cost_cents = sum((lot[0] * lot[1] for lot in lots), Decimal(0))
-    entry_fee_cents = sum((lot[2] for lot in lots), Decimal(0))
-    opened = min((lot[3] for lot in lots if lot[3] is not None), default=time.time())
+
+    cost_cents = sum((lot[1] * lot[2] for lot in held_lots), Decimal(0))
+    entry_fee_cents = sum((lot[3] for lot in held_lots), Decimal(0))
+    opened = min((lot[4] for lot in held_lots if lot[4] is not None), default=time.time())
     return {
-        "ticker": ticker, "side": side, "quantity": float(held),
+        "ticker": ticker, "side": wanted_side, "quantity": float(held),
         "entry_price_cents": float(cost_cents / held),
         "entry_fee_cents": float(entry_fee_cents),
         "opened_at": float(opened), "entry_score": entry_score,
