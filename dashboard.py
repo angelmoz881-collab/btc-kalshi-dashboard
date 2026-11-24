@@ -3508,7 +3508,7 @@ def _render_live_dashboard_inner():
         st.markdown("#### 🔐 Kalshi BTC live execution")
         _trade_key_id = _secret("KALSHI_TRADE_KEY_ID") or os.environ.get("KALSHI_TRADE_KEY_ID")
         _trade_private_key = _secret("KALSHI_TRADE_PRIVATE_KEY") or os.environ.get("KALSHI_TRADE_PRIVATE_KEY")
-        _trade_env = str(_secret("KALSHI_TRADE_ENV", "demo") or os.environ.get("KALSHI_TRADE_ENV", "demo")).lower()
+        _trade_env = str(_secret("KALSHI_TRADE_ENV") or os.environ.get("KALSHI_TRADE_ENV", "demo")).lower()
         _trade_unlock = _secret("KALSHI_TRADE_UNLOCK_PASSWORD") or os.environ.get("KALSHI_TRADE_UNLOCK_PASSWORD")
         _trade_ready = bool(_trade_key_id and _trade_private_key and _trade_unlock and _trade_env in ("demo", "prod"))
         _trade_authenticated = False
