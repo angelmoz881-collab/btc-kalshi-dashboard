@@ -112,6 +112,8 @@ def _resting_buy_exposure_dollars(order):
     status = str(order.get("status") or "").lower()
     if status != "resting":
         return Decimal(0)
+    if order.get("reduce_only") is True:
+        raise ValueError("A reduce-only order unexpectedly reported as resting; exposure cannot be verified")
     remaining = dec(order.get("remaining_count_fp", order.get("remaining_count", order.get("count_fp"))))
     if remaining is None or remaining <= 0:
         raise ValueError("Cannot verify remaining size of a resting order")
