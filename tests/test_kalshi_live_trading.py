@@ -78,12 +78,25 @@ class PortfolioCapTests(unittest.TestCase):
                 "status": "resting", "outcome_side": "yes", "book_side": "bid",
                 "remaining_count_fp": "10.00",
             })
-    def test_reduce_only_v2_exit_order_does_not_add_new_exposure(self):
+    def test_filled_reduce_only_v2_exit_order_does_not_add_new_exposure(self):
+        # Kalshi requires reduce-only orders to use IOC, so a completed exit
+        # must not be included in the resting-order reserve.
         exposure = live._resting_buy_exposure_dollars({
-            "status": "resting", "side": "ask", "remaining_count_fp": "10.00",
-            "price": "0.40", "reduce_only": True,
+            "status": "executed", "outcome_side": "yes", "book_side": "ask",
+            "remaining_count_fp": "0.00", "yes_price_dollars": "0.40",
+            "reduce_only": True,
         })
         self.assertEqual(exposure, Decimal("0"))
+
+    def test_reduce_only_order_cannot_be_resting(self):
+        # If the exchange ever reports this impossible state, fail closed
+        # rather than silently omitting potential exposure.
+        with self.assertRaises(ValueError):
+            live._resting_buy_exposure_dollars({
+                "status": "resting", "outcome_side": "yes", "book_side": "ask",
+                "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+                "reduce_only": True,
+            })
 
     def test_negative_position_exposure_is_counted_by_absolute_value(self):
         self.assertEqual(
