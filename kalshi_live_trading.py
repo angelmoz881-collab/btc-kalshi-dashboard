@@ -124,23 +124,26 @@ def _resting_buy_exposure_dollars(order):
             return Decimal(0)
 
     price = None
-    for name in ("price", "yes_price_dollars", "no_price_dollars"):
+    outcome_side = str(order.get("outcome_side") or order.get("contract_side") or "").lower()
+    if action == "buy" and not outcome_side and book_side in ("yes", "no"):
+        outcome_side = book_side
+    if action == "buy" and outcome_side in ("yes", "no"):
+        names = (outcome_side + "_price_dollars", outcome_side + "_price")
+    else:
+        names = ("price", "yes_price_dollars", "yes_price")
+    for name in names:
         if order.get(name) is not None:
-            price = _money(order.get(name))
+            raw = order.get(name)
+            price = _money(raw, cents=name.endswith("_price") and not name.endswith("_dollars"))
             break
-    if price is None:
-        for name in ("yes_price", "no_price"):
-            if order.get(name) is not None:
-                price = _money(order.get(name), cents=True)
-                break
     if price is None:
         raise ValueError("Cannot verify exposure for a resting buy order")
 
-    if action == "buy":
-        outcome_side = str(order.get("outcome_side") or order.get("contract_side") or "").lower()
-        if outcome_side == "no" and order.get("no_price_dollars") is None and order.get("no_price") is None:
-            price = Decimal(1) - price
-    elif book_side == "ask":
+    if action == "buy" and outcome_side == "no":
+        # A legacy NO purchase's exposure is its NO price, not the YES price.
+        pass
+    elif action != "buy" and book_side == "ask":
+        # A V2 ask opens NO exposure at the complement of the YES-book price.
         price = Decimal(1) - price
     return remaining * price
 
