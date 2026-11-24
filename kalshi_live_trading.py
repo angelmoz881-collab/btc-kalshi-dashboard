@@ -68,7 +68,7 @@ def place_btc_limit_ioc(key_id, private_pem, environment, ticker, outcome,
         cents = Decimal(str(yes_price_cents))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Quantity and price must be valid numbers")
-    if not qty.is_finite() or qty < 1 or qty > 5 or qty * 100 % 1 != 0:
+    if not qty.is_finite() or qty < 1 or qty > 5 or qty != qty.to_integral_value():
         raise ValueError("Quantity must be 1–5 contracts in whole-contract increments")
     if not cents.is_finite() or cents < 1 or cents > 99:
         raise ValueError("YES limit price must be between 1¢ and 99¢")
