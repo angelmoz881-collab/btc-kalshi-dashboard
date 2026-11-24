@@ -1,0 +1,140 @@
+import unittest
+from decimal import Decimal
+from unittest.mock import patch
+
+import kalshi_live_trading as live
+
+
+class PortfolioCapTests(unittest.TestCase):
+    def test_budget_subtracts_positions_and_resting_buys(self):
+        snapshot = {
+            "equity_dollars": Decimal("1000"),
+            "committed_dollars": Decimal("125"),
+        }
+        self.assertEqual(live.available_scalp_budget(snapshot), Decimal("75.00"))
+
+    def test_budget_never_exceeds_twenty_percent(self):
+        snapshot = {
+            "equity_dollars": Decimal("500"),
+            "committed_dollars": Decimal("0"),
+        }
+        self.assertEqual(live.available_scalp_budget(snapshot), Decimal("100.00"))
+
+    def test_exposure_at_or_above_cap_blocks_new_allocation(self):
+        snapshot = {
+            "equity_dollars": Decimal("1000"),
+            "committed_dollars": Decimal("200"),
+        }
+        self.assertEqual(live.available_scalp_budget(snapshot), Decimal("0"))
+
+    def test_unknown_exposure_fails_closed(self):
+        with self.assertRaises(ValueError):
+            live.available_scalp_budget({"equity_dollars": Decimal("1000"), "committed_dollars": None})
+
+    def test_cannot_raise_cap_above_twenty_percent(self):
+        with self.assertRaises(ValueError):
+            live.available_scalp_budget(
+                {"equity_dollars": Decimal("1000"), "committed_dollars": Decimal("0")},
+                Decimal("0.25"),
+            )
+
+    def test_contract_sizing_includes_fee_reserve(self):
+        self.assertEqual(live.contracts_for_budget(Decimal("10"), Decimal("50")), 18)
+        self.assertEqual(live.contracts_for_budget(Decimal("0.50"), Decimal("50")), 0)
+
+    def test_resting_v2_bid_and_ask_orders_both_count_as_exposure(self):
+        bid = live._resting_buy_exposure_dollars({
+            "status": "resting", "outcome_side": "yes", "book_side": "bid",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
+        })
+        ask = live._resting_buy_exposure_dollars({
+            "status": "resting", "outcome_side": "no", "book_side": "ask",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
+        })
+        self.assertEqual(bid, Decimal("4.0000"))
+        self.assertEqual(ask, Decimal("6.0000"))
+
+    def test_current_v2_order_schema_counts_yes_bid_exposure(self):
+        exposure = live._resting_buy_exposure_dollars({
+            "status": "resting", "outcome_side": "yes", "book_side": "bid",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
+        })
+        self.assertEqual(exposure, Decimal("4.0000"))
+
+    def test_current_v2_order_schema_counts_no_ask_exposure(self):
+        exposure = live._resting_buy_exposure_dollars({
+            "status": "resting", "outcome_side": "no", "book_side": "ask",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
+        })
+        self.assertEqual(exposure, Decimal("6.0000"))
+
+    def test_unreadable_resting_order_exposure_fails_closed(self):
+        with self.assertRaises(ValueError):
+            live._resting_buy_exposure_dollars({
+                "status": "resting", "outcome_side": "yes", "book_side": "bid",
+                "remaining_count_fp": "10.00",
+            })
+    def test_filled_reduce_only_v2_exit_order_does_not_add_new_exposure(self):
+        # Kalshi requires reduce-only orders to use IOC, so a completed exit
+        # must not be included in the resting-order reserve.
+        exposure = live._resting_buy_exposure_dollars({
+            "status": "executed", "outcome_side": "yes", "book_side": "ask",
+            "remaining_count_fp": "0.00", "yes_price_dollars": "0.40",
+            "reduce_only": True,
+        })
+        self.assertEqual(exposure, Decimal("0"))
+
+    def test_reduce_only_order_cannot_be_resting(self):
+        # If the exchange ever reports this impossible state, fail closed
+        # rather than silently omitting potential exposure.
+        with self.assertRaises(ValueError):
+            live._resting_buy_exposure_dollars({
+                "status": "resting", "outcome_side": "yes", "book_side": "ask",
+                "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+                "reduce_only": True,
+            })
+
+    def test_negative_position_exposure_is_counted_by_absolute_value(self):
+        self.assertEqual(
+            live._position_exposure_dollars({"market_exposure": -2500}),
+            Decimal("25"),
+        )
+
+
+class V2OrderMappingTests(unittest.TestCase):
+    def _capture(self, outcome, action, price, reduce_only=False):
+        with patch.object(live, "_request", return_value={"fill_count": "1.00"}) as request:
+            live.submit_ioc_order(
+                "key", "pem", "KXBTC15M-TEST", outcome, action, price, 1,
+                reduce_only=reduce_only,
+            )
+            return request.call_args.kwargs["body"]
+
+    def test_buy_yes_uses_yes_bid(self):
+        body = self._capture("yes", "buy", Decimal("61"))
+        self.assertEqual(body["side"], "bid")
+        self.assertEqual(body["price"], "0.6100")
+
+    def test_buy_no_uses_yes_ask_equivalent(self):
+        body = self._capture("no", "buy", Decimal("39"))
+        self.assertEqual(body["side"], "ask")
+        self.assertEqual(body["price"], "0.6100")
+
+    def test_sell_no_uses_yes_bid_equivalent_and_reduce_only(self):
+        body = self._capture("no", "sell", Decimal("39"), reduce_only=True)
+        self.assertEqual(body["side"], "bid")
+        self.assertEqual(body["price"], "0.6100")
+        self.assertTrue(body["reduce_only"])
+        self.assertEqual(body["time_in_force"], "immediate_or_cancel")
+
+    def test_orders_restricted_to_btc15m(self):
+        with self.assertRaises(ValueError):
+            live.submit_ioc_order("key", "pem", "KXBTC-OTHER", "yes", "buy", 50, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
