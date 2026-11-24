@@ -44,15 +44,17 @@ class PortfolioCapTests(unittest.TestCase):
 
     def test_resting_v2_bid_and_ask_orders_both_count_as_exposure(self):
         bid = live._resting_buy_exposure_dollars({
-            "status": "resting", "side": "bid", "remaining_count_fp": "10.00",
-            "price": "0.40", "reduce_only": False,
+            "status": "resting", "outcome_side": "yes", "book_side": "bid",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
         })
         ask = live._resting_buy_exposure_dollars({
-            "status": "resting", "side": "ask", "remaining_count_fp": "10.00",
-            "price": "0.40", "reduce_only": False,
+            "status": "resting", "outcome_side": "no", "book_side": "ask",
+            "remaining_count_fp": "10.00", "yes_price_dollars": "0.40",
+            "no_price_dollars": "0.60",
         })
-        self.assertEqual(bid, Decimal("4.00"))
-        self.assertEqual(ask, Decimal("6.00"))
+        self.assertEqual(bid, Decimal("4.0000"))
+        self.assertEqual(ask, Decimal("6.0000"))
 
     def test_current_v2_order_schema_counts_yes_bid_exposure(self):
         exposure = live._resting_buy_exposure_dollars({
