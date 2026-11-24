@@ -20,6 +20,7 @@ from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_pos
 from auto_scalp import paper_step, marketable_entry
 from alert_notifications import build_signal_alerts, pick_new_alert
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
+from kalshi_live_trading import place_btc_limit_ioc
 from polymarket_btc_5m import render_polymarket_btc_5m
 import json
 import html
@@ -3499,9 +3500,74 @@ def _render_live_dashboard_inner():
 
     if selected_page == "⚡ SCALP":
         st.subheader("⚡ Automatic Scalp Signals")
-        st.caption("Auto-entry watch and early-exit guidance. Never places a real order.")
+        st.caption("Scalp signals remain research guidance. Live orders below require an explicit click and are never sent automatically.")
         if active_ticker:
             st.caption(f"Watching: {active_ticker}")
+
+        # Live order execution is isolated from the research/paper engine.
+        st.markdown("#### 🔐 Kalshi BTC live execution")
+        _trade_key_id = _secret("KALSHI_TRADE_KEY_ID") or os.environ.get("KALSHI_TRADE_KEY_ID")
+        _trade_private_key = _secret("KALSHI_TRADE_PRIVATE_KEY") or os.environ.get("KALSHI_TRADE_PRIVATE_KEY")
+        _trade_env = str(_secret("KALSHI_TRADE_ENV", "demo") or os.environ.get("KALSHI_TRADE_ENV", "demo")).lower()
+        _trade_unlock = _secret("KALSHI_TRADE_UNLOCK_PASSWORD") or os.environ.get("KALSHI_TRADE_UNLOCK_PASSWORD")
+        _trade_ready = bool(_trade_key_id and _trade_private_key and _trade_unlock and _trade_env in ("demo", "prod"))
+        _trade_authenticated = False
+        if not _trade_ready:
+            st.info("Live execution is locked. Add KALSHI_TRADE_KEY_ID, KALSHI_TRADE_PRIVATE_KEY, KALSHI_TRADE_UNLOCK_PASSWORD and KALSHI_TRADE_ENV (demo or prod) to Streamlit Secrets. Demo is the safer first test.")
+        else:
+            _typed_trade_unlock = st.text_input("Unlock trading controls", type="password", key="kalshi_trade_unlock_input")
+            _trade_authenticated = bool(_typed_trade_unlock) and hmac.compare_digest(str(_typed_trade_unlock), str(_trade_unlock))
+            if _trade_authenticated and _trade_env == "prod":
+                _prod_phrase = st.text_input("Production account confirmation", key="kalshi_prod_phrase",
+                                             placeholder="I UNDERSTAND LIVE TRADING")
+                _trade_authenticated = _prod_phrase == "I UNDERSTAND LIVE TRADING"
+            _trade_session_enabled = st.checkbox("Enable manual order buttons for this session", value=False,
+                                                 key="kalshi_live_order_controls")
+            _trade_authenticated = _trade_authenticated and _trade_session_enabled
+            st.caption(f"Execution environment: {'DEMO' if _trade_env == 'demo' else 'PRODUCTION · REAL MONEY'}. Orders are limit-priced IOC orders; unfilled quantity is canceled.")
+        if _trade_authenticated:
+            if kalshi_stale or not kalshi_data or kalshi_data.get("book_error") or (kalshi_data.get("market") or {}).get("status") not in ("active", "open"):
+                st.warning("Live order buttons are blocked until the current BTC market and order book are fresh and open.")
+            else:
+                _entry_side = str((scalp_watch or {}).get("side") or "").lower()
+                if not is_live_position and _entry_side in ("yes", "no") and (scalp_watch or {}).get("status") == "WATCH " + _entry_side.upper():
+                    _entry_qty = st.number_input("Entry contracts", min_value=1, max_value=5, value=1, step=1, key="kalshi_live_entry_qty")
+                    _yes_entry_limit = kalshi_data.get("yes_ask") if _entry_side == "yes" else kalshi_data.get("yes_bid")
+                    st.caption(f"Current {_entry_side.upper()} entry watch · YES-book limit {show_price(_yes_entry_limit)}. The order will not chase beyond this limit.")
+                    if st.button(f"Place {_entry_side.upper()} buy · {_entry_qty} contract(s)", type="primary", key="kalshi_live_buy_button"):
+                        try:
+                            _result = place_btc_limit_ioc(
+                                _trade_key_id, _trade_private_key, _trade_env, active_ticker,
+                                _entry_side, "buy", _entry_qty, _yes_entry_limit
+                            )
+                            st.session_state["kalshi_last_live_order"] = _result
+                            st.success(f"Order accepted · filled {_result['fill_count']:g} / {_result['requested_count']:g} · remaining {_result['remaining_count']:g}")
+                        except Exception as _exc:
+                            st.error(f"Order was not confirmed: {type(_exc).__name__}: {_exc}. Check Kalshi order history before retrying.")
+                elif is_live_position and account_position:
+                    _exit_side = str(account_position.get("side") or "").lower()
+                    _yes_exit_limit = kalshi_data.get("yes_bid") if _exit_side == "yes" else kalshi_data.get("yes_ask")
+                    _exit_qty = min(5.0, float(account_position.get("quantity") or 0))
+                    if _exit_side in ("yes", "no") and _exit_qty >= 1 and _yes_exit_limit is not None:
+                        st.caption(f"Synced real position · {_exit_side.upper()} · {_exit_qty:g} contract(s). Exit is limited to the current executable bid; any unfilled remainder stays open.")
+                        if st.button(f"Sell to close {_exit_side.upper()} · {_exit_qty:g} contract(s)", type="primary", key="kalshi_live_sell_button"):
+                            try:
+                                _result = place_btc_limit_ioc(
+                                    _trade_key_id, _trade_private_key, _trade_env, active_ticker,
+                                    _exit_side, "sell", _exit_qty, _yes_exit_limit
+                                )
+                                st.session_state["kalshi_last_live_order"] = _result
+                                st.success(f"Exit order accepted · filled {_result['fill_count']:g} / {_result['requested_count']:g} · remaining {_result['remaining_count']:g}. Refresh account sync to verify the remaining position.")
+                            except Exception as _exc:
+                                st.error(f"Exit was not confirmed: {type(_exc).__name__}: {_exc}. Check Kalshi order history before retrying.")
+                    else:
+                        st.warning("Live position quantity/side cannot be safely converted to an order. No sell button shown.")
+                else:
+                    st.info("No confirmed scalp entry watch or synced live BTC15M position. No order button is available.")
+        _last_live_order = st.session_state.get("kalshi_last_live_order")
+        if _last_live_order:
+            st.caption(f"Last order · {_last_live_order.get('environment','').upper()} · {_last_live_order.get('intent')} {_last_live_order.get('outcome')} · order ID {_last_live_order.get('order_id') or 'not returned'} · average fill {_last_live_order.get('average_fill_price') or 'not reported'}")
+        st.caption("Safety: manual click only; 1–5 whole contracts; BTC 15-minute markets only; IOC limit orders; no automatic retries. An accepted order is not proof of a full fill. Verify fills and positions in Kalshi. A production order risks real money.")
         # This spot pressure radar is independent from entry/expiry decisions.
         radar = engine.get("scalp_pressure") or {}
         st.markdown("#### BTC buying vs. selling pressure · early radar")
