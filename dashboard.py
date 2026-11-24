@@ -20,6 +20,7 @@ from scalp_engine import estimated_taker_fee_cents, entry_watch, review_open_pos
 from auto_scalp import paper_step, marketable_entry
 from alert_notifications import build_signal_alerts, pick_new_alert
 from kalshi_account import get_btc_open_positions, get_market_fills, reconstruct_position
+from polymarket_btc_5m import render_polymarket_btc_5m
 import json
 import html
 import os
@@ -2989,7 +2990,7 @@ def _render_live_dashboard_inner():
     # 15-minute Kalshi flow so longer-horizon estimates do not blur the scalp view.
     selected_page = st.radio(
         "Dashboard section",
-        ["📈 CHART", "⚡ SCALP", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
+        ["📈 CHART", "₿ POLY 5M", "⚡ SCALP", "🏆 ARENA", "🕐 HOURLY", "📊 FLOW", "📖 GUIDE"],
         horizontal=True,
         label_visibility="collapsed",
         key="dashboard_section_compact",
@@ -3771,6 +3772,9 @@ def _render_live_dashboard_inner():
             st.caption(review.get("reason", "Missing inputs"))
             st.caption("Expiry estimates are uncalibrated. The separate SCALP tab monitors live bid depth and manual net exits. Entry watches and exit alerts have not been backtested or validated.")
             st.caption("Order-book depth is not a forecast. Quotes can change and may not be executable at the displayed size. The official settlement source is CME CF BRTI, not Coinbase.")
+
+    if selected_page == "₿ POLY 5M":
+        render_polymarket_btc_5m()
 
     if selected_page == "📖 GUIDE":
         st.markdown("""
