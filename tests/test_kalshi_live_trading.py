@@ -42,6 +42,31 @@ class PortfolioCapTests(unittest.TestCase):
         self.assertEqual(live.contracts_for_budget(Decimal("10"), Decimal("50")), 18)
         self.assertEqual(live.contracts_for_budget(Decimal("0.50"), Decimal("50")), 0)
 
+    def test_resting_v2_bid_and_ask_orders_both_count_as_exposure(self):
+        bid = live._resting_buy_exposure_dollars({
+            "status": "resting", "side": "bid", "remaining_count_fp": "10.00",
+            "price": "0.40", "reduce_only": False,
+        })
+        ask = live._resting_buy_exposure_dollars({
+            "status": "resting", "side": "ask", "remaining_count_fp": "10.00",
+            "price": "0.40", "reduce_only": False,
+        })
+        self.assertEqual(bid, Decimal("4.00"))
+        self.assertEqual(ask, Decimal("6.00"))
+
+    def test_reduce_only_v2_exit_order_does_not_add_new_exposure(self):
+        exposure = live._resting_buy_exposure_dollars({
+            "status": "resting", "side": "ask", "remaining_count_fp": "10.00",
+            "price": "0.40", "reduce_only": True,
+        })
+        self.assertEqual(exposure, Decimal("0"))
+
+    def test_negative_position_exposure_is_counted_by_absolute_value(self):
+        self.assertEqual(
+            live._position_exposure_dollars({"market_exposure": -2500}),
+            Decimal("25"),
+        )
+
 
 class V2OrderMappingTests(unittest.TestCase):
     def _capture(self, outcome, action, price, reduce_only=False):
